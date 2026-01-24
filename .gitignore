@@ -1,44 +1,27 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
-*.o
+# Build outputs
+*.exe
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
 *.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
+*.ilk
+*.exp
 *.lib
 
-# Executables
-*.exe
-*.out
-*.app
+# Benchmark results (optional - remove this line if you want to track results)
+gpu_benchmark_results.csv
 
-# debug information files
-*.dwo
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vcxproj.user
 
-# Intellij IDEA
-/.idea
+# VS Code
+.vscode/
+
+# Build directories
+Debug/
+Release/
+x64/
+x86/
