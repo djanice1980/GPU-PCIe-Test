@@ -140,19 +140,19 @@ void PrintBandwidthAnalysis(const char* direction, double bandwidth_gbps) {
     if (!analysis.likelyInterface) return;
     
     std::cout << "\n  Interface Analysis (" << direction << "):\n";
-    std::cout << "  ├─ Closest match: " << analysis.likelyInterface->name << "\n";
-    std::cout << "  ├─ Theoretical max: " << std::fixed << std::setprecision(2) 
+    std::cout << "  |-- Closest match: " << analysis.likelyInterface->name << "\n";
+    std::cout << "  |-- Theoretical max: " << std::fixed << std::setprecision(2) 
               << analysis.likelyInterface->bandwidth_gbps << " GB/s\n";
-    std::cout << "  ├─ Measured: " << bandwidth_gbps << " GB/s\n";
-    std::cout << "  ├─ Efficiency: " << std::fixed << std::setprecision(1) 
+    std::cout << "  |-- Measured: " << bandwidth_gbps << " GB/s\n";
+    std::cout << "  |-- Efficiency: " << std::fixed << std::setprecision(1) 
               << analysis.percentOfTheoretical << "%\n";
     
     if (analysis.isRealistic) {
-        std::cout << "  └─ ✓ Performance is typical for " << analysis.likelyInterface->name << "\n";
+        std::cout << "  +-- [OK] Performance is typical for " << analysis.likelyInterface->name << "\n";
     } else if (analysis.percentOfTheoretical > 95.0) {
-        std::cout << "  └─ ⚠ Unusually high (exceeds typical overhead)\n";
+        std::cout << "  +-- [!] Unusually high (exceeds typical overhead)\n";
     } else if (analysis.percentOfTheoretical < 60.0) {
-        std::cout << "  └─ ⚠ Lower than expected - possible bottleneck\n";
+        std::cout << "  +-- [!] Lower than expected - possible bottleneck\n";
     }
 }
 
@@ -210,34 +210,34 @@ void PrintInterfaceGuess(double uploadBandwidth, double downloadBandwidth) {
     BandwidthAnalysis primaryAnalysis = AnalyzeBandwidth(avgBandwidth);
     
     if (primaryAnalysis.likelyInterface) {
-        std::cout << "\n┌─ Likely Connection Type ─────────────────────\n";
-        std::cout << "│\n";
-        std::cout << "│  " << primaryAnalysis.likelyInterface->name << "\n";
-        std::cout << "│  " << primaryAnalysis.likelyInterface->description << "\n";
-        std::cout << "│\n";
-        std::cout << "│  Upload:   " << std::fixed << std::setprecision(2) << uploadBandwidth 
+        std::cout << "\n+-- Likely Connection Type ---------------------\n";
+        std::cout << "|\n";
+        std::cout << "|  " << primaryAnalysis.likelyInterface->name << "\n";
+        std::cout << "|  " << primaryAnalysis.likelyInterface->description << "\n";
+        std::cout << "|\n";
+        std::cout << "|  Upload:   " << std::fixed << std::setprecision(2) << uploadBandwidth 
                   << " GB/s  (" << std::setprecision(1) << uploadAnalysis.percentOfTheoretical << "% of " 
                   << uploadAnalysis.likelyInterface->name << ")\n";
-        std::cout << "│  Download: " << std::fixed << std::setprecision(2) << downloadBandwidth 
+        std::cout << "|  Download: " << std::fixed << std::setprecision(2) << downloadBandwidth 
                   << " GB/s  (" << std::setprecision(1) << downloadAnalysis.percentOfTheoretical << "% of " 
                   << downloadAnalysis.likelyInterface->name << ")\n";
-        std::cout << "│\n";
+        std::cout << "|\n";
         
         // Provide context-specific recommendations
         if (primaryAnalysis.isRealistic) {
-            std::cout << "│  ✓ Performance is as expected for this interface\n";
+            std::cout << "|  [OK] Performance is as expected for this interface\n";
         } else if (primaryAnalysis.percentOfTheoretical < 60.0) {
-            std::cout << "│  ⚠ Lower than expected - possible issues:\n";
-            std::cout << "│    • GPU might be in reduced PCIe mode (x8 instead of x16)\n";
-            std::cout << "│    • PCIe slot might be limited (check motherboard manual)\n";
-            std::cout << "│    • Driver or system configuration issue\n";
-            std::cout << "│    • Thermal throttling\n";
+            std::cout << "|  [!] Lower than expected - possible issues:\n";
+            std::cout << "|    * GPU might be in reduced PCIe mode (x8 instead of x16)\n";
+            std::cout << "|    * PCIe slot might be limited (check motherboard manual)\n";
+            std::cout << "|    * Driver or system configuration issue\n";
+            std::cout << "|    * Thermal throttling\n";
         } else if (primaryAnalysis.percentOfTheoretical > 95.0) {
-            std::cout << "│  ℹ Exceptionally high efficiency - excellent!\n";
+            std::cout << "|  [i] Exceptionally high efficiency - excellent!\n";
         }
         
-        std::cout << "│\n";
-        std::cout << "└───────────────────────────────────────────────\n";
+        std::cout << "|\n";
+        std::cout << "+-----------------------------------------------\n";
     }
     
     PrintDoubleDivider();

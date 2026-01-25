@@ -222,13 +222,15 @@ TestResults RunBandwidthTest(
     }
     std::cout << "\n";
 
+    std::sort(bandwidths.begin(), bandwidths.end());
+
     TestResults results;
     results.testName = name;
-    results.minValue = *std::min_element(bandwidths.begin(), bandwidths.end());
+    results.minValue = bandwidths.front();
     results.avgValue = std::accumulate(bandwidths.begin(), bandwidths.end(), 0.0) / bandwidths.size();
-    results.maxValue = *std::max_element(bandwidths.begin(), bandwidths.end());
-    results.p99Value = 0.0;
-    results.p999Value = 0.0;
+    results.maxValue = bandwidths.back();
+    results.p99Value = bandwidths[static_cast<size_t>(bandwidths.size() * 0.99)];
+    results.p999Value = bandwidths[static_cast<size_t>(bandwidths.size() * 0.999)];
     results.unit = "GB/s";
     results.timestamp = std::chrono::system_clock::now();
 

@@ -485,13 +485,15 @@ TestResults RunBandwidthTest(
     vkDestroyQueryPool(ctx.device, queryPool, nullptr);
     vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmdBuf);
 
+    std::sort(bandwidths.begin(), bandwidths.end());
+
     TestResults results;
     results.testName = name;
-    results.minValue = *std::min_element(bandwidths.begin(), bandwidths.end());
+    results.minValue = bandwidths.front();
     results.avgValue = std::accumulate(bandwidths.begin(), bandwidths.end(), 0.0) / bandwidths.size();
-    results.maxValue = *std::max_element(bandwidths.begin(), bandwidths.end());
-    results.p99Value = 0.0;
-    results.p999Value = 0.0;
+    results.maxValue = bandwidths.back();
+    results.p99Value = bandwidths[static_cast<size_t>(bandwidths.size() * 0.99)];
+    results.p999Value = bandwidths[static_cast<size_t>(bandwidths.size() * 0.999)];
     results.unit = "GB/s";
     results.timestamp = std::chrono::system_clock::now();
 
@@ -504,6 +506,96 @@ TestResults RunBandwidthTest(
     // Compare to known interface speeds
     PrintBandwidthComparison(results.avgValue, name);
     
+    PrintDoubleDivider();
+
+    return results;
+}
+
+// ------------------------------------------------------------
+// Command Latency Test
+// ------------------------------------------------------------
+TestResults RunCommandLatencyTest(
+    VulkanContext& ctx,
+    int iterations,
+    bool checkEscape = false)
+{
+    const char* name = "Test 3 - Command Latency";
+    std::cout << name << "\n";
+    PrintDivider();
+
+    std::vector<double> latencies;
+    int lastPercent = -1;
+    bool escaped = false;
+
+    for (int i = 0; i < iterations && !escaped; i++) {
+        auto start = std::chrono::high_resolution_clock::now();
+
+        // Allocate command buffer
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = ctx.commandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+
+        VkCommandBuffer cmdBuf;
+        vkAllocateCommandBuffers(ctx.device, &allocInfo, &cmdBuf);
+
+        // Begin and immediately end (empty command buffer)
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmdBuf, &beginInfo);
+        vkEndCommandBuffer(cmdBuf);
+
+        // Submit and wait
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &cmdBuf;
+        vkQueueSubmit(ctx.queue, 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(ctx.queue);
+
+        auto end = std::chrono::high_resolution_clock::now();
+        double us = std::chrono::duration<double, std::micro>(end - start).count();
+        latencies.push_back(us);
+
+        vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmdBuf);
+
+        int percent = int((i + 1) * 100 / iterations);
+        if (percent != lastPercent) {
+            std::cout << "\rProgress: " << percent << "% ";
+            if (checkEscape) std::cout << "(Press ESC to stop) ";
+            std::cout << std::flush;
+            lastPercent = percent;
+        }
+
+        if (checkEscape && CheckForEscape()) {
+            escaped = true;
+            std::cout << "\n[Stopped by user]\n";
+        }
+    }
+
+    std::cout << "\n";
+
+    std::sort(latencies.begin(), latencies.end());
+
+    TestResults results;
+    results.testName = name;
+    results.minValue = latencies.front();
+    results.avgValue = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
+    results.maxValue = latencies.back();
+    results.p99Value = latencies[static_cast<size_t>(latencies.size() * 0.99)];
+    results.p999Value = latencies[static_cast<size_t>(latencies.size() * 0.999)];
+    results.unit = "us";
+    results.timestamp = std::chrono::system_clock::now();
+
+    PrintDivider();
+    std::cout << "Results:\n";
+    std::cout << "  Min        : " << std::fixed << std::setprecision(2) << results.minValue << " us\n";
+    std::cout << "  Avg        : " << results.avgValue << " us\n";
+    std::cout << "  Max        : " << results.maxValue << " us\n";
+    std::cout << "  P99        : " << results.p99Value << " us\n";
+    std::cout << "  P99.9      : " << results.p999Value << " us\n";
     PrintDoubleDivider();
 
     return results;
@@ -760,6 +852,9 @@ int main() {
         gpuSrc.Destroy(ctx);
         cpuDst.Destroy(ctx);
 
+        // Command latency test
+        results.push_back(RunCommandLatencyTest(ctx, config.commandLatencyIters, config.continuousMode));
+
         // Small transfer latency tests
         Buffer smallCpuSrc, smallGpuDst;
         smallCpuSrc.Create(ctx, config.smallLatencySize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 
@@ -768,7 +863,7 @@ int main() {
                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         
         results.push_back(RunLatencyTest(
-            ("Test 3 - CPU -> GPU " + FormatSize(config.smallLatencySize) + " Transfer Latency").c_str(),
+            ("Test 4 - CPU -> GPU " + FormatSize(config.smallLatencySize) + " Transfer Latency").c_str(),
             ctx, smallCpuSrc, smallGpuDst, config.transferLatencyIters, config.continuousMode));
         
         smallCpuSrc.Destroy(ctx);
@@ -781,7 +876,7 @@ int main() {
                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         
         results.push_back(RunLatencyTest(
-            ("Test 4 - GPU -> CPU " + FormatSize(config.smallLatencySize) + " Transfer Latency").c_str(),
+            ("Test 5 - GPU -> CPU " + FormatSize(config.smallLatencySize) + " Transfer Latency").c_str(),
             ctx, smallGpuSrc, smallCpuDst, config.transferLatencyIters, config.continuousMode));
         
         smallGpuSrc.Destroy(ctx);
