@@ -1,168 +1,151 @@
-# GPU-PCIe-Test
+# GPU-PCIe-Test v2.0
 
-A GPU performance benchmark tool for measuring PCIe and Thunderbolt bandwidth between CPU and GPU memory. Supports both Direct3D 12 (Windows) and Vulkan (cross-platform) APIs.
-
-All based off the work of procrastineto
-https://github.com/procrastineto/GPU-PCIe-Test
+A comprehensive GPU bandwidth and latency benchmarking tool for measuring PCIe, Thunderbolt, and other interconnect performance. Supports both Direct3D 12 and Vulkan APIs.
 
 ## Features
 
-- **Bandwidth Testing** - Measures CPU→GPU and GPU→CPU transfer speeds with large buffers (default 256MB)
-- **Latency Testing** - Measures round-trip latency for small transfers and command submission overhead
-- **Interface Detection** - Automatically identifies your likely connection type (PCIe gen/lanes, Thunderbolt, OCuLink)
-- **Dual API Support** - Choose between Direct3D 12, Vulkan, or run both for comparison
-- **Multi-GPU Support** - Select which GPU to benchmark on systems with multiple graphics cards
-- **CSV Logging** - Results are appended to a CSV file for tracking performance over time
-- **Continuous Mode** - Run repeated tests to monitor thermal throttling or stability
-- **Reference Charts** - Built-in PCIe/Thunderbolt bandwidth reference for comparison
+### New in v2.0
+- **Multi-run Averaging**: Runs each test 3 times by default, reports averaged results with standard deviation for more reliable measurements
+- **Bidirectional Bandwidth Test**: Measures simultaneous upload/download throughput for real-world workload simulation (ML inference, video streaming)
+- **GPU/PCIe Detection**: Reports detected GPU name, vendor, VRAM, driver version, and identifies integrated vs discrete GPUs
+- **Improved Code Structure**: constexpr constants, comprehensive comments explaining Vulkan memory flags and D3D12 heap types
 
-## Use Cases
+### Core Features
+- Direct3D 12 and Vulkan API support
+- CPU-to-GPU and GPU-to-CPU bandwidth tests (256 MB default)
+- Command submission latency test
+- Small transfer latency tests (1 byte)
+- Automatic PCIe/Thunderbolt interface detection
+- CSV logging with timestamps
+- Configurable test parameters
 
-- Verify your GPU is running at the expected PCIe link speed (x16 vs x8, Gen 4 vs Gen 3)
-- Test eGPU enclosure performance over Thunderbolt 3/4/5
-- Compare OCuLink adapter performance
-- Diagnose bandwidth bottlenecks
-- Monitor for thermal throttling during sustained transfers
+## Building
 
-## Quick Start
+### Prerequisites
+- Visual Studio 2019 or later with C++ Desktop workload
+- Vulkan SDK (optional, for Vulkan support) - https://vulkan.lunarg.com/
 
-1. Download the latest release (or build from source)
-2. Run `GPU-PCIe-Test.exe`
-3. Select your API (D3D12, Vulkan, or Both)
-4. View results and interface detection
+### Build Steps
 
-## Sample Output
+1. Open **Developer Command Prompt for VS 2019/2022**
+2. Navigate to the source directory
+3. Run `build.bat`
 
-```
-==============================================
-      GPU Performance Benchmark Tool
-==============================================
-
-Found 1 GPU: NVIDIA GeForce RTX 4090
-
-Test 1 - CPU -> GPU 256MB Transfer Bandwidth
-----------------------------------------------
-Progress: 100%
-Results:
-  Min: 24.82 GB/s
-  Avg: 25.14 GB/s
-  Max: 25.31 GB/s
-==============================================
-
-==============================================================
-Interface Detection
-==============================================================
-
-┌─ Likely Connection Type ─────────────────────
-│
-│  PCIe 4.0 x16
-│  Modern GPU slot (AMD Ryzen 3000+, Intel 11th gen+)
-│
-│  Upload:   25.14 GB/s  (79.8% of PCIe 4.0 x16)
-│  Download: 25.89 GB/s  (82.2% of PCIe 4.0 x16)
-│
-│  ✓ Performance is as expected for this interface
-│
-└───────────────────────────────────────────────
+```cmd
+cd C:\path\to\GPU-PCIe-Test
+build.bat
 ```
 
-## Configuration Options
+Output: `GPU-PCIe-Test.exe`
 
-Press `C` at startup to access the configuration menu:
+## Usage
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| Large transfer size | Buffer size for bandwidth tests | 256 MB |
-| Small transfer size | Buffer size for latency tests | 1 byte |
-| Command latency iterations | Number of empty submit cycles | 100,000 |
-| Transfer latency iterations | Number of small transfer cycles | 10,000 |
-| Copies per batch | Transfers per timing measurement | 8 |
-| Bandwidth test batches | Number of timing samples | 32 |
-| Continuous mode | Repeat tests until ESC pressed | OFF |
-| CSV logging | Save results to file | ON |
-| CSV filename | Output file path | gpu_benchmark_results.csv |
+```cmd
+GPU-PCIe-Test.exe
+```
 
-Press `H` to view the PCIe/Thunderbolt bandwidth reference chart.
+### Menu Options
+1. **API Selection**: Choose D3D12, Vulkan, or both
+2. **Configuration** (press 'C'):
+   - Buffer sizes for bandwidth and latency tests
+   - Iteration counts
+   - Number of runs (1-10 for multi-run averaging)
+   - Enable/disable bidirectional test
+   - Enable/disable detailed GPU info
+   - Toggle logging of individual runs vs averages only
 
-## Understanding Results
+### Configuration Menu
+```
+  1. Bandwidth buffer size: 256 MB
+  2. Latency buffer size:   1 B
+  3. Command iterations:    100000
+  4. Transfer iterations:   10000
+  5. Copies per batch:      8
+  6. Bandwidth batches:     32
+  7. Number of runs:        3 (multi-run averaging)
+  8. Log all runs:          No (averages only)
+  9. Bidirectional test:    Enabled
+  A. Detailed GPU info:     Enabled
+  C. Continuous mode:       Disabled
+  H. Show reference chart
+  0. Start benchmark
+```
 
-### Bandwidth (GB/s)
+## Test Descriptions
 
-Typical real-world bandwidth is **70-90%** of theoretical maximum due to protocol overhead:
+| Test | Description | Unit |
+|------|-------------|------|
+| CPU-to-GPU Bandwidth | Large buffer upload throughput | GB/s |
+| GPU-to-CPU Bandwidth | Large buffer download throughput | GB/s |
+| Bidirectional | Simultaneous upload + download | GB/s (combined) |
+| Command Latency | Empty command submission overhead | us |
+| CPU-to-GPU Latency | Small transfer round-trip time | us |
+| GPU-to-CPU Latency | Small transfer round-trip time | us |
 
-| Interface | Theoretical Max | Typical Real-World |
-|-----------|-----------------|-------------------|
-| PCIe 3.0 x16 | 15.75 GB/s | 11-14 GB/s |
-| PCIe 4.0 x16 | 31.5 GB/s | 22-28 GB/s |
-| PCIe 5.0 x16 | 63.0 GB/s | 44-57 GB/s |
-| Thunderbolt 3/4 | 2.75 GB/s | 2.0-2.5 GB/s |
-| Thunderbolt 5 | 6.0 GB/s | 4.2-5.4 GB/s |
+## Output
 
-### Latency (microseconds)
+### Console
+- Per-run results (Min, Avg, Max, P99, P99.9)
+- Aggregated results with standard deviation
+- Interface detection (PCIe generation and lane width)
 
-- **Command Latency** - Time to submit an empty command buffer and wait for completion. Tests driver/OS overhead.
-- **Transfer Latency** - Time to copy a tiny buffer. Includes command latency plus DMA setup overhead.
+### CSV File
+Results are saved to `gpu_benchmark_results.csv`:
+```
+Timestamp,API,Test Name,Run,Min,Avg,Max,P99,P99.9,StdDev,Unit
+2026-01-25 12:00:00,D3D12,CPU->GPU 256 MB Bandwidth,AVG,45.2,48.5,52.1,51.8,52.0,1.2,GB/s
+```
 
-Lower is better. Typical values: 2-10 μs for command latency, 5-20 μs for transfer latency.
+## Interface Detection
+
+The tool automatically identifies your connection type:
+
+| Interface | Typical Bandwidth |
+|-----------|------------------|
+| PCIe 3.0 x16 | 12-15 GB/s |
+| PCIe 4.0 x16 | 25-30 GB/s |
+| PCIe 5.0 x16 | 50-60 GB/s |
+| Thunderbolt 3/4 | 2.0-2.5 GB/s |
+| Thunderbolt 5 | 5-6 GB/s |
+
+**Note**: Integrated GPUs (APUs) may show >100% efficiency because memory transfers don't traverse a real PCIe bus.
+
+## Interpreting Results
+
+### Bandwidth
+- **60-95% of theoretical**: Normal, expected overhead
+- **>95%**: Exceptional efficiency
+- **<60%**: Possible bottleneck or throttling
+
+### Latency
+- **D3D12 command latency**: ~1-2 us typical
+- **Vulkan command latency**: ~15-25 us typical (more driver overhead)
+- **Transfer latency**: ~15-50 us typical
+
+### Standard Deviation
+- Low StdDev (<5% of avg): Consistent results
+- High StdDev (>10% of avg): System noise, consider closing background apps
 
 ## Troubleshooting
 
-### Lower than expected bandwidth
+### "No DirectX 12 capable GPU found"
+- Ensure you have a DirectX 12 compatible GPU
+- Update your graphics drivers
 
-- **GPU in reduced PCIe mode** - Check GPU-Z or HWiNFO for actual link speed. Some motherboards run x16 slots at x8 when multiple slots are populated.
-- **Wrong PCIe slot** - Ensure GPU is in the primary x16 slot, not a secondary slot that may be wired as x4 or x8.
-- **Power saving** - GPU may downclock PCIe link when idle. Run a game or GPU stress test first.
-- **Thermal throttling** - Use continuous mode to check if bandwidth drops over time.
-- **Driver issues** - Try updating GPU drivers.
+### "No Vulkan-capable GPU found"
+- Install the Vulkan Runtime from your GPU vendor
+- Install Vulkan SDK for development
 
-### Vulkan benchmark won't run
-
-- Ensure Vulkan SDK is installed and `VULKAN_SDK` environment variable is set
-- Update GPU drivers (includes Vulkan runtime)
-- Check that your GPU supports Vulkan 1.0+
-
-### D3D12 benchmark won't run
-
-- Requires Windows 10 or later
-- Requires a GPU with D3D12 support (most GPUs from 2012+)
-
-## CSV Output Format
-
-Results are appended to `gpu_benchmark_results.csv`:
-
-```csv
-Timestamp,API,Test Name,Min,Avg,Max,99th Percentile,99.9th Percentile,Unit
-2025-01-24 10:30:00,D3D12,Test 1 - CPU -> GPU 256MB Transfer Bandwidth,24.82,25.14,25.31,0,0,GB/s
-2025-01-24 10:30:05,D3D12,Test 2 - GPU -> CPU 256MB Transfer Bandwidth,25.61,25.89,26.02,0,0,GB/s
-```
-
-## Building from Source
-
-See [BUILDING.md](BUILDING.md) for detailed build instructions.
-
-### Quick Build (Windows)
-
-Requirements:
-- Visual Studio 2019 or later (with C++ Desktop workload)
-- Vulkan SDK (optional, for Vulkan build)
-
-```cmd
-# Open "Developer Command Prompt for VS"
-cd GPU-PCIe-Test
-build_final.bat
-```
+### Inconsistent Results
+- Close background applications
+- Disable power saving modes
+- Increase number of runs (option 7)
+- Let the system warm up before testing
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+MIT License - See LICENSE file
 
-## Contributing
+## Author
 
-Contributions welcome! Please open an issue to discuss proposed changes before submitting a PR.
-
-Ideas for future improvements:
-- Linux support for D3D12 via vkd3d
-- GPU memory bandwidth test (VRAM to VRAM)
-- Compute shader bandwidth test
-- GUI interface
-- Historical result graphing
+djanice1980 - https://github.com/djanice1980/GPU-PCIe-Test

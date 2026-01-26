@@ -1,106 +1,184 @@
-// bandwidth_analysis.h
-// PCIe/Thunderbolt Bandwidth Analysis and Printing Utilities
+// ============================================================================
+// bandwidth_analysis.h - Shared header for GPU-PCIe-Test v2.0
+// ============================================================================
 
 #ifndef BANDWIDTH_ANALYSIS_H
 #define BANDWIDTH_ANALYSIS_H
 
-#include <iostream>
+// Prevent Windows.h from defining min/max macros that conflict with std::min/max
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <string>
+#include <vector>
+#include <chrono>
+#include <iostream>
 #include <iomanip>
+#include <sstream>
+#include <fstream>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
 
-// ────────────────────────────────────────────────
-//   Printing helpers
-// ────────────────────────────────────────────────
+// ============================================================================
+//                              CONSTANTS
+// ============================================================================
 
-inline void PrintDivider() {
-    std::cout << std::string(70, '-') << '\n';
+namespace Constants {
+    constexpr size_t DEFAULT_BANDWIDTH_SIZE     = 256ull * 1024 * 1024;
+    constexpr size_t DEFAULT_LATENCY_SIZE       = 1;
+    constexpr int    DEFAULT_COMMAND_LATENCY_ITERS = 100000;
+    constexpr int    DEFAULT_TRANSFER_LATENCY_ITERS = 10000;
+    constexpr int    DEFAULT_COPIES_PER_BATCH   = 8;
+    constexpr int    DEFAULT_BANDWIDTH_BATCHES  = 32;
+    constexpr int    DEFAULT_NUM_RUNS           = 3;
+    constexpr int    MAX_NUM_RUNS               = 10;
+    constexpr int    MIN_NUM_RUNS               = 1;
+    constexpr int    DIVIDER_WIDTH              = 70;
+    constexpr double REALISTIC_MIN_PERCENT      = 60.0;
+    constexpr double REALISTIC_MAX_PERCENT      = 95.0;
+    constexpr double EXCEPTIONAL_THRESHOLD      = 95.0;
 }
 
-inline void PrintDoubleDivider() {
-    std::cout << std::string(70, '=') << '\n';
-}
-
-// ────────────────────────────────────────────────
-//   Interface speed reference table
-// ────────────────────────────────────────────────
+// ============================================================================
+//                          DATA STRUCTURES
+// ============================================================================
 
 struct InterfaceSpeed {
     const char* name;
-    double bandwidth_gbps;  // Theoretical maximum in GB/s
+    double bandwidth_gbps;
     const char* description;
 };
 
-static const InterfaceSpeed INTERFACE_SPEEDS[] = {
-    // PCIe 3.0
+static constexpr InterfaceSpeed INTERFACE_SPEEDS[] = {
     {"PCIe 3.0 x1",  0.985,  "Single lane PCIe Gen 3"},
-    {"PCIe 3.0 x4",  3.94,   "Common for M.2 SSDs, some GPUs"},
-    {"PCIe 3.0 x8",  7.88,   "Older GPUs, some workstation cards"},
-    {"PCIe 3.0 x16", 15.75,  "Standard GPU slot (older platforms)"},
-    
-    // PCIe 4.0
+    {"PCIe 3.0 x4",  3.94,   "Common for M.2 SSDs"},
+    {"PCIe 3.0 x8",  7.88,   "Older GPUs"},
+    {"PCIe 3.0 x16", 15.75,  "Standard GPU slot (older)"},
     {"PCIe 4.0 x1",  1.97,   "Single lane PCIe Gen 4"},
-    {"PCIe 4.0 x4",  7.88,   "Modern M.2 SSDs, OCuLink Gen 4"},
-    {"PCIe 4.0 x8",  15.75,  "Some modern GPUs in x8 mode"},
-    {"PCIe 4.0 x16", 31.5,   "Modern GPU slot (AMD Ryzen 3000+, Intel 11th gen+)"},
-    
-    // PCIe 5.0
+    {"PCIe 4.0 x4",  7.88,   "Modern M.2 SSDs"},
+    {"PCIe 4.0 x8",  15.75,  "Some modern GPUs"},
+    {"PCIe 4.0 x16", 31.5,   "Modern GPU slot"},
     {"PCIe 5.0 x1",  3.94,   "Single lane PCIe Gen 5"},
-    {"PCIe 5.0 x4",  15.75,  "Next-gen M.2 SSDs, OCuLink Gen 5"},
-    {"PCIe 5.0 x8",  31.5,   "High-end GPUs in x8 mode"},
-    {"PCIe 5.0 x16", 63.0,   "Cutting-edge GPU slot (AMD Ryzen 7000+, Intel 12th gen+)"},
-    
-    // Thunderbolt
-    {"Thunderbolt 3", 2.75,  "40 Gbps - Common eGPU connection"},
-    {"Thunderbolt 4", 2.75,  "40 Gbps - Same speed as TB3, better specs"},
-    {"Thunderbolt 5", 6.0,   "80 Gbps bidirectional - Latest standard"},
-    {"TB5 Asymmetric", 12.0, "120 Gbps download / 40 Gbps upload"},
-    
-    // USB
-    {"USB 3.2 Gen 2",  1.25, "10 Gbps - USB-C"},
-    {"USB4 Gen 3x2",   4.8,  "40 Gbps - USB4"},
-    
-    // Other
-    {"OCuLink PCIe 3.0", 3.94,  "External PCIe cable (Gen 3 x4)"},
-    {"OCuLink PCIe 4.0", 7.88,  "External PCIe cable (Gen 4 x4)"},
+    {"PCIe 5.0 x4",  15.75,  "Next-gen M.2 SSDs"},
+    {"PCIe 5.0 x8",  31.5,   "High-end GPUs x8"},
+    {"PCIe 5.0 x16", 63.0,   "Cutting-edge GPU slot"},
+    {"Thunderbolt 3", 2.75,  "40 Gbps eGPU"},
+    {"Thunderbolt 4", 2.75,  "40 Gbps"},
+    {"Thunderbolt 5", 6.0,   "80 Gbps"},
+    {"USB4 Gen 3x2",   4.8,  "40 Gbps USB4"},
 };
 
-static const int NUM_INTERFACES = sizeof(INTERFACE_SPEEDS) / sizeof(InterfaceSpeed);
-
-// ────────────────────────────────────────────────
-//   Bandwidth analysis result structure
-// ────────────────────────────────────────────────
+static constexpr int NUM_INTERFACES = sizeof(INTERFACE_SPEEDS) / sizeof(InterfaceSpeed);
 
 struct BandwidthAnalysis {
-    const InterfaceSpeed* likelyInterface;
-    double percentOfTheoretical;
-    bool isRealistic;  // True if within 60-95% of theoretical max
+    const InterfaceSpeed* likelyInterface = nullptr;
+    double percentOfTheoretical = 0;
+    bool isRealistic = false;
 };
 
-// ────────────────────────────────────────────────
-//   Core analysis function
-// ────────────────────────────────────────────────
+struct GPUInfo {
+    std::string name;
+    std::string vendor;
+    std::string driverVersion;
+    uint64_t dedicatedVideoMemory = 0;
+    uint64_t sharedSystemMemory = 0;
+    uint32_t vendorId = 0;
+    uint32_t deviceId = 0;
+};
 
-BandwidthAnalysis AnalyzeBandwidth(double measuredBandwidth_gbps) {
+struct TestResults {
+    std::string testName;
+    double minValue = 0, avgValue = 0, maxValue = 0;
+    double p99Value = 0, p999Value = 0;
+    std::string unit;
+    std::chrono::system_clock::time_point timestamp;
+};
+
+struct AggregatedResults {
+    std::string testName;
+    std::string unit;
+    double avgMin = 0, avgAvg = 0, avgMax = 0;
+    double avgP99 = 0, avgP999 = 0, stdDevAvg = 0;
+    std::vector<TestResults> runs;
+};
+
+struct BenchmarkConfig {
+    size_t largeBandwidthSize = Constants::DEFAULT_BANDWIDTH_SIZE;
+    size_t smallLatencySize = Constants::DEFAULT_LATENCY_SIZE;
+    int commandLatencyIters = Constants::DEFAULT_COMMAND_LATENCY_ITERS;
+    int transferLatencyIters = Constants::DEFAULT_TRANSFER_LATENCY_ITERS;
+    int copiesPerBatch = Constants::DEFAULT_COPIES_PER_BATCH;
+    int bandwidthBatches = Constants::DEFAULT_BANDWIDTH_BATCHES;
+    int numRuns = Constants::DEFAULT_NUM_RUNS;
+    bool logAllRuns = false;
+    bool continuousMode = false;
+    bool enableCSVLogging = true;
+    bool enableBidirectionalTest = true;
+    bool showDetailedGPUInfo = true;
+    std::string csvFilename = "gpu_benchmark_results.csv";
+};
+
+// ============================================================================
+//                          UTILITY FUNCTIONS
+// ============================================================================
+
+inline void PrintDivider() {
+    std::cout << std::string(Constants::DIVIDER_WIDTH, '-') << '\n';
+}
+
+inline void PrintDoubleDivider() {
+    std::cout << std::string(Constants::DIVIDER_WIDTH, '=') << '\n';
+}
+
+inline std::string FormatSize(size_t bytes) {
+    if (bytes >= 1024ull * 1024 * 1024) return std::to_string(bytes / (1024ull * 1024 * 1024)) + " GB";
+    if (bytes >= 1024 * 1024) return std::to_string(bytes / (1024 * 1024)) + " MB";
+    if (bytes >= 1024) return std::to_string(bytes / 1024) + " KB";
+    return std::to_string(bytes) + " B";
+}
+
+inline std::string FormatMemorySize(uint64_t bytes) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(1);
+    if (bytes >= 1024ull * 1024 * 1024) oss << (bytes / (1024.0 * 1024.0 * 1024.0)) << " GB";
+    else if (bytes >= 1024 * 1024) oss << (bytes / (1024.0 * 1024.0)) << " MB";
+    else oss << bytes << " bytes";
+    return oss.str();
+}
+
+inline std::string GetVendorName(uint32_t vendorId) {
+    switch (vendorId) {
+        case 0x10DE: return "NVIDIA";
+        case 0x1002: return "AMD";
+        case 0x8086: return "Intel";
+        case 0x1414: return "Microsoft";
+        default: return "Unknown";
+    }
+}
+
+inline double CalculateStdDev(const std::vector<double>& values, double mean) {
+    if (values.size() < 2) return 0.0;
+    double sum = 0.0;
+    for (double v : values) sum += (v - mean) * (v - mean);
+    return std::sqrt(sum / (values.size() - 1));
+}
+
+// ============================================================================
+//                        BANDWIDTH ANALYSIS
+// ============================================================================
+
+inline BandwidthAnalysis AnalyzeBandwidth(double measuredBandwidth_gbps) {
     BandwidthAnalysis result;
-    result.likelyInterface = nullptr;
-    result.percentOfTheoretical = 0.0;
-    result.isRealistic = false;
-    
-    // Find the best match - closest interface where measured is 60-95% of theoretical
-    double bestMatch = -1;
-    double bestDiff = 1e9;
+    double bestMatch = -1, bestDiff = 1e9;
     
     for (int i = 0; i < NUM_INTERFACES; i++) {
         double theoretical = INTERFACE_SPEEDS[i].bandwidth_gbps;
         double percent = (measuredBandwidth_gbps / theoretical) * 100.0;
-        
-        // Realistic range: 60-95% of theoretical (accounting for overhead)
-        if (percent >= 60.0 && percent <= 95.0) {
+        if (percent >= Constants::REALISTIC_MIN_PERCENT && percent <= Constants::REALISTIC_MAX_PERCENT) {
             double diff = std::abs(theoretical - measuredBandwidth_gbps);
-            if (diff < bestDiff) {
-                bestDiff = diff;
-                bestMatch = i;
-            }
+            if (diff < bestDiff) { bestDiff = diff; bestMatch = i; }
         }
     }
     
@@ -111,144 +189,125 @@ BandwidthAnalysis AnalyzeBandwidth(double measuredBandwidth_gbps) {
         return result;
     }
     
-    // No realistic match found - find closest by absolute value
     for (int i = 0; i < NUM_INTERFACES; i++) {
-        double theoretical = INTERFACE_SPEEDS[i].bandwidth_gbps;
-        double diff = std::abs(theoretical - measuredBandwidth_gbps);
-        if (diff < bestDiff) {
-            bestDiff = diff;
-            bestMatch = i;
-        }
+        double diff = std::abs(INTERFACE_SPEEDS[i].bandwidth_gbps - measuredBandwidth_gbps);
+        if (diff < bestDiff) { bestDiff = diff; bestMatch = i; }
     }
     
     if (bestMatch >= 0) {
         result.likelyInterface = &INTERFACE_SPEEDS[(int)bestMatch];
         result.percentOfTheoretical = (measuredBandwidth_gbps / result.likelyInterface->bandwidth_gbps) * 100.0;
-        result.isRealistic = false;
     }
-    
     return result;
 }
 
-// ────────────────────────────────────────────────
-//   Printing functions
-// ────────────────────────────────────────────────
-
-void PrintBandwidthAnalysis(const char* direction, double bandwidth_gbps) {
-    BandwidthAnalysis analysis = AnalyzeBandwidth(bandwidth_gbps);
+inline void PrintInterfaceGuess(double uploadBW, double downloadBW) {
+    double avgBW = (uploadBW + downloadBW) / 2.0;
+    BandwidthAnalysis analysis = AnalyzeBandwidth(std::max(uploadBW, downloadBW));
     
-    if (!analysis.likelyInterface) return;
-    
-    std::cout << "\n  Interface Analysis (" << direction << "):\n";
-    std::cout << "  |-- Closest match: " << analysis.likelyInterface->name << "\n";
-    std::cout << "  |-- Theoretical max: " << std::fixed << std::setprecision(2) 
-              << analysis.likelyInterface->bandwidth_gbps << " GB/s\n";
-    std::cout << "  |-- Measured: " << bandwidth_gbps << " GB/s\n";
-    std::cout << "  |-- Efficiency: " << std::fixed << std::setprecision(1) 
-              << analysis.percentOfTheoretical << "%\n";
-    
-    if (analysis.isRealistic) {
-        std::cout << "  +-- [OK] Performance is typical for " << analysis.likelyInterface->name << "\n";
-    } else if (analysis.percentOfTheoretical > 95.0) {
-        std::cout << "  +-- [!] Unusually high (exceeds typical overhead)\n";
-    } else if (analysis.percentOfTheoretical < 60.0) {
-        std::cout << "  +-- [!] Lower than expected - possible bottleneck\n";
-    }
-}
-
-void PrintInterfaceReferenceChart() {
-    std::cout << "\n";
-    PrintDoubleDivider();
-    std::cout << "PCIe & Thunderbolt Bandwidth Reference Chart\n";
-    PrintDoubleDivider();
-    
-    std::cout << "\nPCIe 3.0 (2010-2016 platforms):\n";
-    PrintDivider();
-    std::cout << "  x1   ~1.0 GB/s   | x4   ~4.0 GB/s\n";
-    std::cout << "  x8   ~7.9 GB/s   | x16  ~15.8 GB/s\n";
-    
-    std::cout << "\nPCIe 4.0 (2019+ AMD, 2021+ Intel):\n";
-    PrintDivider();
-    std::cout << "  x1   ~2.0 GB/s   | x4   ~7.9 GB/s\n";
-    std::cout << "  x8   ~15.8 GB/s  | x16  ~31.5 GB/s\n";
-    
-    std::cout << "\nPCIe 5.0 (2022+ AMD, 2022+ Intel):\n";
-    PrintDivider();
-    std::cout << "  x1   ~3.9 GB/s   | x4   ~15.8 GB/s\n";
-    std::cout << "  x8   ~31.5 GB/s  | x16  ~63.0 GB/s\n";
-    
-    std::cout << "\nThunderbolt (eGPU connections):\n";
-    PrintDivider();
-    std::cout << "  TB3 (40 Gbps)    ~2.8 GB/s\n";
-    std::cout << "  TB4 (40 Gbps)    ~2.8 GB/s\n";
-    std::cout << "  TB5 (80 Gbps)    ~6.0 GB/s bidirectional\n";
-    std::cout << "  TB5 (120 Gbps)   ~12.0 GB/s download mode\n";
-    
-    std::cout << "\nOther Connections:\n";
-    PrintDivider();
-    std::cout << "  OCuLink Gen 3    ~4.0 GB/s   (PCIe 3.0 x4)\n";
-    std::cout << "  OCuLink Gen 4    ~7.9 GB/s   (PCIe 4.0 x4)\n";
-    std::cout << "  USB4 (40 Gbps)   ~4.8 GB/s\n";
-    
-    std::cout << "\nNote: Values shown are theoretical maximums.\n";
-    std::cout << "Real-world performance is typically 70-90% of theoretical.\n";
-    PrintDoubleDivider();
-}
-
-void PrintInterfaceGuess(double uploadBandwidth, double downloadBandwidth) {
     std::cout << "\n";
     PrintDoubleDivider();
     std::cout << "Interface Detection\n";
     PrintDoubleDivider();
     
-    // Analyze both directions
-    BandwidthAnalysis uploadAnalysis = AnalyzeBandwidth(uploadBandwidth);
-    BandwidthAnalysis downloadAnalysis = AnalyzeBandwidth(downloadBandwidth);
-    
-    // Use the more constraining direction (usually upload for GPU)
-    double avgBandwidth = (uploadBandwidth + downloadBandwidth) / 2.0;
-    BandwidthAnalysis primaryAnalysis = AnalyzeBandwidth(avgBandwidth);
-    
-    if (primaryAnalysis.likelyInterface) {
+    if (analysis.likelyInterface) {
         std::cout << "\n+-- Likely Connection Type ---------------------\n";
-        std::cout << "|\n";
-        std::cout << "|  " << primaryAnalysis.likelyInterface->name << "\n";
-        std::cout << "|  " << primaryAnalysis.likelyInterface->description << "\n";
-        std::cout << "|\n";
-        std::cout << "|  Upload:   " << std::fixed << std::setprecision(2) << uploadBandwidth 
-                  << " GB/s  (" << std::setprecision(1) << uploadAnalysis.percentOfTheoretical << "% of " 
-                  << uploadAnalysis.likelyInterface->name << ")\n";
-        std::cout << "|  Download: " << std::fixed << std::setprecision(2) << downloadBandwidth 
-                  << " GB/s  (" << std::setprecision(1) << downloadAnalysis.percentOfTheoretical << "% of " 
-                  << downloadAnalysis.likelyInterface->name << ")\n";
-        std::cout << "|\n";
+        std::cout << "|\n|  " << analysis.likelyInterface->name << "\n";
+        std::cout << "|  " << analysis.likelyInterface->description << "\n|\n";
         
-        // Provide context-specific recommendations
-        if (primaryAnalysis.isRealistic) {
-            std::cout << "|  [OK] Performance is as expected for this interface\n";
-        } else if (primaryAnalysis.percentOfTheoretical < 60.0) {
-            std::cout << "|  [!] Lower than expected - possible issues:\n";
-            std::cout << "|    * GPU might be in reduced PCIe mode (x8 instead of x16)\n";
-            std::cout << "|    * PCIe slot might be limited (check motherboard manual)\n";
-            std::cout << "|    * Driver or system configuration issue\n";
-            std::cout << "|    * Thermal throttling\n";
-        } else if (primaryAnalysis.percentOfTheoretical > 95.0) {
-            std::cout << "|  [i] Exceptionally high efficiency - excellent!\n";
-        }
+        double upPct = (uploadBW / analysis.likelyInterface->bandwidth_gbps) * 100.0;
+        double dnPct = (downloadBW / analysis.likelyInterface->bandwidth_gbps) * 100.0;
+        double avgPct = (avgBW / analysis.likelyInterface->bandwidth_gbps) * 100.0;
         
-        std::cout << "|\n";
-        std::cout << "+-----------------------------------------------\n";
+        std::cout << std::fixed << std::setprecision(2);
+        std::cout << "|  Upload:   " << uploadBW << " GB/s  (" << std::setprecision(1) << upPct << "% of " << analysis.likelyInterface->name << ")\n";
+        std::cout << "|  Download: " << std::setprecision(2) << downloadBW << " GB/s  (" << std::setprecision(1) << dnPct << "% of " << analysis.likelyInterface->name << ")\n|\n";
+        
+        if (avgPct >= Constants::EXCEPTIONAL_THRESHOLD) std::cout << "|  [i] Exceptionally high efficiency - excellent!\n";
+        else if (analysis.isRealistic) std::cout << "|  [OK] Performance is as expected for this interface\n";
+        else if (avgPct < Constants::REALISTIC_MIN_PERCENT) std::cout << "|  [!] Lower than expected - possible bottleneck\n";
+        
+        std::cout << "|\n+-----------------------------------------------\n";
     }
-    
     PrintDoubleDivider();
 }
 
-inline void PrintBandwidthComparison(double measured_gbps, const char* test_label = "Measured") {
-    PrintDoubleDivider();
-    std::cout << "Bandwidth Comparison: " << test_label << "\n";
-    PrintDivider();
-    std::cout << "Measured: " << std::fixed << std::setprecision(2) << measured_gbps << " GB/s\n";
-    // ... you can expand this with more comparison logic as needed
-    PrintDoubleDivider();
+// ============================================================================
+//                     MULTI-RUN AGGREGATION
+// ============================================================================
+
+inline AggregatedResults AggregateRuns(const std::vector<TestResults>& runs) {
+    AggregatedResults agg;
+    if (runs.empty()) return agg;
+    
+    agg.testName = runs[0].testName;
+    agg.unit = runs[0].unit;
+    agg.runs = runs;
+    
+    std::vector<double> avgValues;
+    for (const auto& r : runs) {
+        agg.avgMin += r.minValue;
+        agg.avgAvg += r.avgValue;
+        agg.avgMax += r.maxValue;
+        agg.avgP99 += r.p99Value;
+        agg.avgP999 += r.p999Value;
+        avgValues.push_back(r.avgValue);
+    }
+    
+    size_t n = runs.size();
+    agg.avgMin /= n; agg.avgAvg /= n; agg.avgMax /= n;
+    agg.avgP99 /= n; agg.avgP999 /= n;
+    agg.stdDevAvg = CalculateStdDev(avgValues, agg.avgAvg);
+    
+    return agg;
 }
+
+inline void PrintAggregatedResults(const AggregatedResults& agg, int numRuns) {
+    PrintDivider();
+    std::cout << "Aggregated (" << numRuns << " runs): " << agg.testName << "\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  Avg: " << agg.avgAvg << " " << agg.unit << " (StdDev: " << agg.stdDevAvg << ")\n";
+    std::cout << "  Min: " << agg.avgMin << " | Max: " << agg.avgMax << " " << agg.unit << "\n";
+}
+
+// ============================================================================
+//                            CSV LOGGER
+// ============================================================================
+
+class CSVLogger {
+public:
+    CSVLogger(const std::string& filename) : filename_(filename) {
+        std::ifstream check(filename);
+        bool exists = check.good();
+        check.close();
+        file_.open(filename, std::ios::app);
+        if (!exists && file_.is_open()) file_ << "Timestamp,API,Test Name,Run,Min,Avg,Max,P99,P99.9,StdDev,Unit\n";
+    }
+    ~CSVLogger() { if (file_.is_open()) file_.close(); }
+
+    void LogResult(const TestResults& r, const std::string& api, int run = 0) {
+        if (!file_.is_open()) return;
+        auto t = std::chrono::system_clock::to_time_t(r.timestamp);
+        std::tm tm; localtime_s(&tm, &t);
+        file_ << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "," << api << "," << r.testName << ","
+              << run << "," << r.minValue << "," << r.avgValue << "," << r.maxValue << ","
+              << r.p99Value << "," << r.p999Value << ",," << r.unit << "\n";
+        file_.flush();
+    }
+
+    void LogAggregated(const AggregatedResults& r, const std::string& api) {
+        if (!file_.is_open()) return;
+        auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        std::tm tm; localtime_s(&tm, &t);
+        file_ << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << "," << api << "," << r.testName << ",AVG,"
+              << r.avgMin << "," << r.avgAvg << "," << r.avgMax << ","
+              << r.avgP99 << "," << r.avgP999 << "," << r.stdDevAvg << "," << r.unit << "\n";
+        file_.flush();
+    }
+
+private:
+    std::string filename_;
+    std::ofstream file_;
+};
+
 #endif // BANDWIDTH_ANALYSIS_H
