@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v2.2 - GUI Edition
+// GPU-PCIe-Test v2.5 - GUI Edition
 // Dear ImGui + D3D12 Frontend
 // ============================================================================
 // This is a graphical frontend for the GPU/PCIe benchmark tool.
@@ -8,6 +8,8 @@
 // - Interactive configuration
 // - Results graphs and charts with standard comparisons
 // - CSV export
+// - VRAM-aware buffer sizing
+// - eGPU auto-detection
 // ============================================================================
 
 #ifndef NOMINMAX
@@ -31,6 +33,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <map>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -59,6 +62,20 @@ namespace Constants {
     constexpr int DEFAULT_LATENCY_ITERS = 2000; // Reduced from 10000 - still accurate, much faster
     constexpr int DEFAULT_NUM_RUNS = 3;
     constexpr float BASE_FONT_SCALE = 1.0f;  // User's preferred 2x scaling
+    
+    // Timeout and retry constants
+    constexpr DWORD FENCE_WAIT_TIMEOUT_MS = 8000;       // 8 seconds per fence wait
+    constexpr int MAX_FENCE_RETRIES = 3;                // Max retries before aborting
+    constexpr DWORD GLOBAL_BENCHMARK_TIMEOUT_MS = 300000; // 5 minute global timeout
+    
+    // VRAM safety margin (leave 20% free for system use)
+    constexpr double VRAM_SAFETY_MARGIN = 0.8;
+    constexpr size_t MIN_BANDWIDTH_SIZE = 16ull * 1024 * 1024;  // 16 MB minimum
+    
+    // eGPU detection thresholds
+    constexpr double EGPU_BANDWIDTH_THRESHOLD = 5.0;  // GB/s - below this suggests external connection
+    constexpr double TB3_MAX_BANDWIDTH = 3.5;         // Thunderbolt 3 typical max
+    constexpr double TB4_MAX_BANDWIDTH = 4.5;         // Thunderbolt 4 typical max
 }
 
 // ============================================================================
@@ -72,6 +89,10 @@ struct GPUInfo {
     size_t      dedicatedVRAM = 0;
     size_t      sharedMemory = 0;
     bool        isIntegrated = false;
+    bool        isValid = true;  // False for "no GPU found" placeholder
+    
+    // Store adapter for reliable selection (handles hot-plug scenarios)
+    ComPtr<IDXGIAdapter1> adapter;
 };
 
 struct BenchmarkResult {
@@ -93,6 +114,7 @@ struct BenchmarkConfig {
     bool   runBidirectional = true;
     bool   runLatency = true;
     bool   quickMode = false;
+    bool   averageRuns = true;  // When false, record each run individually
     int    selectedGPU = 0;
 };
 
@@ -102,7 +124,7 @@ struct InterfaceSpeed {
     const char* description;
 };
 
-// Updated interface standards with OCuLink and corrected TB3/TB4 speeds
+// Updated interface standards with OCuLink, TB5, and PCIe 6.0
 // TB3 has variable PCIe allocation (typically 2 lanes), TB4 guarantees more bandwidth
 static const InterfaceSpeed INTERFACE_SPEEDS[] = {
     {"PCIe 3.0 x4",    3.94,  "Entry-level GPU slot"},
@@ -112,11 +134,13 @@ static const InterfaceSpeed INTERFACE_SPEEDS[] = {
     {"PCIe 4.0 x8",    15.75, "Mid-range PCIe 4.0"},
     {"PCIe 4.0 x16",   31.51, "High-end discrete GPU"},
     {"PCIe 5.0 x8",    31.51, "PCIe 5.0 mid-range"},
-    {"PCIe 5.0 x16",   63.02, "Cutting-edge GPU slot"},
+    {"PCIe 5.0 x16",   63.02, "High-end PCIe 5.0 GPU slot"},
+    {"PCIe 6.0 x16",   126.03, "Next-gen PCIe 6.0 GPU slot"},
     {"OCuLink 1.0",    3.94,  "PCIe 3.0 x4 external"},
     {"OCuLink 2.0",    7.88,  "PCIe 4.0 x4 external"},
     {"Thunderbolt 3",  2.50,  "40 Gbps (variable PCIe allocation)"},
     {"Thunderbolt 4",  3.00,  "40 Gbps (guaranteed PCIe bandwidth)"},
+    {"Thunderbolt 5",  10.00, "80 Gbps bi-directional / 120 Gbps boost"},
     {"USB4 40Gbps",    4.00,  "40 Gbps external"},
     {"USB4 80Gbps",    8.00,  "80 Gbps external"},
 };
@@ -127,6 +151,9 @@ static const int NUM_INTERFACE_SPEEDS = sizeof(INTERFACE_SPEEDS) / sizeof(INTERF
 // APPLICATION STATE
 // ============================================================================
 enum class AppState { Idle, Running, Completed };
+
+// Fence wait result for robust error handling
+enum class FenceWaitResult { Success, Timeout, Error, Cancelled };
 
 struct AppContext {
     // Window
@@ -175,10 +202,16 @@ struct AppContext {
     std::atomic<int>   totalTests{ 0 };
     std::atomic<int>   completedTests{ 0 };
     std::atomic<bool>  cancelRequested{ false };
+    std::atomic<bool>  benchmarkAborted{ false };  // For critical failures
+    std::atomic<int>   fenceTimeoutCount{ 0 };     // Track consecutive timeouts
     std::string        currentTest;
     std::mutex         resultsMutex;
     std::vector<BenchmarkResult> results;
     std::thread        benchmarkThread;
+    std::atomic<bool>  benchmarkThreadRunning{ false };  // Track if thread is active
+    
+    // Benchmark timing for global timeout
+    std::chrono::steady_clock::time_point benchmarkStartTime;
 
     // UI State (removed g_ prefix - cleaner inside struct)
     bool showResultsWindow = false;
@@ -204,6 +237,10 @@ struct AppContext {
     double      downloadPercentage = 0;    // Percentage of closest standard
     std::string closestUploadStandard;     // Name of closest standard
     std::string closestDownloadStandard;   // Name of closest standard
+    
+    // eGPU detection
+    bool        possibleEGPU = false;
+    std::string eGPUConnectionType;
 };
 
 static AppContext g_app;
@@ -248,6 +285,20 @@ std::string FormatMemory(size_t bytes) {
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(1) << gb << " GB";
     return ss.str();
+}
+
+std::string FormatVendorDeviceId(uint32_t vendorId, uint32_t deviceId) {
+    std::ostringstream ss;
+    ss << std::hex << std::uppercase << std::setfill('0');
+    ss << "0x" << std::setw(4) << vendorId << ":0x" << std::setw(4) << deviceId;
+    return ss.str();
+}
+
+// Check if global benchmark timeout has been exceeded
+bool IsGlobalTimeoutExceeded() {
+    auto elapsed = std::chrono::steady_clock::now() - g_app.benchmarkStartTime;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > 
+           Constants::GLOBAL_BENCHMARK_TIMEOUT_MS;
 }
 
 // Find closest interface standard and calculate percentage
@@ -311,6 +362,33 @@ void DetectInterface(double upload, double download) {
     FindClosestInterface(download, g_app.closestDownloadStandard, g_app.downloadPercentage);
 }
 
+// Detect if this might be an eGPU based on bandwidth and GPU type
+void DetectEGPU(double upload, double download, bool isIntegrated) {
+    g_app.possibleEGPU = false;
+    g_app.eGPUConnectionType.clear();
+    
+    // iGPUs are never eGPUs
+    if (isIntegrated) return;
+    
+    double maxBandwidth = std::max(upload, download);
+    
+    // If a discrete GPU has suspiciously low bandwidth, it might be external
+    if (maxBandwidth < Constants::EGPU_BANDWIDTH_THRESHOLD) {
+        g_app.possibleEGPU = true;
+        
+        // Try to identify the connection type
+        if (maxBandwidth <= Constants::TB3_MAX_BANDWIDTH) {
+            g_app.eGPUConnectionType = "Thunderbolt 3 / USB4 40Gbps";
+        } else if (maxBandwidth <= Constants::TB4_MAX_BANDWIDTH) {
+            g_app.eGPUConnectionType = "Thunderbolt 4 / USB4";
+        } else {
+            g_app.eGPUConnectionType = "External (OCuLink / USB4 80Gbps)";
+        }
+        
+        Log("[INFO] Possible eGPU detected via " + g_app.eGPUConnectionType);
+    }
+}
+
 // ============================================================================
 // GPU ENUMERATION
 // ============================================================================
@@ -318,7 +396,16 @@ void EnumerateGPUs() {
     g_app.gpuList.clear();
 
     ComPtr<IDXGIFactory6> factory;
-    CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
+    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+        Log("[ERROR] Failed to create DXGI factory");
+        // Add placeholder for no GPU
+        GPUInfo placeholder;
+        placeholder.name = "No GPU Found";
+        placeholder.vendor = "N/A";
+        placeholder.isValid = false;
+        g_app.gpuList.push_back(placeholder);
+        return;
+    }
 
     ComPtr<IDXGIAdapter1> adapter;
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
@@ -338,9 +425,68 @@ void EnumerateGPUs() {
         info.dedicatedVRAM = desc.DedicatedVideoMemory;
         info.sharedMemory = desc.SharedSystemMemory;
         info.isIntegrated = (desc.DedicatedVideoMemory == 0);
+        info.isValid = true;
+        
+        // Store the adapter pointer for reliable selection later
+        info.adapter = adapter;
 
-        g_app.gpuList.push_back(info);
+        g_app.gpuList.push_back(std::move(info));
+        
+        // Reset for next iteration
+        adapter.Reset();
     }
+    
+    // If no hardware GPUs found, add a placeholder
+    if (g_app.gpuList.empty()) {
+        Log("[WARNING] No hardware GPUs found!");
+        GPUInfo placeholder;
+        placeholder.name = "No GPU Found - Check drivers";
+        placeholder.vendor = "N/A";
+        placeholder.isValid = false;
+        g_app.gpuList.push_back(placeholder);
+    }
+}
+
+// Get safe maximum bandwidth size based on GPU VRAM
+size_t GetSafeMaxBandwidthSize(int gpuIndex) {
+    if (gpuIndex < 0 || gpuIndex >= static_cast<int>(g_app.gpuList.size())) {
+        return Constants::MIN_BANDWIDTH_SIZE;
+    }
+    
+    const GPUInfo& gpu = g_app.gpuList[gpuIndex];
+    if (!gpu.isValid) {
+        return Constants::MIN_BANDWIDTH_SIZE;
+    }
+    
+    size_t availableVRAM = gpu.dedicatedVRAM;
+    
+    // For iGPUs, use shared memory but be more conservative
+    if (gpu.isIntegrated) {
+        availableVRAM = gpu.sharedMemory / 4;  // Use 25% of shared memory max
+    }
+    
+    // Apply safety margin and account for needing multiple buffers
+    // (upload, download, GPU-side buffers = ~4x the test size)
+    size_t safeMax = static_cast<size_t>(availableVRAM * Constants::VRAM_SAFETY_MARGIN / 4);
+    
+    // Clamp to reasonable bounds
+    safeMax = std::max(safeMax, Constants::MIN_BANDWIDTH_SIZE);
+    safeMax = std::min(safeMax, 2ull * 1024 * 1024 * 1024);  // 2GB max
+    
+    return safeMax;
+}
+
+// Validate and potentially cap bandwidth size for selected GPU
+size_t ValidateBandwidthSize(size_t requestedSize, int gpuIndex) {
+    size_t maxSafe = GetSafeMaxBandwidthSize(gpuIndex);
+    
+    if (requestedSize > maxSafe) {
+        Log("[WARNING] Requested bandwidth size " + FormatSize(requestedSize) + 
+            " exceeds safe limit for this GPU. Capping to " + FormatSize(maxSafe));
+        return maxSafe;
+    }
+    
+    return requestedSize;
 }
 
 // ============================================================================
@@ -416,20 +562,47 @@ bool InitD3D12() {
 // ============================================================================
 
 bool InitBenchmarkDevice(int gpuIndex) {
-    ComPtr<IDXGIFactory6> factory;
-    CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
-
-    ComPtr<IDXGIAdapter1> adapter;
-    int idx = 0;
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC1 desc;
-        adapter->GetDesc1(&desc);
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-        if (idx == gpuIndex) break;
-        idx++;
+    if (gpuIndex < 0 || gpuIndex >= static_cast<int>(g_app.gpuList.size())) {
+        Log("[ERROR] Invalid GPU index: " + std::to_string(gpuIndex));
+        return false;
     }
+    
+    const GPUInfo& selectedGPU = g_app.gpuList[gpuIndex];
+    
+    // Check if this is a valid GPU
+    if (!selectedGPU.isValid) {
+        Log("[ERROR] Cannot benchmark - no valid GPU selected");
+        return false;
+    }
+    
+    // Use the stored adapter pointer for reliable selection
+    if (selectedGPU.adapter) {
+        if (FAILED(D3D12CreateDevice(selectedGPU.adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_app.benchDevice)))) {
+            Log("[ERROR] Failed to create D3D12 device on selected adapter");
+            return false;
+        }
+    } else {
+        // Fallback: Re-enumerate and match by index (legacy behavior)
+        Log("[WARNING] Using fallback adapter enumeration - adapter pointer was null");
+        ComPtr<IDXGIFactory6> factory;
+        CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
 
-    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_app.benchDevice)))) return false;
+        ComPtr<IDXGIAdapter1> adapter;
+        int idx = 0;
+        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+            DXGI_ADAPTER_DESC1 desc;
+            adapter->GetDesc1(&desc);
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+            if (idx == gpuIndex) break;
+            idx++;
+            adapter.Reset();
+        }
+
+        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_app.benchDevice)))) {
+            Log("[ERROR] Failed to create D3D12 device via fallback enumeration");
+            return false;
+        }
+    }
 
     D3D12_COMMAND_QUEUE_DESC qd = {};
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
@@ -440,6 +613,7 @@ bool InitBenchmarkDevice(int gpuIndex) {
     if (FAILED(g_app.benchDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_app.benchFence)))) return false;
     g_app.benchFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     g_app.benchFenceValue = 1;
+    g_app.fenceTimeoutCount = 0;  // Reset timeout counter
 
     return true;
 }
@@ -475,32 +649,72 @@ ComPtr<ID3D12Resource> CreateBuffer(D3D12_HEAP_TYPE heapType, size_t size, D3D12
         &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource));
 
     if (FAILED(hr)) {
-        Log("[ERROR] CreateCommittedResource failed: HRESULT = 0x" + std::to_string(hr));
+        Log("[ERROR] CreateCommittedResource failed: HRESULT = 0x" + std::to_string(hr) + 
+            " (Size: " + FormatSize(size) + ")");
         return nullptr;
     }
 
     return resource;
 }
 
-void WaitForBenchFence() {
+// Enhanced fence wait with retry logic and global timeout checking
+FenceWaitResult WaitForBenchFenceEx() {
+    // Check for cancellation first
+    if (g_app.cancelRequested) {
+        return FenceWaitResult::Cancelled;
+    }
+    
+    // Check global timeout
+    if (IsGlobalTimeoutExceeded()) {
+        Log("[ERROR] Global benchmark timeout exceeded (5 minutes)");
+        return FenceWaitResult::Timeout;
+    }
+    
     g_app.benchQueue->Signal(g_app.benchFence.Get(), g_app.benchFenceValue);
 
     if (g_app.benchFence->GetCompletedValue() < g_app.benchFenceValue) {
         HRESULT hr = g_app.benchFence->SetEventOnCompletion(g_app.benchFenceValue, g_app.benchFenceEvent);
         if (FAILED(hr)) {
             Log("[ERROR] SetEventOnCompletion failed: " + std::to_string(hr));
-            return;
+            return FenceWaitResult::Error;
         }
 
-        DWORD waitResult = WaitForSingleObject(g_app.benchFenceEvent, 8000);
+        DWORD waitResult = WaitForSingleObject(g_app.benchFenceEvent, Constants::FENCE_WAIT_TIMEOUT_MS);
         if (waitResult == WAIT_TIMEOUT) {
-            Log("[WARNING] Benchmark fence wait timed out after 8s - possible GPU hang");
+            g_app.fenceTimeoutCount++;
+            Log("[WARNING] Benchmark fence wait timed out after " + 
+                std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" + 
+                std::to_string(g_app.fenceTimeoutCount.load()) + ")");
+            
+            if (g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) {
+                Log("[ERROR] Max fence timeouts exceeded - possible GPU hang. Aborting benchmark.");
+                g_app.benchmarkAborted = true;
+                return FenceWaitResult::Timeout;
+            }
+            
+            // Try to continue but warn
+            return FenceWaitResult::Timeout;
         } else if (waitResult != WAIT_OBJECT_0) {
             Log("[ERROR] WaitForSingleObject failed: " + std::to_string(GetLastError()));
+            return FenceWaitResult::Error;
         }
+        
+        // Success - reset timeout counter
+        g_app.fenceTimeoutCount = 0;
     }
 
     g_app.benchFenceValue++;
+    return FenceWaitResult::Success;
+}
+
+// Legacy wrapper for compatibility
+void WaitForBenchFence() {
+    WaitForBenchFenceEx();
+}
+
+// Check if we should abort the current test/benchmark
+bool ShouldAbortBenchmark() {
+    return g_app.cancelRequested || g_app.benchmarkAborted || IsGlobalTimeoutExceeded();
 }
 
 BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, size_t size, int copies, int batches) {
@@ -508,6 +722,12 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
     BenchmarkResult result;
     result.testName = name;
     result.unit = "GB/s";
+
+    // Validate inputs
+    if (!src || !dst) {
+        Log("[ERROR] Invalid source or destination buffer in bandwidth test");
+        return result;
+    }
 
     // Create timestamp query heap
     D3D12_QUERY_HEAP_DESC qhd = {};
@@ -520,19 +740,28 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
     }
 
     auto queryReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, sizeof(UINT64) * 2, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!queryReadback) return result;
+    if (!queryReadback) {
+        Log("[ERROR] Failed to create query readback buffer - aborting test");
+        return result;
+    }
 
     UINT64 timestampFreq = 0;
-    g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-    if (timestampFreq == 0) {
-        Log("[ERROR] Failed to get timestamp frequency");
+    HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
+    if (FAILED(freqResult) || timestampFreq == 0) {
+        Log("[ERROR] Failed to get valid timestamp frequency (freq=" + std::to_string(timestampFreq) + ")");
         return result;
     }
 
     std::vector<double> bandwidths;
     bandwidths.reserve(batches);
+    int failedBatches = 0;
 
-    for (int i = 0; i < batches && !g_app.cancelRequested; ++i) {
+    for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
+        // Small sleep to reduce CPU spin when checking cancellation
+        if (i % 8 == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        
         g_app.benchAllocator->Reset();
         g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
 
@@ -552,30 +781,56 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
 
         ID3D12CommandList* lists[] = { g_app.benchList.Get() };
         g_app.benchQueue->ExecuteCommandLists(1, lists);
-        WaitForBenchFence();
+        
+        FenceWaitResult fenceResult = WaitForBenchFenceEx();
+        if (fenceResult == FenceWaitResult::Cancelled) {
+            break;
+        }
+        if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
+            Log("[ERROR] Critical fence error - aborting bandwidth test");
+            break;
+        }
 
         // Read timestamps
         UINT64* timestamps = nullptr;
         D3D12_RANGE readRange = { 0, sizeof(UINT64) * 2 };
         if (SUCCEEDED(queryReadback->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
-            double seconds = static_cast<double>(timestamps[1] - timestamps[0]) / static_cast<double>(timestampFreq);
+            UINT64 delta = timestamps[1] - timestamps[0];
             queryReadback->Unmap(0, nullptr);
-
-            double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
-            bandwidths.push_back(bw);
+            
+            // Sanity check on delta
+            if (delta > 0 && timestampFreq > 0) {
+                double seconds = static_cast<double>(delta) / static_cast<double>(timestampFreq);
+                if (seconds > 0) {
+                    double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                    bandwidths.push_back(bw);
+                } else {
+                    failedBatches++;
+                }
+            } else {
+                failedBatches++;
+            }
         } else {
             Log("[ERROR] Failed to map query readback buffer in bandwidth test");
+            failedBatches++;
         }
 
         g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
     }
 
+    // Calculate results only if we have valid samples
     if (!bandwidths.empty()) {
         std::sort(bandwidths.begin(), bandwidths.end());
         result.minValue = bandwidths.front();
         result.maxValue = bandwidths.back();
         result.avgValue = std::accumulate(bandwidths.begin(), bandwidths.end(), 0.0) / bandwidths.size();
         result.samples = std::move(bandwidths);
+        
+        if (failedBatches > 0) {
+            Log("[WARNING] " + std::to_string(failedBatches) + " batches failed in " + name);
+        }
+    } else {
+        Log("[WARNING] No valid samples collected for " + name);
     }
 
     return result;
@@ -588,6 +843,11 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
     result.unit = "us";
 
     if (iterations <= 0) return result;
+    
+    if (!src || !dst) {
+        Log("[ERROR] Invalid source or destination buffer in latency test");
+        return result;
+    }
 
     // ────────────────────────────────────────────────────────────────
     // Setup timestamp resources (create once per test)
@@ -607,19 +867,27 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
     // Large enough readback buffer for all timestamps in one go
     size_t readbackSize = sizeof(UINT64) * QueriesPerBatch * 2;
     auto readbackBuffer = CreateBuffer(D3D12_HEAP_TYPE_READBACK, readbackSize, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!readbackBuffer) return result;
+    if (!readbackBuffer) {
+        Log("[ERROR] Failed to create readback buffer - aborting latency test");
+        return result;
+    }
 
     UINT64 timestampFreq = 0;
-    g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-    if (timestampFreq == 0) {
-        Log("[ERROR] Failed to get timestamp frequency");
+    HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
+    if (FAILED(freqResult) || timestampFreq == 0) {
+        Log("[ERROR] Failed to get valid timestamp frequency");
         return result;
     }
 
     std::vector<double> latencies;
     latencies.reserve(iterations);
 
-    for (int b = 0; b < batches && !g_app.cancelRequested; ++b) {
+    for (int b = 0; b < batches && !ShouldAbortBenchmark(); ++b) {
+        // Small sleep to reduce CPU spin
+        if (b % 4 == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        
         int opsThisBatch = std::min(QueriesPerBatch, iterations - (int)latencies.size());
 
         g_app.benchAllocator->Reset();
@@ -639,7 +907,11 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
 
         ID3D12CommandList* lists[] = { g_app.benchList.Get() };
         g_app.benchQueue->ExecuteCommandLists(1, lists);
-        WaitForBenchFence();
+        
+        FenceWaitResult fenceResult = WaitForBenchFenceEx();
+        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
+            break;
+        }
 
         // Map and extract deltas
         UINT64* timestamps = nullptr;
@@ -648,9 +920,11 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
             for (int i = 0; i < opsThisBatch; ++i) {
                 UINT64 tStart = timestamps[i * 2 + 0];
                 UINT64 tEnd = timestamps[i * 2 + 1];
-                double deltaSec = static_cast<double>(tEnd - tStart) / static_cast<double>(timestampFreq);
-                double us = deltaSec * 1'000'000.0;
-                latencies.push_back(us);
+                if (tEnd > tStart && timestampFreq > 0) {
+                    double deltaSec = static_cast<double>(tEnd - tStart) / static_cast<double>(timestampFreq);
+                    double us = deltaSec * 1'000'000.0;
+                    latencies.push_back(us);
+                }
             }
             readbackBuffer->Unmap(0, nullptr);
         } else {
@@ -667,6 +941,8 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
         result.maxValue = latencies.back();
         result.avgValue = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
         result.samples = std::move(latencies);
+    } else {
+        Log("[WARNING] No valid latency samples collected for " + name);
     }
 
     return result;
@@ -694,19 +970,27 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
 
     size_t readbackSize = sizeof(UINT64) * QueriesPerBatch * 2;
     auto readbackBuffer = CreateBuffer(D3D12_HEAP_TYPE_READBACK, readbackSize, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!readbackBuffer) return result;
+    if (!readbackBuffer) {
+        Log("[ERROR] Failed to create readback buffer - aborting command latency test");
+        return result;
+    }
 
     UINT64 timestampFreq = 0;
-    g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-    if (timestampFreq == 0) {
-        Log("[ERROR] Failed to get timestamp frequency");
+    HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
+    if (FAILED(freqResult) || timestampFreq == 0) {
+        Log("[ERROR] Failed to get valid timestamp frequency");
         return result;
     }
 
     std::vector<double> latencies;
     latencies.reserve(iterations);
 
-    for (int b = 0; b < batches && !g_app.cancelRequested; ++b) {
+    for (int b = 0; b < batches && !ShouldAbortBenchmark(); ++b) {
+        // Small sleep to reduce CPU spin
+        if (b % 4 == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        
         int opsThisBatch = std::min(QueriesPerBatch, iterations - static_cast<int>(latencies.size()));
 
         g_app.benchAllocator->Reset();
@@ -724,7 +1008,11 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
 
         ID3D12CommandList* lists[] = { g_app.benchList.Get() };
         g_app.benchQueue->ExecuteCommandLists(1, lists);
-        WaitForBenchFence();
+        
+        FenceWaitResult fenceResult = WaitForBenchFenceEx();
+        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
+            break;
+        }
 
         UINT64* timestamps = nullptr;
         D3D12_RANGE readRange = { 0, readbackSize };
@@ -732,9 +1020,11 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
             for (int i = 0; i < opsThisBatch; ++i) {
                 UINT64 tStart = timestamps[i * 2 + 0];
                 UINT64 tEnd = timestamps[i * 2 + 1];
-                double deltaSec = static_cast<double>(tEnd - tStart) / static_cast<double>(timestampFreq);
-                double us = deltaSec * 1'000'000.0;
-                latencies.push_back(us);
+                if (timestampFreq > 0) {
+                    double deltaSec = static_cast<double>(tEnd - tStart) / static_cast<double>(timestampFreq);
+                    double us = deltaSec * 1'000'000.0;
+                    latencies.push_back(us);
+                }
             }
             readbackBuffer->Unmap(0, nullptr);
         } else {
@@ -750,6 +1040,8 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
         result.maxValue = latencies.back();
         result.avgValue = std::accumulate(latencies.begin(), latencies.end(), 0.0) / latencies.size();
         result.samples = std::move(latencies);
+    } else {
+        Log("[WARNING] No valid command latency samples collected");
     }
 
     return result;
@@ -767,7 +1059,7 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
     auto cpuReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST);
 
     if (!cpuUpload || !gpuDefault || !gpuSrc || !cpuReadback) {
-        Log("[ERROR] Failed to create resources for bidirectional test");
+        Log("[ERROR] Failed to create resources for bidirectional test - likely out of VRAM");
         return result;
     }
 
@@ -784,16 +1076,21 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
     if (!queryReadback) return result;
 
     UINT64 timestampFreq = 0;
-    g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-    if (timestampFreq == 0) {
-        Log("[ERROR] Failed to get timestamp frequency");
+    HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
+    if (FAILED(freqResult) || timestampFreq == 0) {
+        Log("[ERROR] Failed to get valid timestamp frequency");
         return result;
     }
 
     std::vector<double> bandwidths;
     bandwidths.reserve(batches);
 
-    for (int i = 0; i < batches && !g_app.cancelRequested; ++i) {
+    for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
+        // Small sleep to reduce CPU spin
+        if (i % 8 == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        
         g_app.benchAllocator->Reset();
         g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
 
@@ -809,16 +1106,25 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
 
         ID3D12CommandList* lists[] = { g_app.benchList.Get() };
         g_app.benchQueue->ExecuteCommandLists(1, lists);
-        WaitForBenchFence();
+        
+        FenceWaitResult fenceResult = WaitForBenchFenceEx();
+        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
+            break;
+        }
 
         UINT64* timestamps = nullptr;
         D3D12_RANGE readRange = { 0, sizeof(UINT64) * 2 };
         if (SUCCEEDED(queryReadback->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
-            double seconds = static_cast<double>(timestamps[1] - timestamps[0]) / static_cast<double>(timestampFreq);
+            UINT64 delta = timestamps[1] - timestamps[0];
             queryReadback->Unmap(0, nullptr);
-
-            double bw = (static_cast<double>(size) * copies * 2 / (1024.0 * 1024.0 * 1024.0)) / seconds;
-            bandwidths.push_back(bw);
+            
+            if (delta > 0 && timestampFreq > 0) {
+                double seconds = static_cast<double>(delta) / static_cast<double>(timestampFreq);
+                if (seconds > 0) {
+                    double bw = (static_cast<double>(size) * copies * 2 / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                    bandwidths.push_back(bw);
+                }
+            }
         } else {
             Log("[ERROR] Failed to map query readback buffer in bidirectional test");
         }
@@ -832,27 +1138,87 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
         result.maxValue = bandwidths.back();
         result.avgValue = std::accumulate(bandwidths.begin(), bandwidths.end(), 0.0) / bandwidths.size();
         result.samples = std::move(bandwidths);
+    } else {
+        Log("[WARNING] No valid bidirectional samples collected");
     }
 
     return result;
 }
 
+// Helper to aggregate results with the same base test name
+std::vector<BenchmarkResult> AggregateResults(const std::vector<BenchmarkResult>& rawResults) {
+    // Map from base test name to aggregated samples
+    std::map<std::string, std::vector<double>> aggregatedSamples;
+    std::map<std::string, std::string> unitMap;
+    
+    for (const auto& r : rawResults) {
+        // Extract base name (remove " Run X" suffix if present)
+        std::string baseName = r.testName;
+        size_t runPos = baseName.find(" Run ");
+        if (runPos != std::string::npos) {
+            baseName = baseName.substr(0, runPos);
+        }
+        
+        // Append all samples
+        for (double s : r.samples) {
+            aggregatedSamples[baseName].push_back(s);
+        }
+        unitMap[baseName] = r.unit;
+    }
+    
+    // Build aggregated results
+    std::vector<BenchmarkResult> aggregated;
+    for (auto& [name, samples] : aggregatedSamples) {
+        if (samples.empty()) continue;
+        
+        BenchmarkResult r;
+        r.testName = name;
+        r.unit = unitMap[name];
+        
+        std::sort(samples.begin(), samples.end());
+        r.minValue = samples.front();
+        r.maxValue = samples.back();
+        r.avgValue = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
+        r.samples = std::move(samples);
+        
+        aggregated.push_back(r);
+    }
+    
+    return aggregated;
+}
+
 void BenchmarkThreadFunc() {
+    g_app.benchmarkThreadRunning = true;
+    g_app.benchmarkStartTime = std::chrono::steady_clock::now();
+    g_app.benchmarkAborted = false;
+    g_app.fenceTimeoutCount = 0;
+    
     Log("=== Benchmark Started ===");
     Log("GPU: " + g_app.gpuList[g_app.config.selectedGPU].name);
+    
+    // Validate and potentially cap bandwidth size based on VRAM
+    size_t originalSize = g_app.config.bandwidthSize;
+    g_app.config.bandwidthSize = ValidateBandwidthSize(originalSize, g_app.config.selectedGPU);
+    
     Log("Size: " + FormatSize(g_app.config.bandwidthSize));
+    if (g_app.config.bandwidthSize != originalSize) {
+        Log("[INFO] Size was reduced from " + FormatSize(originalSize) + " to fit VRAM");
+    }
     Log("Batches: " + std::to_string(g_app.config.bandwidthBatches));
     Log("Copies/Batch: " + std::to_string(g_app.config.copiesPerBatch));
     Log("Runs: " + std::to_string(g_app.config.numRuns));
+    Log("Average Runs: " + std::string(g_app.config.averageRuns ? "Yes" : "No (individual)"));
     Log("=========================");
 
     if (!InitBenchmarkDevice(g_app.config.selectedGPU)) {
         Log("[ERROR] Failed to initialize benchmark device!");
         g_app.state = AppState::Idle;
+        g_app.benchmarkThreadRunning = false;
         return;
     }
 
     std::vector<BenchmarkResult> allResults;
+    int successfulRuns = 0;
 
     // Calculate total tests
     int testsPerRun = 2;  // Upload + Download
@@ -861,65 +1227,103 @@ void BenchmarkThreadFunc() {
     g_app.totalTests = testsPerRun * g_app.config.numRuns;
 
     double avgUpload = 0, avgDownload = 0;
+    double maxUpload = 0, maxDownload = 0;  // Track best (max) values for individual mode
+    int uploadCount = 0, downloadCount = 0;
+    
+    // Suffix for individual run recording
+    auto getRunSuffix = [](int run, bool useAverage) -> std::string {
+        return useAverage ? "" : " Run " + std::to_string(run);
+    };
 
-    for (int run = 1; run <= g_app.config.numRuns && !g_app.cancelRequested; run++) {
+    for (int run = 1; run <= g_app.config.numRuns && !ShouldAbortBenchmark(); run++) {
         g_app.currentRun = run;
         Log("--- Run " + std::to_string(run) + " / " + std::to_string(g_app.config.numRuns) + " ---");
+        
+        bool runHadCriticalFailure = false;
+        std::string runSuffix = getRunSuffix(run, g_app.config.averageRuns);
 
         // Upload (CPU to GPU)
         auto cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_GENERIC_READ);
         if (!cpuUpload) {
-            Log("[CRITICAL] Failed to allocate upload buffer - skipping upload test");
-            continue;
+            Log("[CRITICAL] Failed to allocate upload buffer - aborting run");
+            runHadCriticalFailure = true;
         }
+        
         auto gpuDefault = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COPY_DEST);
         if (!gpuDefault) {
-            Log("[CRITICAL] Failed to allocate GPU default buffer - skipping upload test");
+            Log("[CRITICAL] Failed to allocate GPU default buffer - aborting run");
+            runHadCriticalFailure = true;
+        }
+        
+        if (runHadCriticalFailure) {
+            // Skip the entire run if we can't allocate critical buffers
+            g_app.completedTests += testsPerRun;  // Mark tests as "completed" (skipped)
+            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
             continue;
         }
-        auto resUpload = RunBandwidthTest("CPU->GPU " + FormatSize(g_app.config.bandwidthSize),
+        
+        auto resUpload = RunBandwidthTest("CPU->GPU " + FormatSize(g_app.config.bandwidthSize) + runSuffix,
             cpuUpload, gpuDefault,
             g_app.config.bandwidthSize,
             g_app.config.copiesPerBatch,
             g_app.config.bandwidthBatches);
-        allResults.push_back(resUpload);
-        avgUpload += resUpload.avgValue;
-        Log("  CPU->GPU: " + std::to_string(resUpload.avgValue).substr(0, 5) + " GB/s");
+        
+        if (!resUpload.samples.empty()) {
+            allResults.push_back(resUpload);
+            avgUpload += resUpload.avgValue;
+            maxUpload = std::max(maxUpload, resUpload.maxValue);  // Track best run
+            uploadCount++;
+            Log("  CPU->GPU: " + std::to_string(resUpload.avgValue).substr(0, 5) + " GB/s");
+        } else {
+            Log("[WARNING] Upload test produced no valid samples");
+        }
+        
         g_app.completedTests++;
         g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-        if (g_app.cancelRequested) break;
+        if (ShouldAbortBenchmark()) break;
 
         // Download (GPU to CPU)
         auto gpuSrc = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        if (!gpuSrc) {
-            Log("[CRITICAL] Failed to allocate GPU source buffer - skipping download test");
-            continue;
-        }
         auto cpuReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!cpuReadback) {
-            Log("[CRITICAL] Failed to allocate readback buffer - skipping download test");
-            continue;
+        
+        if (!gpuSrc || !cpuReadback) {
+            Log("[CRITICAL] Failed to allocate download buffers - skipping download test");
+            g_app.completedTests++;
+            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
+        } else {
+            auto resDownload = RunBandwidthTest("GPU->CPU " + FormatSize(g_app.config.bandwidthSize) + runSuffix,
+                gpuSrc, cpuReadback,
+                g_app.config.bandwidthSize,
+                g_app.config.copiesPerBatch,
+                g_app.config.bandwidthBatches);
+            
+            if (!resDownload.samples.empty()) {
+                allResults.push_back(resDownload);
+                avgDownload += resDownload.avgValue;
+                maxDownload = std::max(maxDownload, resDownload.maxValue);  // Track best run
+                downloadCount++;
+                Log("  GPU->CPU: " + std::to_string(resDownload.avgValue).substr(0, 5) + " GB/s");
+            } else {
+                Log("[WARNING] Download test produced no valid samples");
+            }
+            
+            g_app.completedTests++;
+            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
         }
-        auto resDownload = RunBandwidthTest("GPU->CPU " + FormatSize(g_app.config.bandwidthSize),
-            gpuSrc, cpuReadback,
-            g_app.config.bandwidthSize,
-            g_app.config.copiesPerBatch,
-            g_app.config.bandwidthBatches);
-        allResults.push_back(resDownload);
-        avgDownload += resDownload.avgValue;
-        Log("  GPU->CPU: " + std::to_string(resDownload.avgValue).substr(0, 5) + " GB/s");
-        g_app.completedTests++;
-        g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-        if (g_app.cancelRequested) break;
+        
+        if (ShouldAbortBenchmark()) break;
 
         // Bidirectional
         if (g_app.config.runBidirectional) {
             auto resBidir = RunBidirectionalTest(g_app.config.bandwidthSize, g_app.config.copiesPerBatch, g_app.config.bandwidthBatches);
-            allResults.push_back(resBidir);
-            Log("  Bidirectional: " + std::to_string(resBidir.avgValue).substr(0, 5) + " GB/s");
+            if (!resBidir.samples.empty()) {
+                resBidir.testName = "Bidirectional " + FormatSize(g_app.config.bandwidthSize) + runSuffix;
+                allResults.push_back(resBidir);
+                Log("  Bidirectional: " + std::to_string(resBidir.avgValue).substr(0, 5) + " GB/s");
+            }
             g_app.completedTests++;
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-            if (g_app.cancelRequested) break;
+            if (ShouldAbortBenchmark()) break;
         }
 
         // Latency tests
@@ -931,6 +1335,8 @@ void BenchmarkThreadFunc() {
 
             if (!latCpuUpload || !latGpuDefault || !latGpuSrc || !latCpuReadback) {
                 Log("[CRITICAL] Failed to allocate latency buffers - skipping latency tests");
+                g_app.completedTests += 3;  // Skip all 3 latency tests
+                g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
                 continue;
             }
 
@@ -940,56 +1346,108 @@ void BenchmarkThreadFunc() {
             RunLatencyTest("Warm-up Download", latGpuSrc, latCpuReadback, Constants::LATENCY_WARMUP_ITERATIONS);
             RunCommandLatencyTest(Constants::LATENCY_WARMUP_ITERATIONS);
 
-            // Real measurements
-            auto resUpLat = RunLatencyTest("CPU->GPU Latency", latCpuUpload, latGpuDefault, g_app.config.latencyIters);
-            allResults.push_back(resUpLat);
-            Log("  CPU->GPU Latency: " + std::to_string(resUpLat.avgValue).substr(0, 6) + " us");
-            g_app.completedTests++;
-            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-            if (g_app.cancelRequested) break;
+            if (ShouldAbortBenchmark()) break;
 
-            auto resDownLat = RunLatencyTest("GPU->CPU Latency", latGpuSrc, latCpuReadback, g_app.config.latencyIters);
-            allResults.push_back(resDownLat);
-            Log("  GPU->CPU Latency: " + std::to_string(resDownLat.avgValue).substr(0, 6) + " us");
+            // Real measurements
+            auto resUpLat = RunLatencyTest("CPU->GPU Latency" + runSuffix, latCpuUpload, latGpuDefault, g_app.config.latencyIters);
+            if (!resUpLat.samples.empty()) {
+                allResults.push_back(resUpLat);
+                Log("  CPU->GPU Latency: " + std::to_string(resUpLat.avgValue).substr(0, 6) + " us");
+            }
             g_app.completedTests++;
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-            if (g_app.cancelRequested) break;
+            if (ShouldAbortBenchmark()) break;
+
+            auto resDownLat = RunLatencyTest("GPU->CPU Latency" + runSuffix, latGpuSrc, latCpuReadback, g_app.config.latencyIters);
+            if (!resDownLat.samples.empty()) {
+                allResults.push_back(resDownLat);
+                Log("  GPU->CPU Latency: " + std::to_string(resDownLat.avgValue).substr(0, 6) + " us");
+            }
+            g_app.completedTests++;
+            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
+            if (ShouldAbortBenchmark()) break;
 
             auto resCmdLat = RunCommandLatencyTest(g_app.config.latencyIters);
-            allResults.push_back(resCmdLat);
-            Log("  Command Latency: " + std::to_string(resCmdLat.avgValue).substr(0, 6) + " us");
+            if (!resCmdLat.samples.empty()) {
+                resCmdLat.testName = "Command Latency" + runSuffix;
+                allResults.push_back(resCmdLat);
+                Log("  Command Latency: " + std::to_string(resCmdLat.avgValue).substr(0, 6) + " us");
+            }
             g_app.completedTests++;
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-            if (g_app.cancelRequested) break;
+            if (ShouldAbortBenchmark()) break;
         }
+        
+        successfulRuns++;
     }
 
     CleanupBenchmarkDevice();
 
     if (g_app.cancelRequested) {
-        Log("Benchmark cancelled");
+        Log("Benchmark cancelled by user");
+        g_app.state = AppState::Idle;
+    } else if (g_app.benchmarkAborted) {
+        Log("[ERROR] Benchmark aborted due to critical errors");
+        g_app.state = AppState::Idle;
+    } else if (uploadCount == 0 || downloadCount == 0) {
+        Log("[ERROR] Benchmark failed - no valid bandwidth measurements");
         g_app.state = AppState::Idle;
     } else {
-        avgUpload /= g_app.config.numRuns;
-        avgDownload /= g_app.config.numRuns;
-        DetectInterface(avgUpload, avgDownload);
+        // Calculate values based on mode
+        double reportUpload, reportDownload;
+        
+        if (g_app.config.averageRuns) {
+            // Average mode: use average of all runs
+            reportUpload = avgUpload / uploadCount;
+            reportDownload = avgDownload / downloadCount;
+        } else {
+            // Individual mode: use best (max) values for interface comparison
+            reportUpload = maxUpload;
+            reportDownload = maxDownload;
+        }
+        
+        DetectInterface(reportUpload, reportDownload);
+        
+        // Check for possible eGPU
+        bool isIntegrated = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
+        DetectEGPU(reportUpload, reportDownload, isIntegrated);
 
         Log("=== Benchmark Complete ===");
         Log("Detected Interface: " + g_app.detectedInterface);
+        
+        if (g_app.possibleEGPU) {
+            Log("[INFO] This appears to be an eGPU connected via " + g_app.eGPUConnectionType);
+        }
 
-        // Log with percentages
+        // Log with percentages - indicate if using best or average
         char uploadBuf[128], downloadBuf[128];
-        snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU: %.2f GB/s (%.0f%% of %s)",
-            avgUpload, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
-        snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU: %.2f GB/s (%.0f%% of %s)",
-            avgDownload, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+        const char* modeStr = g_app.config.averageRuns ? "Avg" : "Best";
+        snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU (%s): %.2f GB/s (%.0f%% of %s)",
+            modeStr, reportUpload, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
+        snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU (%s): %.2f GB/s (%.0f%% of %s)",
+            modeStr, reportDownload, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+        Log(uploadBuf);
+        Log(downloadBuf);
         Log(uploadBuf);
         Log(downloadBuf);
 
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
-        g_app.results = allResults;
+        
+        // If averaging is enabled and we have multiple runs, aggregate the results
+        std::vector<BenchmarkResult> newResults;
+        if (g_app.config.averageRuns && g_app.config.numRuns > 1) {
+            newResults = AggregateResults(allResults);
+        } else {
+            newResults = allResults;
+        }
+        
+        // Append new results to existing results (accumulate across benchmark runs)
+        g_app.results.insert(g_app.results.end(), newResults.begin(), newResults.end());
+        
         g_app.state = AppState::Completed;
     }
+    
+    g_app.benchmarkThreadRunning = false;
 }
 
 // ============================================================================
@@ -1018,6 +1476,11 @@ void ExportCSV(const std::string& filename) {
     file << "\nDetected Interface," << g_app.detectedInterface << "\n";
     file << "CPU->GPU," << g_app.uploadBW << " GB/s," << g_app.uploadPercentage << "% of " << g_app.closestUploadStandard << "\n";
     file << "GPU->CPU," << g_app.downloadBW << " GB/s," << g_app.downloadPercentage << "% of " << g_app.closestDownloadStandard << "\n";
+    
+    // Add eGPU detection info
+    if (g_app.possibleEGPU) {
+        file << "\neGPU Detection,Possible eGPU," << g_app.eGPUConnectionType << "\n";
+    }
 
     file.close();
     Log("Results exported to " + filename);
@@ -1110,7 +1573,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v2.0 GUI");
+    ImGui::Text("GPU-PCIe-Test v2.5 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1118,7 +1581,48 @@ void RenderGUI() {
 
     ImGui::Text("Select GPU:");
     ImGui::SetNextItemWidth(-1);
+    
+    // Check if we have valid GPUs
+    bool hasValidGPU = !g_app.gpuList.empty() && g_app.gpuList[0].isValid;
+    
+    if (!hasValidGPU) {
+        ImGui::BeginDisabled();
+    }
     ImGui::Combo("##GPU", &g_app.config.selectedGPU, g_app.gpuComboPointers.data(), (int)g_app.gpuComboPointers.size());
+    if (!hasValidGPU) {
+        ImGui::EndDisabled();
+    }
+    
+    // Display GPU details below the combo box
+    if (g_app.config.selectedGPU >= 0 && g_app.config.selectedGPU < static_cast<int>(g_app.gpuList.size())) {
+        const GPUInfo& selectedGPU = g_app.gpuList[g_app.config.selectedGPU];
+        
+        if (selectedGPU.isValid) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+            
+            // VRAM info
+            if (selectedGPU.isIntegrated) {
+                ImGui::Text("  Type: Integrated GPU");
+                ImGui::Text("  Shared Memory: %s", FormatMemory(selectedGPU.sharedMemory).c_str());
+            } else {
+                ImGui::Text("  Type: Discrete GPU");
+                ImGui::Text("  VRAM: %s", FormatMemory(selectedGPU.dedicatedVRAM).c_str());
+            }
+            
+            // Vendor/Device ID
+            ImGui::Text("  ID: %s", FormatVendorDeviceId(selectedGPU.vendorId, selectedGPU.deviceId).c_str());
+            
+            // Show max safe bandwidth size
+            size_t maxSafe = GetSafeMaxBandwidthSize(g_app.config.selectedGPU);
+            ImGui::Text("  Max Safe Test Size: %s", FormatSize(maxSafe).c_str());
+            
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "  No valid GPU detected!");
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "  Check your graphics drivers.");
+        }
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1127,10 +1631,18 @@ void RenderGUI() {
     ImGui::Text("Bandwidth Test Size");
     ImGui::SetNextItemWidth(-1);
 
-    // Bandwidth in MB (safe int32 range: 16–1024 MB)
+    // Bandwidth in MB - allow up to safe max based on GPU VRAM
+    int maxBandwidthMB = static_cast<int>(GetSafeMaxBandwidthSize(g_app.config.selectedGPU) / (1024 * 1024));
+    maxBandwidthMB = std::max(maxBandwidthMB, 16);  // Ensure minimum of 16 MB
+    
     int bandwidth_mb = static_cast<int>(g_app.config.bandwidthSize / (1024 * 1024));
-    if (ImGui::SliderInt("##BandwidthSize", &bandwidth_mb, 16, 1024, "%d MB", ImGuiSliderFlags_Logarithmic)) {
+    bandwidth_mb = std::min(bandwidth_mb, maxBandwidthMB);  // Ensure current value doesn't exceed max
+    
+    if (ImGui::SliderInt("##BandwidthSize", &bandwidth_mb, 16, maxBandwidthMB, "%d MB", ImGuiSliderFlags_Logarithmic)) {
         g_app.config.bandwidthSize = static_cast<size_t>(bandwidth_mb) * 1024 * 1024;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Max safe size for this GPU: %d MB", maxBandwidthMB);
     }
 
     ImGui::Text("Latency Test Size");
@@ -1161,6 +1673,37 @@ void RenderGUI() {
     ImGui::Spacing();
     ImGui::Checkbox("Run Bidirectional Test", &g_app.config.runBidirectional);
     ImGui::Checkbox("Run Latency Tests", &g_app.config.runLatency);
+    
+    ImGui::Spacing();
+    
+    // Track previous state to detect changes
+    static bool prevAverageRuns = g_app.config.averageRuns;
+    if (ImGui::Checkbox("Average Runs", &g_app.config.averageRuns)) {
+        // Clear results when switching modes - can't compare averaged vs individual
+        if (prevAverageRuns != g_app.config.averageRuns && !g_app.results.empty()) {
+            std::lock_guard<std::mutex> lock(g_app.resultsMutex);
+            g_app.results.clear();
+            g_app.uploadBW = 0;
+            g_app.downloadBW = 0;
+            g_app.uploadPercentage = 0;
+            g_app.downloadPercentage = 0;
+            g_app.closestUploadStandard.clear();
+            g_app.closestDownloadStandard.clear();
+            g_app.detectedInterface.clear();
+            if (g_app.state == AppState::Completed) {
+                g_app.state = AppState::Idle;
+            }
+            Log("[INFO] Results cleared - switched between Average/Individual modes");
+        }
+        prevAverageRuns = g_app.config.averageRuns;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("When enabled, combines all runs into averaged results.\nWhen disabled, shows each run individually.\nChanging this clears existing results.");
+    }
+    if (!g_app.config.averageRuns) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "(Individual)");
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1180,9 +1723,10 @@ void RenderGUI() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    bool canStart = (g_app.state == AppState::Idle);
+    // Can start when Idle OR when Completed (to run more tests)
+    bool canStart = (g_app.state == AppState::Idle || g_app.state == AppState::Completed) && hasValidGPU;
     bool canStop = (g_app.state == AppState::Running);
-    bool hasResults = (g_app.state == AppState::Completed);
+    bool hasResults = !g_app.results.empty();  // Changed: check if results exist, not state
 
     if (!canStart) ImGui::BeginDisabled();
     if (ImGui::Button("Start Benchmark", ImVec2(-1, 40))) {
@@ -1204,13 +1748,21 @@ void RenderGUI() {
         g_app.currentRun = 0;
         g_app.currentTest = "Initializing...";
         g_app.cancelRequested = false;
+        g_app.benchmarkAborted = false;
+        g_app.possibleEGPU = false;
+        g_app.eGPUConnectionType.clear();
         g_app.showResultsWindow = false;
         g_app.showGraphsWindow = false;
         g_app.showCompareWindow = false;
-        g_app.results.clear();
+        // NOTE: Don't clear g_app.results - we want to accumulate results
         ClearLog();
+        
+        // Join previous thread if still somehow running
+        if (g_app.benchmarkThread.joinable()) {
+            g_app.benchmarkThread.join();
+        }
+        
         g_app.benchmarkThread = std::thread(BenchmarkThreadFunc);
-        g_app.benchmarkThread.detach();
     }
     if (!canStart) ImGui::EndDisabled();
 
@@ -1225,7 +1777,7 @@ void RenderGUI() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Results buttons - only available when complete
+    // Results buttons - available when we have results
     if (!hasResults) ImGui::BeginDisabled();
     if (ImGui::Button("View Results", ImVec2(-1, 30))) {
         g_app.showResultsWindow = true;
@@ -1239,7 +1791,57 @@ void RenderGUI() {
     if (ImGui::Button("Export to CSV", ImVec2(-1, 30))) {
         ExportCSV("gpu_benchmark_results.csv");
     }
+    
+    ImGui::Spacing();
+    
+    // Clear Charts button
+    if (ImGui::Button("Clear Charts", ImVec2(-1, 30))) {
+        std::lock_guard<std::mutex> lock(g_app.resultsMutex);
+        g_app.results.clear();
+        g_app.uploadBW = 0;
+        g_app.downloadBW = 0;
+        g_app.uploadPercentage = 0;
+        g_app.downloadPercentage = 0;
+        g_app.closestUploadStandard.clear();
+        g_app.closestDownloadStandard.clear();
+        g_app.detectedInterface.clear();
+        g_app.detectedInterfaceDescription.clear();
+        g_app.possibleEGPU = false;
+        g_app.eGPUConnectionType.clear();
+        if (g_app.state == AppState::Completed) {
+            g_app.state = AppState::Idle;
+        }
+        Log("[INFO] Charts cleared");
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Clear all benchmark results and graphs");
+    }
     if (!hasResults) ImGui::EndDisabled();
+    
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    
+    // Reset Settings button (always available when not running)
+    if (canStop) ImGui::BeginDisabled();
+    if (ImGui::Button("Reset Settings", ImVec2(-1, 30))) {
+        g_app.config.bandwidthSize = Constants::DEFAULT_BANDWIDTH_SIZE;
+        g_app.config.latencySize = Constants::DEFAULT_LATENCY_SIZE;
+        g_app.config.bandwidthBatches = Constants::DEFAULT_BANDWIDTH_BATCHES;
+        g_app.config.copiesPerBatch = Constants::DEFAULT_COPIES_PER_BATCH;
+        g_app.config.latencyIters = Constants::DEFAULT_LATENCY_ITERS;
+        g_app.config.numRuns = Constants::DEFAULT_NUM_RUNS;
+        g_app.config.runBidirectional = true;
+        g_app.config.runLatency = true;
+        g_app.config.quickMode = false;
+        g_app.config.averageRuns = true;
+        // Don't reset selectedGPU or clear results
+        Log("[INFO] Settings reset to defaults");
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Reset all settings to default values\n(Does not clear chart data)");
+    }
+    if (canStop) ImGui::EndDisabled();
 
     ImGui::End();
 
@@ -1263,8 +1865,17 @@ void RenderGUI() {
             else if (line.find("ERROR") != std::string::npos || line.find("CRITICAL") != std::string::npos) {
                 ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", line.c_str());
             }
+            else if (line.find("WARNING") != std::string::npos) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "%s", line.c_str());
+            }
+            else if (line.find("INFO") != std::string::npos) {
+                ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "%s", line.c_str());
+            }
             else if (line.find("GB/s") != std::string::npos || line.find(" us") != std::string::npos) {
                 ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", line.c_str());
+            }
+            else if (line.find("eGPU") != std::string::npos) {
+                ImGui::TextColored(ImVec4(1.0f, 0.6f, 1.0f, 1.0f), "%s", line.c_str());
             }
             else {
                 ImGui::Text("%s", line.c_str());
@@ -1305,6 +1916,12 @@ void RenderGUI() {
             g_app.uploadBW, g_app.uploadPercentage, g_app.closestUploadStandard.c_str(),
             g_app.downloadBW, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "%s", resultBuf);
+        
+        // Show eGPU detection if applicable
+        if (g_app.possibleEGPU) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 1.0f, 1.0f), " | Possible eGPU via %s", g_app.eGPUConnectionType.c_str());
+        }
 
         // All bars green for completed state
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));  // Green
@@ -1337,7 +1954,7 @@ void RenderGUI() {
     ImGui::End();
 
     // ========== Results Window (Popup, only when requested) ==========
-    if (g_app.showResultsWindow && g_app.state == AppState::Completed) {
+    if (g_app.showResultsWindow && !g_app.results.empty()) {
         ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
         ImGui::Begin("Results", &g_app.showResultsWindow);
 
@@ -1373,6 +1990,12 @@ void RenderGUI() {
         ImGui::Text("Detected Interface:");
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.5f, 1.0f), "%s", g_app.detectedInterface.c_str());
+        
+        // eGPU detection
+        if (g_app.possibleEGPU) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 1.0f, 1.0f), " (Possible eGPU via %s)", g_app.eGPUConnectionType.c_str());
+        }
 
         ImGui::Spacing();
 
@@ -1397,295 +2020,384 @@ void RenderGUI() {
     }
 
     // ========== Graphs Window (Popup, only when requested) ==========
-    if (g_app.showGraphsWindow && g_app.state == AppState::Completed) {
-        ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
+    if (g_app.showGraphsWindow && !g_app.results.empty()) {
+        ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
         ImGui::Begin("Graphs", &g_app.showGraphsWindow);
 
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
 
-        // Bandwidth bar chart
-        std::vector<double> bandwidths;
-        std::vector<const char*> labels;
+        // Bandwidth results - maintain order (oldest first = top of chart)
+        std::vector<const BenchmarkResult*> bandwidthResults;
+        std::vector<const BenchmarkResult*> latencyResults;
         for (const auto& r : g_app.results) {
-            if (r.unit == "GB/s") {
-                bandwidths.push_back(r.avgValue);
-                labels.push_back(r.testName.c_str());
+            if (r.unit == "GB/s") bandwidthResults.push_back(&r);
+            else if (r.unit == "us") latencyResults.push_back(&r);
+        }
+
+        if (!bandwidthResults.empty()) {
+            // Show appropriate label based on mode
+            if (g_app.config.averageRuns) {
+                ImGui::Text("Bandwidth Tests (GB/s) - Min / Avg / Max  [Oldest at top]");
+            } else {
+                ImGui::Text("Bandwidth Tests (GB/s) - Min / Avg / Best  [Oldest at top]");
+            }
+            
+            // Build data for grouped bars
+            static std::vector<std::string> bwLabelStorage;
+            static std::vector<const char*> bwLabels;
+            bwLabelStorage.clear();
+            bwLabels.clear();
+            
+            int numTests = static_cast<int>(bandwidthResults.size());
+            std::vector<double> mins(numTests), avgs(numTests), maxs(numTests);
+            
+            for (int i = 0; i < numTests; ++i) {
+                bwLabelStorage.push_back(bandwidthResults[i]->testName);
+                mins[i] = bandwidthResults[i]->minValue;
+                avgs[i] = bandwidthResults[i]->avgValue;
+                maxs[i] = bandwidthResults[i]->maxValue;
+            }
+            for (const auto& s : bwLabelStorage) bwLabels.push_back(s.c_str());
+            
+            // Plot height based on number of tests
+            float plotHeight = std::max(200.0f, numTests * 50.0f + 80.0f);
+            
+            if (ImPlot::BeginPlot("##Bandwidth", ImVec2(-1, plotHeight))) {
+                // Invert Y axis so oldest (index 0) appears at TOP
+                ImPlot::SetupAxes("GB/s", "", 0, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
+                
+                // Calculate positions for grouped bars
+                double barWidth = 0.25;
+                
+                std::vector<double> positions(numTests);
+                for (int i = 0; i < numTests; ++i) positions[i] = static_cast<double>(i);
+                
+                // Create offset positions for each group
+                std::vector<double> minPos(numTests), avgPos(numTests), maxPos(numTests);
+                for (int i = 0; i < numTests; ++i) {
+                    minPos[i] = positions[i] - barWidth;
+                    avgPos[i] = positions[i];
+                    maxPos[i] = positions[i] + barWidth;
+                }
+                
+                // Setup Y axis with test names
+                ImPlot::SetupAxisTicks(ImAxis_Y1, positions.data(), numTests, bwLabels.data());
+                
+                // Plot horizontal bars
+                ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.6f, 1.0f, 0.8f));  // Blue for Min
+                ImPlot::PlotBars("Min", mins.data(), minPos.data(), numTests, barWidth * 0.9, ImPlotBarsFlags_Horizontal);
+                
+                ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.9f, 0.2f, 0.8f));  // Green for Avg
+                ImPlot::PlotBars("Avg", avgs.data(), avgPos.data(), numTests, barWidth * 0.9, ImPlotBarsFlags_Horizontal);
+                
+                ImPlot::SetNextFillStyle(ImVec4(1.0f, 0.4f, 0.2f, 0.8f));  // Orange for Max
+                ImPlot::PlotBars("Max", maxs.data(), maxPos.data(), numTests, barWidth * 0.9, ImPlotBarsFlags_Horizontal);
+                
+                ImPlot::EndPlot();
+            }
+            
+            // Legend explanation - change "Max" to "Best" in individual mode
+            ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Blue = Min");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "  Green = Avg");
+            ImGui::SameLine();
+            if (g_app.config.averageRuns) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "  Orange = Max");
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "  Orange = Best");
             }
         }
 
-        if (!bandwidths.empty() && ImPlot::BeginPlot("Bandwidth (GB/s)", ImVec2(-1, 250))) {
-            ImPlot::SetupAxes("Test", "GB/s");
-            ImPlot::SetupAxisTicks(ImAxis_X1, 0, (double)bandwidths.size() - 1, (int)bandwidths.size(), labels.data());
-            ImPlot::PlotBars("Bandwidth", bandwidths.data(), (int)bandwidths.size(), 0.67);
-            ImPlot::EndPlot();
-        }
-
-        // Latency bar chart
-        std::vector<double> latencies;
-        std::vector<const char*> latLabels;
-        for (const auto& r : g_app.results) {
-            if (r.unit == "us") {
-                latencies.push_back(r.avgValue);
-                latLabels.push_back(r.testName.c_str());
+        if (!latencyResults.empty()) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            // Show appropriate label based on mode
+            if (g_app.config.averageRuns) {
+                ImGui::Text("Latency Tests (microseconds) - Min / Avg / Max  [Oldest at top]");
+            } else {
+                ImGui::Text("Latency Tests (microseconds) - Min / Avg / Best  [Oldest at top]");
             }
-        }
-
-        if (!latencies.empty() && ImPlot::BeginPlot("Latency (us)", ImVec2(-1, 250))) {
-            ImPlot::SetupAxes("Test", "us");
-            ImPlot::SetupAxisTicks(ImAxis_X1, 0, (double)latencies.size() - 1, (int)latencies.size(), latLabels.data());
-            ImPlot::PlotBars("Latency", latencies.data(), (int)latencies.size(), 0.67);
-            ImPlot::EndPlot();
+            
+            // Build data for grouped bars
+            static std::vector<std::string> latLabelStorage;
+            static std::vector<const char*> latLabels;
+            latLabelStorage.clear();
+            latLabels.clear();
+            
+            int numTests = static_cast<int>(latencyResults.size());
+            std::vector<double> mins(numTests), avgs(numTests), maxs(numTests);
+            
+            for (int i = 0; i < numTests; ++i) {
+                latLabelStorage.push_back(latencyResults[i]->testName);
+                mins[i] = latencyResults[i]->minValue;
+                avgs[i] = latencyResults[i]->avgValue;
+                maxs[i] = latencyResults[i]->maxValue;
+            }
+            for (const auto& s : latLabelStorage) latLabels.push_back(s.c_str());
+            
+            float plotHeight = std::max(200.0f, numTests * 50.0f + 80.0f);
+            
+            if (ImPlot::BeginPlot("##Latency", ImVec2(-1, plotHeight))) {
+                // Invert Y axis so oldest (index 0) appears at TOP
+                ImPlot::SetupAxes("Microseconds (us)", "", 0, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
+                
+                double barWidth = 0.25;
+                
+                std::vector<double> positions(numTests);
+                for (int i = 0; i < numTests; ++i) positions[i] = static_cast<double>(i);
+                
+                std::vector<double> minPos(numTests), avgPos(numTests), maxPos(numTests);
+                for (int i = 0; i < numTests; ++i) {
+                    minPos[i] = positions[i] - barWidth;
+                    avgPos[i] = positions[i];
+                    maxPos[i] = positions[i] + barWidth;
+                }
+                
+                ImPlot::SetupAxisTicks(ImAxis_Y1, positions.data(), numTests, latLabels.data());
+                
+                ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.6f, 1.0f, 0.8f));
+                ImPlot::PlotBars("Min", mins.data(), minPos.data(), numTests, barWidth * 0.9, ImPlotBarsFlags_Horizontal);
+                
+                ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.9f, 0.2f, 0.8f));
+                ImPlot::PlotBars("Avg", avgs.data(), avgPos.data(), numTests, barWidth * 0.9, ImPlotBarsFlags_Horizontal);
+                
+                ImPlot::SetNextFillStyle(ImVec4(1.0f, 0.4f, 0.2f, 0.8f));
+                ImPlot::PlotBars("Max", maxs.data(), maxPos.data(), numTests, barWidth * 0.9, ImPlotBarsFlags_Horizontal);
+                
+                ImPlot::EndPlot();
+            }
+            
+            ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "Blue = Min");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "  Green = Avg");
+            ImGui::SameLine();
+            if (g_app.config.averageRuns) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "  Orange = Max");
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.2f, 1.0f), "  Orange = Best");
+            }
         }
 
         ImGui::End();
     }
 
-    // ========== Compare to Standards Window (NEW) ==========
-    if (g_app.showCompareWindow && g_app.state == AppState::Completed) {
-        ImGui::SetNextWindowSize(ImVec2(1100, 850), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Compare to Standards", &g_app.showCompareWindow);
+    // ========== Compare to Standards Window ==========
+    if (g_app.showCompareWindow && !g_app.results.empty()) {
+        ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Compare to Interface Standards", &g_app.showCompareWindow);
 
-        if (ImGui::BeginTabBar("CompareTabs")) {
+        const char* modeLabel = g_app.config.averageRuns ? "Average" : "Best Run";
+        ImGui::Text("Your %s Results vs Standard Interface Bandwidths", modeLabel);
+        ImGui::Text("(Sorted from fastest to slowest, top to bottom)");
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        if (g_app.possibleEGPU) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 1.0f, 1.0f), "Note: Possible external GPU detected via %s", g_app.eGPUConnectionType.c_str());
+            ImGui::Spacing();
+        }
 
-            // ===== CPU->GPU Tab =====
-            if (ImGui::BeginTabItem("CPU->GPU vs Standards")) {
-                // Build sorted list with your result inserted in correct position
-                struct BandwidthEntry {
-                    std::string name;
-                    double bandwidth;
-                    bool isUserResult;
-                };
-                std::vector<BandwidthEntry> entries;
-
-                // Add all standards
-                for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
-                    entries.push_back({ INTERFACE_SPEEDS[i].name, INTERFACE_SPEEDS[i].bandwidth, false });
-                }
-                // Add user result
-                entries.push_back({ ">> YOUR RESULT <<", g_app.uploadBW, true });
-
-                // Sort by bandwidth (slowest to fastest)
-                std::sort(entries.begin(), entries.end(), [](const BandwidthEntry& a, const BandwidthEntry& b) {
-                    return a.bandwidth < b.bandwidth;
-                });
-
-                // Build arrays for plotting
-                std::vector<double> positions;
-                std::vector<double> standardBW, userBW;
-                std::vector<double> standardPos, userPos;
-                static std::vector<std::string> sortedNamesUp;  // Static to persist for ImPlot
-                sortedNamesUp.clear();
-
-                for (size_t i = 0; i < entries.size(); i++) {
-                    sortedNamesUp.push_back(entries[i].name);
-                    if (entries[i].isUserResult) {
-                        userPos.push_back((double)i);
-                        userBW.push_back(entries[i].bandwidth);
-                    } else {
-                        standardPos.push_back((double)i);
-                        standardBW.push_back(entries[i].bandwidth);
-                    }
-                }
-
-                // Create label pointers
-                static std::vector<const char*> labelPtrsUp;
-                labelPtrsUp.clear();
-                for (const auto& s : sortedNamesUp) labelPtrsUp.push_back(s.c_str());
-
-                // Plot with extra bottom margin for angled labels
-                if (ImPlot::BeginPlot("CPU->GPU Bandwidth vs Interface Standards", ImVec2(-1, 380))) {
-                    ImPlot::SetupAxes("", "GB/s", ImPlotAxisFlags_NoTickLabels, 0);
-                    ImPlot::SetupAxisLimits(ImAxis_X1, -0.5, (double)entries.size() - 0.5);
-                    ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 70);
-
-                    // Plot standards in gray
-                    if (!standardBW.empty()) {
-                        ImPlot::SetNextFillStyle(ImVec4(0.5f, 0.5f, 0.5f, 0.7f));
-                        ImPlot::PlotBars("Standards", standardPos.data(), standardBW.data(), (int)standardBW.size(), 0.6);
-                    }
-
-                    // Plot user result in green
-                    if (!userBW.empty()) {
-                        ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.9f, 0.2f, 1.0f));
-                        ImPlot::PlotBars("Your Result", userPos.data(), userBW.data(), (int)userBW.size(), 0.6);
-                    }
-
-                    // Draw vertical labels below each bar
-                    ImDrawList* drawList = ImPlot::GetPlotDrawList();
-                    float fontSize = ImGui::GetFontSize() * 0.55f;
-                    ImFont* font = ImGui::GetFont();
-
-                    for (size_t i = 0; i < entries.size(); i++) {
-                        ImPlotPoint plotPt((double)i, 0);
-                        ImVec2 screenPt = ImPlot::PlotToPixels(plotPt);
-                        screenPt.y += 5;  // Below axis
-
-                        ImU32 textColor = entries[i].isUserResult ? 
-                            IM_COL32(50, 230, 50, 255) : IM_COL32(180, 180, 180, 255);
-
-                        // Draw text vertically (one character per line)
-                        const char* text = entries[i].name.c_str();
-                        float lineHeight = fontSize * 0.85f;
-                        float xOffset = -fontSize * 0.25f;  // Center horizontally
-                        int charIdx = 0;
-
-                        while (*text && charIdx < 14) {  // Limit to 14 chars
-                            char ch[2] = {*text, 0};
-                            ImVec2 charPos(screenPt.x + xOffset, screenPt.y + charIdx * lineHeight);
-                            drawList->AddText(font, fontSize, charPos, textColor, ch);
-                            text++;
-                            charIdx++;
-                        }
-                    }
-
-                    ImPlot::EndPlot();
-                }
-
-                // Reference list (in case angled labels are hard to read)
-                ImGui::Spacing();
-                ImGui::Separator();
-
-                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Reference (slowest to fastest):");
-                ImGui::Indent();
-                for (size_t i = 0; i < entries.size(); i++) {
-                    if (entries[i].isUserResult) {
-                        ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "%zu. %s (%.2f GB/s)", i + 1, entries[i].name.c_str(), entries[i].bandwidth);
-                    } else {
-                        ImGui::Text("%zu. %s (%.2f GB/s)", i + 1, entries[i].name.c_str(), entries[i].bandwidth);
-                    }
-                }
-                ImGui::Unindent();
-
-                // Summary text
-                ImGui::Spacing();
-                char summary[128];
-                snprintf(summary, sizeof(summary), "Your CPU->GPU bandwidth: %.2f GB/s = %.0f%% of %s",
-                    g_app.uploadBW, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
-                ImVec4 color = g_app.uploadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
-                    g_app.uploadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
-                    ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-                ImGui::TextColored(color, "%s", summary);
-
-                ImGui::EndTabItem();
+        // Build combined list of standards + user results, sorted by bandwidth
+        struct BandwidthEntry {
+            std::string name;
+            double bandwidth;
+            int type;  // 0 = standard, 1 = upload, 2 = download
+            std::string description;
+        };
+        
+        std::vector<BandwidthEntry> entries;
+        
+        // Add all interface standards
+        for (int i = 0; i < NUM_INTERFACE_SPEEDS; ++i) {
+            entries.push_back({
+                INTERFACE_SPEEDS[i].name,
+                INTERFACE_SPEEDS[i].bandwidth,
+                0,
+                INTERFACE_SPEEDS[i].description
+            });
+        }
+        
+        // Add user results
+        entries.push_back({
+            "YOUR CPU->GPU",
+            g_app.uploadBW,
+            1,
+            "Your measured upload bandwidth"
+        });
+        
+        entries.push_back({
+            "YOUR GPU->CPU",
+            g_app.downloadBW,
+            2,
+            "Your measured download bandwidth"
+        });
+        
+        // Sort by bandwidth (highest first = fastest at top)
+        std::sort(entries.begin(), entries.end(), [](const BandwidthEntry& a, const BandwidthEntry& b) {
+            return a.bandwidth > b.bandwidth;
+        });
+        
+        // Build arrays for plotting
+        int numEntries = static_cast<int>(entries.size());
+        std::vector<double> bandwidths(numEntries);
+        std::vector<double> positions(numEntries);
+        std::vector<double> standardBW, uploadBW, downloadBW;
+        std::vector<double> standardPos, uploadPos, downloadPos;
+        
+        static std::vector<std::string> labelStorage;
+        static std::vector<const char*> labels;
+        labelStorage.clear();
+        labels.clear();
+        
+        for (int i = 0; i < numEntries; ++i) {
+            positions[i] = static_cast<double>(i);
+            bandwidths[i] = entries[i].bandwidth;
+            labelStorage.push_back(entries[i].name);
+            
+            if (entries[i].type == 0) {
+                standardPos.push_back(positions[i]);
+                standardBW.push_back(entries[i].bandwidth);
+            } else if (entries[i].type == 1) {
+                uploadPos.push_back(positions[i]);
+                uploadBW.push_back(entries[i].bandwidth);
+            } else {
+                downloadPos.push_back(positions[i]);
+                downloadBW.push_back(entries[i].bandwidth);
             }
-
-            // ===== GPU->CPU Tab =====
-            if (ImGui::BeginTabItem("GPU->CPU vs Standards")) {
-                // Build sorted list with your result inserted in correct position
-                struct BandwidthEntry {
-                    std::string name;
-                    double bandwidth;
-                    bool isUserResult;
-                };
-                std::vector<BandwidthEntry> entries;
-
-                // Add all standards
-                for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
-                    entries.push_back({ INTERFACE_SPEEDS[i].name, INTERFACE_SPEEDS[i].bandwidth, false });
-                }
-                // Add user result
-                entries.push_back({ ">> YOUR RESULT <<", g_app.downloadBW, true });
-
-                // Sort by bandwidth (slowest to fastest)
-                std::sort(entries.begin(), entries.end(), [](const BandwidthEntry& a, const BandwidthEntry& b) {
-                    return a.bandwidth < b.bandwidth;
-                });
-
-                // Build arrays for plotting
-                std::vector<double> standardBW, userBW;
-                std::vector<double> standardPos, userPos;
-                static std::vector<std::string> sortedNamesDn;
-                sortedNamesDn.clear();
-
-                for (size_t i = 0; i < entries.size(); i++) {
-                    sortedNamesDn.push_back(entries[i].name);
-                    if (entries[i].isUserResult) {
-                        userPos.push_back((double)i);
-                        userBW.push_back(entries[i].bandwidth);
-                    } else {
-                        standardPos.push_back((double)i);
-                        standardBW.push_back(entries[i].bandwidth);
-                    }
-                }
-
-                // Plot with extra bottom margin for angled labels
-                if (ImPlot::BeginPlot("GPU->CPU Bandwidth vs Interface Standards", ImVec2(-1, 380))) {
-                    ImPlot::SetupAxes("", "GB/s", ImPlotAxisFlags_NoTickLabels, 0);
-                    ImPlot::SetupAxisLimits(ImAxis_X1, -0.5, (double)entries.size() - 0.5);
-                    ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 70);
-
-                    // Plot standards in gray
-                    if (!standardBW.empty()) {
-                        ImPlot::SetNextFillStyle(ImVec4(0.5f, 0.5f, 0.5f, 0.7f));
-                        ImPlot::PlotBars("Standards", standardPos.data(), standardBW.data(), (int)standardBW.size(), 0.6);
-                    }
-
-                    // Plot user result in cyan
-                    if (!userBW.empty()) {
-                        ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.7f, 0.9f, 1.0f));
-                        ImPlot::PlotBars("Your Result", userPos.data(), userBW.data(), (int)userBW.size(), 0.6);
-                    }
-
-                    // Draw vertical labels below each bar
-                    ImDrawList* drawList = ImPlot::GetPlotDrawList();
-                    float fontSize = ImGui::GetFontSize() * 0.55f;
-                    ImFont* font = ImGui::GetFont();
-
-                    for (size_t i = 0; i < entries.size(); i++) {
-                        ImPlotPoint plotPt((double)i, 0);
-                        ImVec2 screenPt = ImPlot::PlotToPixels(plotPt);
-                        screenPt.y += 5;
-
-                        ImU32 textColor = entries[i].isUserResult ? 
-                            IM_COL32(50, 180, 230, 255) : IM_COL32(180, 180, 180, 255);
-
-                        // Draw text vertically (one character per line)
-                        const char* text = entries[i].name.c_str();
-                        float lineHeight = fontSize * 0.85f;
-                        float xOffset = -fontSize * 0.25f;
-                        int charIdx = 0;
-
-                        while (*text && charIdx < 14) {
-                            char ch[2] = {*text, 0};
-                            ImVec2 charPos(screenPt.x + xOffset, screenPt.y + charIdx * lineHeight);
-                            drawList->AddText(font, fontSize, charPos, textColor, ch);
-                            text++;
-                            charIdx++;
-                        }
-                    }
-
-                    ImPlot::EndPlot();
-                }
-
-                // Reference list
-                ImGui::Spacing();
-                ImGui::Separator();
-
-                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Reference (slowest to fastest):");
-                ImGui::Indent();
-                for (size_t i = 0; i < entries.size(); i++) {
-                    if (entries[i].isUserResult) {
-                        ImGui::TextColored(ImVec4(0.2f, 0.7f, 0.9f, 1.0f), "%zu. %s (%.2f GB/s)", i + 1, entries[i].name.c_str(), entries[i].bandwidth);
-                    } else {
-                        ImGui::Text("%zu. %s (%.2f GB/s)", i + 1, entries[i].name.c_str(), entries[i].bandwidth);
-                    }
-                }
-                ImGui::Unindent();
-
-                // Summary text
-                ImGui::Spacing();
-                char summary[128];
-                snprintf(summary, sizeof(summary), "Your GPU->CPU bandwidth: %.2f GB/s = %.0f%% of %s",
-                    g_app.downloadBW, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
-                ImVec4 color = g_app.downloadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
-                    g_app.downloadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
-                    ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-                ImGui::TextColored(color, "%s", summary);
-
-                ImGui::EndTabItem();
+        }
+        for (const auto& s : labelStorage) labels.push_back(s.c_str());
+        
+        // Calculate plot height based on number of entries
+        float plotHeight = std::max(350.0f, numEntries * 22.0f + 60.0f);
+        
+        // Draw the horizontal bar chart
+        if (ImPlot::BeginPlot("##InterfaceComparison", ImVec2(-1, plotHeight))) {
+            ImPlot::SetupAxes("Bandwidth (GB/s)", "", 0, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0, 70, ImPlotCond_Always);
+            ImPlot::SetupAxisTicks(ImAxis_Y1, positions.data(), numEntries, labels.data());
+            
+            double barHeight = 0.7;
+            
+            // Plot standard interfaces in gray
+            if (!standardBW.empty()) {
+                ImPlot::SetNextFillStyle(ImVec4(0.5f, 0.5f, 0.5f, 0.7f));
+                ImPlot::PlotBars("Interface Standards", standardBW.data(), standardPos.data(), 
+                                  static_cast<int>(standardBW.size()), barHeight, ImPlotBarsFlags_Horizontal);
             }
-
-            ImGui::EndTabBar();
+            
+            // Plot user upload in green
+            if (!uploadBW.empty()) {
+                ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.9f, 0.2f, 1.0f));
+                ImPlot::PlotBars("Your CPU->GPU", uploadBW.data(), uploadPos.data(), 
+                                  static_cast<int>(uploadBW.size()), barHeight, ImPlotBarsFlags_Horizontal);
+            }
+            
+            // Plot user download in cyan
+            if (!downloadBW.empty()) {
+                ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.7f, 0.9f, 1.0f));
+                ImPlot::PlotBars("Your GPU->CPU", downloadBW.data(), downloadPos.data(), 
+                                  static_cast<int>(downloadBW.size()), barHeight, ImPlotBarsFlags_Horizontal);
+            }
+            
+            ImPlot::EndPlot();
+        }
+        
+        // Legend
+        ImGui::Spacing();
+        const char* modeLbl = g_app.config.averageRuns ? "Avg" : "Best";
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Gray = Interface Standards");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "  Green = Your CPU->GPU %s (%.2f GB/s)", modeLbl, g_app.uploadBW);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.2f, 0.7f, 0.9f, 1.0f), "  Cyan = Your GPU->CPU %s (%.2f GB/s)", modeLbl, g_app.downloadBW);
+        
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        // Detailed ranking list
+        ImGui::Text("Detailed Ranking (fastest to slowest):");
+        ImGui::Spacing();
+        
+        if (ImGui::BeginTable("RankingTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, 
+                              ImVec2(0, 200))) {
+            ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthFixed, 50);
+            ImGui::TableSetupColumn("Interface", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Bandwidth", ImGuiTableColumnFlags_WidthFixed, 100);
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableHeadersRow();
+            
+            for (int i = 0; i < numEntries; ++i) {
+                ImGui::TableNextRow();
+                
+                // Determine row color based on type
+                ImVec4 textColor;
+                if (entries[i].type == 1) {
+                    textColor = ImVec4(0.2f, 0.9f, 0.2f, 1.0f);  // Green for upload
+                } else if (entries[i].type == 2) {
+                    textColor = ImVec4(0.2f, 0.7f, 0.9f, 1.0f);  // Cyan for download
+                } else {
+                    textColor = ImVec4(0.8f, 0.8f, 0.8f, 1.0f);  // Light gray for standards
+                }
+                
+                ImGui::TableNextColumn();
+                if (entries[i].type != 0) {
+                    ImGui::TextColored(textColor, "#%d", i + 1);
+                } else {
+                    ImGui::Text("#%d", i + 1);
+                }
+                
+                ImGui::TableNextColumn();
+                if (entries[i].type != 0) {
+                    ImGui::TextColored(textColor, "%s", entries[i].name.c_str());
+                } else {
+                    ImGui::Text("%s", entries[i].name.c_str());
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s", entries[i].description.c_str());
+                }
+                
+                ImGui::TableNextColumn();
+                if (entries[i].type != 0) {
+                    ImGui::TextColored(textColor, "%.2f GB/s", entries[i].bandwidth);
+                } else {
+                    ImGui::Text("%.2f GB/s", entries[i].bandwidth);
+                }
+            }
+            
+            ImGui::EndTable();
+        }
+        
+        // Summary percentages
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        char uploadSummary[128], downloadSummary[128];
+        snprintf(uploadSummary, sizeof(uploadSummary), 
+                 "CPU->GPU: %.2f GB/s = %.0f%% of %s",
+                 g_app.uploadBW, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
+        snprintf(downloadSummary, sizeof(downloadSummary),
+                 "GPU->CPU: %.2f GB/s = %.0f%% of %s", 
+                 g_app.downloadBW, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+        
+        ImVec4 uploadColor = g_app.uploadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
+            g_app.uploadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
+            ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        ImVec4 downloadColor = g_app.downloadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
+            g_app.downloadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
+            ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        
+        ImGui::TextColored(uploadColor, "%s", uploadSummary);
+        ImGui::TextColored(downloadColor, "%s", downloadSummary);
+        
+        if (!g_app.detectedInterface.empty() && g_app.detectedInterface != "Unknown") {
+            ImGui::Spacing();
+            ImGui::Text("Detected Interface:");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.5f, 1.0f), "%s", g_app.detectedInterface.c_str());
         }
 
         ImGui::End();
@@ -1694,48 +2406,31 @@ void RenderGUI() {
     // ========== About Dialog ==========
     if (g_app.showAboutDialog) {
         ImGui::OpenPopup("About GPU-PCIe-Test");
-        g_app.showAboutDialog = false;  // Reset so it doesn't keep opening
+        g_app.showAboutDialog = false;  // Only open once
     }
 
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(640, 480), ImGuiCond_Appearing);  // Larger for scaled fonts
-
-    if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_NoResize)) {
-        ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "GPU-PCIe-Test v2.0 GUI");
+    if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("GPU-PCIe-Test v2.5 GUI Edition");
         ImGui::Separator();
         ImGui::Spacing();
-
-        ImGui::Text("A GPU and PCIe bandwidth/latency benchmark tool.");
-        ImGui::Text("Measures CPU<->GPU transfer speeds to help identify");
-        ImGui::Text("PCIe lane configuration and potential bottlenecks.");
-
+        ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
+        ImGui::Text("Measures data transfer speeds between CPU and GPU.");
         ImGui::Spacing();
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-
-        ImGui::Text("Author:");
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "David Janice");
-
-        ImGui::Text("Email:");
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "djanice1980@gmail.com");
-
-        ImGui::Text("GitHub:");
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 1.0f, 1.0f), "https://github.com/djanice1980/GPU-PCIe-Test");
-
-        ImGui::Spacing();
+        ImGui::Text("Features:");
+        ImGui::BulletText("Upload/Download bandwidth tests");
+        ImGui::BulletText("Bidirectional bandwidth test");
+        ImGui::BulletText("Latency measurements");
+        ImGui::BulletText("Interface detection (PCIe/TB/USB4/OCuLink)");
+        ImGui::BulletText("eGPU auto-detection");
+        ImGui::BulletText("VRAM-aware buffer sizing");
+        ImGui::BulletText("Average or individual run recording");
+        ImGui::BulletText("Min/Avg/Max graphs");
+        ImGui::BulletText("Ranked comparison to standards");
+        ImGui::BulletText("CSV export");
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::Spacing();
-
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Built with Dear ImGui, ImPlot, and Direct3D 12");
-
-        ImGui::Spacing();
         ImGui::Spacing();
 
         float buttonWidth = 120.0f;
@@ -1939,7 +2634,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.0 GUI",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.5 GUI",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,
@@ -1968,9 +2663,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     g_app.gpuComboNames.clear();
     g_app.gpuComboPointers.clear();
     for (const auto& gpu : g_app.gpuList) {
-        std::string label = gpu.vendor + " " + gpu.name +
-            " (" + FormatMemory(gpu.dedicatedVRAM) +
-            (gpu.isIntegrated ? " iGPU" : "") + ")";
+        std::string label;
+        if (gpu.isValid) {
+            label = gpu.vendor + " " + gpu.name +
+                " (" + FormatMemory(gpu.dedicatedVRAM) +
+                (gpu.isIntegrated ? " iGPU" : "") + ")";
+        } else {
+            label = gpu.name;  // "No GPU Found" message
+        }
         g_app.gpuComboNames.push_back(std::move(label));
         g_app.gpuComboPointers.push_back(g_app.gpuComboNames.back().c_str());
     }
@@ -2053,7 +2753,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         Render();
     }
 
-    // Cleanup
+    // Cleanup - request cancellation and wait for benchmark thread
+    g_app.cancelRequested = true;
+    if (g_app.benchmarkThread.joinable()) {
+        // Give the thread a moment to notice cancellation
+        for (int i = 0; i < 50 && g_app.benchmarkThreadRunning; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        g_app.benchmarkThread.join();
+    }
+    
     WaitForGPU();
 
     ImGui_ImplDX12_Shutdown();
