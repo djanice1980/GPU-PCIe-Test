@@ -1,8 +1,8 @@
-# GPU-PCIe-Test v2.0 - GUI Edition
+# GPU-PCIe-Test v2.2 - GUI Edition
 
 A graphical frontend for the GPU/PCIe bandwidth and latency benchmark tool.
 
-This version will flag with virus scanners.  It is not signed and the loops may freak out scanning software.
+![Screenshot placeholder]
 
 ## Features
 
