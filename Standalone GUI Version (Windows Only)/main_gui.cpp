@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v2.5 - GUI Edition
+// GPU-PCIe-Test v2.6 - GUI Edition
 // Dear ImGui + D3D12 Frontend
 // ============================================================================
 // This is a graphical frontend for the GPU/PCIe benchmark tool.
@@ -10,6 +10,7 @@
 // - CSV export
 // - VRAM-aware buffer sizing
 // - eGPU auto-detection
+// - Actual PCIe link detection via SetupAPI
 // ============================================================================
 
 #ifndef NOMINMAX
@@ -20,6 +21,11 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl.h>
+#include <setupapi.h>
+#include <devpkey.h>
+#include <cfgmgr32.h>
+#include <initguid.h>
+#include <devpropdef.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -37,6 +43,8 @@
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "setupapi.lib")
+#pragma comment(lib, "cfgmgr32.lib")
 
 // ImGui headers (must be in imgui/ subfolder)
 #include "imgui/imgui.h"
@@ -91,9 +99,38 @@ struct GPUInfo {
     bool        isIntegrated = false;
     bool        isValid = true;  // False for "no GPU found" placeholder
     
+    // PCIe link information (detected via SetupAPI)
+    int         pcieGenCurrent = 0;     // Current PCIe generation (1-6)
+    int         pcieLanesCurrent = 0;   // Current lane width (1,2,4,8,16,32)
+    int         pcieGenMax = 0;         // Max supported PCIe generation
+    int         pcieLanesMax = 0;       // Max supported lane width
+    bool        pcieInfoValid = false;  // True if we successfully queried PCIe info
+    std::string pcieLocationPath;       // Device location path for identification
+    
     // Store adapter for reliable selection (handles hot-plug scenarios)
     ComPtr<IDXGIAdapter1> adapter;
 };
+
+// PCIe generation speed in GT/s (gigatransfers per second)
+static const double PCIE_GEN_SPEEDS[] = {
+    0.0,   // Gen 0 (invalid)
+    2.5,   // Gen 1
+    5.0,   // Gen 2
+    8.0,   // Gen 3
+    16.0,  // Gen 4
+    32.0,  // Gen 5
+    64.0   // Gen 6
+};
+
+// Calculate theoretical bandwidth for PCIe config (in GB/s)
+inline double CalculatePCIeBandwidth(int gen, int lanes) {
+    if (gen < 1 || gen > 6 || lanes < 1) return 0.0;
+    // PCIe uses 128b/130b encoding for Gen3+, 8b/10b for Gen1-2
+    double encodingEfficiency = (gen >= 3) ? (128.0 / 130.0) : (8.0 / 10.0);
+    double gtPerSec = PCIE_GEN_SPEEDS[gen];
+    // GT/s * lanes * encoding efficiency / 8 bits per byte = GB/s
+    return (gtPerSec * lanes * encodingEfficiency) / 8.0;
+}
 
 struct BenchmarkResult {
     std::string       testName;
@@ -241,6 +278,12 @@ struct AppContext {
     // eGPU detection
     bool        possibleEGPU = false;
     std::string eGPUConnectionType;
+    
+    // Summary window
+    bool        showSummaryWindow = false;
+    double      actualPCIeBandwidth = 0;   // Theoretical max based on detected link
+    std::string actualPCIeConfig;          // e.g., "PCIe 4.0 x16"
+    std::string summaryExplanation;        // Explanation of measured vs actual
 };
 
 static AppContext g_app;
@@ -390,6 +433,138 @@ void DetectEGPU(double upload, double download, bool isIntegrated) {
 }
 
 // ============================================================================
+// PCIe LINK DETECTION
+// ============================================================================
+
+// Define PCIe DEVPKEYs if not available in SDK
+// These are the property keys for querying PCIe link status
+DEFINE_DEVPROPKEY(DEVPKEY_PciDevice_CurrentLinkSpeed, 0x3ab22e31, 0x8264, 0x4b4e, 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62, 9);
+DEFINE_DEVPROPKEY(DEVPKEY_PciDevice_CurrentLinkWidth, 0x3ab22e31, 0x8264, 0x4b4e, 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62, 10);
+DEFINE_DEVPROPKEY(DEVPKEY_PciDevice_MaxLinkSpeed, 0x3ab22e31, 0x8264, 0x4b4e, 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62, 11);
+DEFINE_DEVPROPKEY(DEVPKEY_PciDevice_MaxLinkWidth, 0x3ab22e31, 0x8264, 0x4b4e, 0x9a, 0xf5, 0xa8, 0xd2, 0xd8, 0xe3, 0x3e, 0x62, 12);
+
+// Query PCIe link information for a GPU using SetupAPI
+bool DetectPCIeLink(uint32_t vendorId, uint32_t deviceId, GPUInfo& outInfo) {
+    outInfo.pcieInfoValid = false;
+    
+    // Create device info set for display adapters
+    HDEVINFO deviceInfoSet = SetupDiGetClassDevsW(
+        nullptr,
+        L"PCI",  // Enumerate PCI devices
+        nullptr,
+        DIGCF_PRESENT | DIGCF_ALLCLASSES
+    );
+    
+    if (deviceInfoSet == INVALID_HANDLE_VALUE) {
+        Log("[DEBUG] SetupDiGetClassDevs failed");
+        return false;
+    }
+    
+    SP_DEVINFO_DATA deviceInfoData;
+    deviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+    
+    // Iterate through all PCI devices to find our GPU
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(deviceInfoSet, i, &deviceInfoData); i++) {
+        // Get hardware ID to match vendor/device
+        WCHAR hardwareId[512] = {0};
+        DWORD requiredSize = 0;
+        
+        if (!SetupDiGetDeviceRegistryPropertyW(
+                deviceInfoSet, &deviceInfoData,
+                SPDRP_HARDWAREID, nullptr,
+                (PBYTE)hardwareId, sizeof(hardwareId), &requiredSize)) {
+            continue;
+        }
+        
+        // Parse vendor and device ID from hardware ID string
+        // Format: PCI\VEN_XXXX&DEV_XXXX&...
+        WCHAR searchVen[32], searchDev[32];
+        swprintf_s(searchVen, L"VEN_%04X", vendorId);
+        swprintf_s(searchDev, L"DEV_%04X", deviceId);
+        
+        std::wstring hwIdStr(hardwareId);
+        if (hwIdStr.find(searchVen) == std::wstring::npos ||
+            hwIdStr.find(searchDev) == std::wstring::npos) {
+            continue;
+        }
+        
+        // Found our device - query PCIe properties
+        DEVPROPTYPE propType;
+        DWORD propSize;
+        
+        // Current Link Speed (returns PCIe generation)
+        UINT32 currentSpeed = 0;
+        if (SetupDiGetDevicePropertyW(deviceInfoSet, &deviceInfoData,
+                &DEVPKEY_PciDevice_CurrentLinkSpeed, &propType,
+                (PBYTE)&currentSpeed, sizeof(currentSpeed), &propSize, 0)) {
+            outInfo.pcieGenCurrent = static_cast<int>(currentSpeed);
+        }
+        
+        // Current Link Width
+        UINT32 currentWidth = 0;
+        if (SetupDiGetDevicePropertyW(deviceInfoSet, &deviceInfoData,
+                &DEVPKEY_PciDevice_CurrentLinkWidth, &propType,
+                (PBYTE)&currentWidth, sizeof(currentWidth), &propSize, 0)) {
+            outInfo.pcieLanesCurrent = static_cast<int>(currentWidth);
+        }
+        
+        // Max Link Speed
+        UINT32 maxSpeed = 0;
+        if (SetupDiGetDevicePropertyW(deviceInfoSet, &deviceInfoData,
+                &DEVPKEY_PciDevice_MaxLinkSpeed, &propType,
+                (PBYTE)&maxSpeed, sizeof(maxSpeed), &propSize, 0)) {
+            outInfo.pcieGenMax = static_cast<int>(maxSpeed);
+        }
+        
+        // Max Link Width
+        UINT32 maxWidth = 0;
+        if (SetupDiGetDevicePropertyW(deviceInfoSet, &deviceInfoData,
+                &DEVPKEY_PciDevice_MaxLinkWidth, &propType,
+                (PBYTE)&maxWidth, sizeof(maxWidth), &propSize, 0)) {
+            outInfo.pcieLanesMax = static_cast<int>(maxWidth);
+        }
+        
+        // Get location path for reference
+        WCHAR locationPath[256] = {0};
+        if (SetupDiGetDeviceRegistryPropertyW(
+                deviceInfoSet, &deviceInfoData,
+                SPDRP_LOCATION_INFORMATION, nullptr,
+                (PBYTE)locationPath, sizeof(locationPath), nullptr)) {
+            char pathBuffer[256];
+            WideCharToMultiByte(CP_UTF8, 0, locationPath, -1, pathBuffer, 256, nullptr, nullptr);
+            outInfo.pcieLocationPath = pathBuffer;
+        }
+        
+        // Check if we got valid PCIe info
+        if (outInfo.pcieGenCurrent > 0 && outInfo.pcieLanesCurrent > 0) {
+            outInfo.pcieInfoValid = true;
+            
+            char logBuf[256];
+            snprintf(logBuf, sizeof(logBuf), 
+                "[INFO] Detected PCIe Gen%d x%d (Max: Gen%d x%d) for %s",
+                outInfo.pcieGenCurrent, outInfo.pcieLanesCurrent,
+                outInfo.pcieGenMax, outInfo.pcieLanesMax,
+                outInfo.name.c_str());
+            Log(logBuf);
+        }
+        
+        SetupDiDestroyDeviceInfoList(deviceInfoSet);
+        return outInfo.pcieInfoValid;
+    }
+    
+    SetupDiDestroyDeviceInfoList(deviceInfoSet);
+    return false;
+}
+
+// Format PCIe config as string (e.g., "PCIe 4.0 x16")
+std::string FormatPCIeConfig(int gen, int lanes) {
+    if (gen <= 0 || lanes <= 0) return "Unknown";
+    char buf[64];
+    snprintf(buf, sizeof(buf), "PCIe %d.0 x%d", gen, lanes);
+    return buf;
+}
+
+// ============================================================================
 // GPU ENUMERATION
 // ============================================================================
 void EnumerateGPUs() {
@@ -429,6 +604,9 @@ void EnumerateGPUs() {
         
         // Store the adapter pointer for reliable selection later
         info.adapter = adapter;
+        
+        // Detect PCIe link configuration
+        DetectPCIeLink(desc.VendorId, desc.DeviceId, info);
 
         g_app.gpuList.push_back(std::move(info));
         
@@ -1428,8 +1606,89 @@ void BenchmarkThreadFunc() {
             modeStr, reportDownload, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
         Log(uploadBuf);
         Log(downloadBuf);
-        Log(uploadBuf);
-        Log(downloadBuf);
+        
+        // Generate summary comparing measured vs actual PCIe link
+        const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
+        double measuredMax = std::max(reportUpload, reportDownload);
+        
+        if (gpu.pcieInfoValid) {
+            g_app.actualPCIeConfig = FormatPCIeConfig(gpu.pcieGenCurrent, gpu.pcieLanesCurrent);
+            g_app.actualPCIeBandwidth = CalculatePCIeBandwidth(gpu.pcieGenCurrent, gpu.pcieLanesCurrent);
+            
+            Log("=== Actual PCIe Link ===");
+            char pcieBuf[128];
+            snprintf(pcieBuf, sizeof(pcieBuf), "Connected as: %s (theoretical max: %.2f GB/s)",
+                g_app.actualPCIeConfig.c_str(), g_app.actualPCIeBandwidth);
+            Log(pcieBuf);
+            
+            if (gpu.pcieGenMax > 0 && gpu.pcieLanesMax > 0) {
+                std::string maxConfig = FormatPCIeConfig(gpu.pcieGenMax, gpu.pcieLanesMax);
+                double maxBandwidth = CalculatePCIeBandwidth(gpu.pcieGenMax, gpu.pcieLanesMax);
+                snprintf(pcieBuf, sizeof(pcieBuf), "GPU capable of: %s (theoretical max: %.2f GB/s)",
+                    maxConfig.c_str(), maxBandwidth);
+                Log(pcieBuf);
+            }
+            
+            // Generate explanation
+            double efficiency = (measuredMax / g_app.actualPCIeBandwidth) * 100.0;
+            
+            if (measuredMax > g_app.actualPCIeBandwidth * 1.1) {
+                // Measured faster than PCIe link should allow
+                if (gpu.isIntegrated) {
+                    g_app.summaryExplanation = "FASTER THAN PCIe LINK: This is expected for an integrated GPU. "
+                        "The GPU shares the CPU's memory controller and doesn't use a PCIe slot, "
+                        "so transfers bypass PCIe entirely.";
+                } else {
+                    g_app.summaryExplanation = "FASTER THAN PCIe LINK: Measured bandwidth exceeds the detected "
+                        "PCIe link capacity. This could indicate the GPU uses a different bus (e.g., "
+                        "on-die connection) or there may be PCIe detection limitations.";
+                }
+            } else if (measuredMax < g_app.actualPCIeBandwidth * 0.7) {
+                // Significantly slower than expected
+                std::ostringstream oss;
+                oss << "SLOWER THAN EXPECTED: Measured " << std::fixed << std::setprecision(0) 
+                    << efficiency << "% of theoretical maximum. Possible causes:\n"
+                    << "- PCIe slot may be sharing lanes with other devices (M.2 slots, USB controllers)\n"
+                    << "- BIOS settings may limit PCIe lanes\n"
+                    << "- Chipset limitations on this motherboard slot\n"
+                    << "- CPU PCIe lane limitations\n"
+                    << "- Thermal throttling or power limits";
+                g_app.summaryExplanation = oss.str();
+            } else if (measuredMax < g_app.actualPCIeBandwidth * 0.85) {
+                // Somewhat slower
+                std::ostringstream oss;
+                oss << "GOOD - " << std::fixed << std::setprecision(0) << efficiency 
+                    << "% of theoretical max. Some overhead is normal due to:\n"
+                    << "- Protocol overhead (headers, acknowledgements)\n"
+                    << "- Memory subsystem limitations\n"
+                    << "- Driver overhead";
+                g_app.summaryExplanation = oss.str();
+            } else {
+                // Very good - close to theoretical max
+                std::ostringstream oss;
+                oss << "EXCELLENT - " << std::fixed << std::setprecision(0) << efficiency 
+                    << "% of theoretical max! Your PCIe link is performing optimally.";
+                g_app.summaryExplanation = oss.str();
+            }
+            
+            // Check if running below max capability
+            if (gpu.pcieGenCurrent < gpu.pcieGenMax || gpu.pcieLanesCurrent < gpu.pcieLanesMax) {
+                std::ostringstream oss;
+                oss << g_app.summaryExplanation << "\n\nNOTE: GPU is running below its maximum capability. "
+                    << "Current: " << FormatPCIeConfig(gpu.pcieGenCurrent, gpu.pcieLanesCurrent)
+                    << ", Max: " << FormatPCIeConfig(gpu.pcieGenMax, gpu.pcieLanesMax) << ". "
+                    << "Check BIOS settings and slot placement.";
+                g_app.summaryExplanation = oss.str();
+            }
+        } else {
+            g_app.actualPCIeConfig = "Not detected";
+            g_app.actualPCIeBandwidth = 0;
+            g_app.summaryExplanation = "Could not query actual PCIe link configuration. "
+                "This may happen with some GPU drivers or on older systems.";
+        }
+        
+        // Show summary window
+        g_app.showSummaryWindow = true;
 
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
         
@@ -1573,7 +1832,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v2.5 GUI");
+    ImGui::Text("GPU-PCIe-Test v2.6 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1608,6 +1867,22 @@ void RenderGUI() {
             } else {
                 ImGui::Text("  Type: Discrete GPU");
                 ImGui::Text("  VRAM: %s", FormatMemory(selectedGPU.dedicatedVRAM).c_str());
+            }
+            
+            // PCIe link info
+            if (selectedGPU.pcieInfoValid) {
+                ImGui::PopStyleColor();
+                ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "  PCIe: Gen%d x%d", 
+                    selectedGPU.pcieGenCurrent, selectedGPU.pcieLanesCurrent);
+                if (selectedGPU.pcieGenCurrent < selectedGPU.pcieGenMax || 
+                    selectedGPU.pcieLanesCurrent < selectedGPU.pcieLanesMax) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "(max: Gen%d x%d)", 
+                        selectedGPU.pcieGenMax, selectedGPU.pcieLanesMax);
+                }
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+            } else {
+                ImGui::Text("  PCIe: Not detected");
             }
             
             // Vendor/Device ID
@@ -1779,6 +2054,12 @@ void RenderGUI() {
 
     // Results buttons - available when we have results
     if (!hasResults) ImGui::BeginDisabled();
+    if (ImGui::Button("View Summary", ImVec2(-1, 30))) {
+        g_app.showSummaryWindow = true;
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("View detailed analysis comparing measured vs actual PCIe link");
+    }
     if (ImGui::Button("View Results", ImVec2(-1, 30))) {
         g_app.showResultsWindow = true;
     }
@@ -1887,6 +2168,16 @@ void RenderGUI() {
         ImGui::SetScrollHereY(1.0f);
     ImGui::EndChild();
 
+    ImGui::Separator();
+    if (ImGui::Button("Copy Log to Clipboard", ImVec2(-1, 0))) {
+        std::lock_guard<std::mutex> lock(g_app.logMutex);
+        std::string allLog;
+        for (const auto& line : g_app.logLines) {
+            allLog += line + "\n";
+        }
+        ImGui::SetClipboardText(allLog.c_str());
+    }
+
     ImGui::End();
 
     // ========== Progress Bar (Bottom) ==========
@@ -1904,7 +2195,7 @@ void RenderGUI() {
         ImGui::ProgressBar(g_app.overallProgress, ImVec2(-1, 24), overlayBuf);
 
         // Per-test progress
-        ImGui::ProgressBar(g_app.progress, ImVec2(-1, 16), "Test progress");
+        ImGui::ProgressBar(g_app.progress, ImVec2(-1, 24), "Test progress");
 
     }
     else if (g_app.state == AppState::Completed) {
@@ -1953,6 +2244,132 @@ void RenderGUI() {
 
     ImGui::End();
 
+    // ========== Summary Window (Auto-popup after benchmark) ==========
+    if (g_app.showSummaryWindow && !g_app.results.empty()) {
+        ImGui::SetNextWindowSize(ImVec2(700, 550), ImGuiCond_FirstUseEver);
+        ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+        ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+        
+        ImGui::Begin("Benchmark Summary", &g_app.showSummaryWindow);
+        
+        const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
+        
+        // GPU Info header
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "GPU: %s", gpu.name.c_str());
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        // Measured Performance section
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "MEASURED PERFORMANCE");
+        ImGui::Indent();
+        
+        const char* modeLabel = g_app.config.averageRuns ? "(Averaged)" : "(Best Run)";
+        ImGui::Text("Mode: %s", modeLabel);
+        
+        ImGui::Text("CPU -> GPU: ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%.2f GB/s", g_app.uploadBW);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(%.0f%% of %s)", 
+            g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
+        
+        ImGui::Text("GPU -> CPU: ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%.2f GB/s", g_app.downloadBW);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(%.0f%% of %s)", 
+            g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+        
+        ImGui::Text("Inferred Interface: ");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.5f, 1.0f), "%s", g_app.detectedInterface.c_str());
+        
+        if (g_app.possibleEGPU) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 1.0f, 1.0f), 
+                "Note: Possible eGPU via %s", g_app.eGPUConnectionType.c_str());
+        }
+        ImGui::Unindent();
+        
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        // Actual PCIe Link section
+        ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, 1.0f), "DETECTED PCIe LINK (from Windows)");
+        ImGui::Indent();
+        
+        if (gpu.pcieInfoValid) {
+            ImGui::Text("Current Link: ");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s", g_app.actualPCIeConfig.c_str());
+            
+            ImGui::Text("Theoretical Max: ");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%.2f GB/s", g_app.actualPCIeBandwidth);
+            
+            if (gpu.pcieGenMax > 0 && gpu.pcieLanesMax > 0) {
+                std::string maxConfig = FormatPCIeConfig(gpu.pcieGenMax, gpu.pcieLanesMax);
+                double maxBw = CalculatePCIeBandwidth(gpu.pcieGenMax, gpu.pcieLanesMax);
+                
+                ImGui::Text("GPU Maximum: ");
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s (%.2f GB/s)", 
+                    maxConfig.c_str(), maxBw);
+            }
+            
+            if (!gpu.pcieLocationPath.empty()) {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Location: %s", 
+                    gpu.pcieLocationPath.c_str());
+            }
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Could not detect PCIe link configuration");
+            if (gpu.isIntegrated) {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), 
+                    "(Integrated GPUs may not report PCIe info)");
+            }
+        }
+        ImGui::Unindent();
+        
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        // Analysis section
+        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "ANALYSIS");
+        ImGui::Indent();
+        
+        // Determine analysis color based on content
+        ImVec4 analysisColor = ImVec4(0.8f, 0.8f, 0.8f, 1.0f);
+        if (g_app.summaryExplanation.find("EXCELLENT") != std::string::npos) {
+            analysisColor = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
+        } else if (g_app.summaryExplanation.find("GOOD") != std::string::npos) {
+            analysisColor = ImVec4(0.8f, 1.0f, 0.4f, 1.0f);
+        } else if (g_app.summaryExplanation.find("SLOWER") != std::string::npos) {
+            analysisColor = ImVec4(1.0f, 0.7f, 0.3f, 1.0f);
+        } else if (g_app.summaryExplanation.find("FASTER THAN") != std::string::npos) {
+            analysisColor = ImVec4(0.4f, 0.8f, 1.0f, 1.0f);
+        }
+        
+        ImGui::PushTextWrapPos(ImGui::GetContentRegionAvail().x);
+        ImGui::TextColored(analysisColor, "%s", g_app.summaryExplanation.c_str());
+        ImGui::PopTextWrapPos();
+        
+        ImGui::Unindent();
+        
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        
+        // Close button
+        float buttonWidth = 120.0f;
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - buttonWidth) * 0.5f);
+        if (ImGui::Button("Close", ImVec2(buttonWidth, 30))) {
+            g_app.showSummaryWindow = false;
+        }
+        
+        ImGui::End();
+    }
+
     // ========== Results Window (Popup, only when requested) ==========
     if (g_app.showResultsWindow && !g_app.results.empty()) {
         ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
@@ -1987,10 +2404,20 @@ void RenderGUI() {
         ImGui::Spacing();
 
         // Interface detection with percentages
-        ImGui::Text("Detected Interface:");
+        ImGui::Text("Inferred Interface (from bandwidth):");
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.5f, 1.0f), "%s", g_app.detectedInterface.c_str());
         
+        const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
+        ImGui::Text("Detected PCIe Link (from Windows):");
+        ImGui::SameLine();
+        if (gpu.pcieInfoValid) {
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s (Theoretical %.2f GB/s)", g_app.actualPCIeConfig.c_str(), g_app.actualPCIeBandwidth);
+        }
+        else {
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "Not detected");
+        }
+
         // eGPU detection
         if (g_app.possibleEGPU) {
             ImGui::SameLine();
@@ -2412,7 +2839,7 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v2.5 GUI Edition");
+        ImGui::Text("GPU-PCIe-Test v2.6 GUI Edition");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
@@ -2634,7 +3061,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.5 GUI",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.6 GUI",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,

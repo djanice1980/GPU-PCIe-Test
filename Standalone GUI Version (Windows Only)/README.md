@@ -9,6 +9,8 @@ A Windows GPU and PCIe bandwidth/latency benchmark tool with a modern GUI interf
 - **Bandwidth Testing**: Measures CPU→GPU (upload) and GPU→CPU (download) transfer speeds
 - **Bidirectional Testing**: Simultaneous upload/download bandwidth measurement
 - **Latency Testing**: Measures transfer latency and command submission latency
+- **PCIe Link Detection**: Queries Windows for actual PCIe generation and lane count
+- **Performance Analysis**: Compares measured bandwidth vs theoretical PCIe maximum
 - **Interface Detection**: Automatically identifies PCIe generation and lane count
 - **eGPU Detection**: Detects external GPUs connected via Thunderbolt/USB4/OCuLink
 - **Multi-GPU Support**: Test any installed GPU with automatic enumeration
@@ -105,6 +107,26 @@ Enable **Quick Mode** for faster benchmarks with reduced accuracy:
 
 ## Interpreting Results
 
+### Summary Window
+
+After each benchmark, a Summary window appears showing:
+
+1. **Measured Performance**: Your actual CPU↔GPU bandwidth
+2. **Detected PCIe Link**: The actual PCIe configuration Windows reports (e.g., "PCIe 4.0 x16")
+3. **Analysis**: Explanation of how your results compare to theoretical maximum
+
+#### Analysis Categories:
+
+- **EXCELLENT (85%+ of theoretical)**: Your PCIe link is performing optimally
+- **GOOD (70-85%)**: Normal performance with expected protocol overhead
+- **SLOWER THAN EXPECTED (<70%)**: Possible issues:
+  - PCIe slot sharing lanes with M.2 slots or USB controllers
+  - BIOS settings limiting PCIe lanes or speed
+  - Motherboard chipset limitations
+  - CPU PCIe lane limitations
+  - Using a x16 slot wired as x8 or x4
+- **FASTER THAN PCIe LINK**: Usually indicates an integrated GPU that shares the CPU's memory controller and bypasses PCIe entirely
+
 ### Bandwidth
 
 - Results close to theoretical maximums indicate optimal PCIe configuration
@@ -126,6 +148,18 @@ The tool automatically detects external GPUs based on bandwidth characteristics:
 - **Individual Mode**: Best for identifying variance between runs, uses best (peak) values for interface comparison
 
 ## Changelog
+
+### v2.6
+- Added actual PCIe link detection via Windows SetupAPI
+- New Summary window auto-pops after benchmark completion
+- Shows detected PCIe generation and lane width (e.g., "PCIe 4.0 x16")
+- Compares measured bandwidth against theoretical PCIe maximum
+- Intelligent analysis explains discrepancies:
+  - Slower than expected: lane sharing, BIOS limits, chipset limitations
+  - Faster than expected: integrated GPU bypassing PCIe
+  - Running below capability: suggestions to check BIOS/slot placement
+- PCIe info shown in GPU details panel
+- View Summary button to re-open analysis
 
 ### v2.5
 - Added PCIe 6.0 x16 and Thunderbolt 5 to interface standards
