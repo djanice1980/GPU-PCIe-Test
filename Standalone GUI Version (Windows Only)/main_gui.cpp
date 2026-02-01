@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v2.6 - GUI Edition
+// GPU-PCIe-Test v2.7 - GUI Edition
 // Dear ImGui + D3D12 Frontend
 // ============================================================================
 // This is a graphical frontend for the GPU/PCIe benchmark tool.
@@ -9,9 +9,14 @@
 // - Results graphs and charts with standard comparisons
 // - CSV export
 // - VRAM-aware buffer sizing
-// - eGPU auto-detection
+// - eGPU auto-detection (Thunderbolt/USB4/USB via device tree)
+// - Integrated GPU (APU) proper detection - no fake PCIe reporting
 // - Actual PCIe link detection via SetupAPI
 // ============================================================================
+
+// Uncomment to enable debug logging for external GPU detection
+// This will log the device tree traversal to help diagnose detection issues
+// #define DEBUG_EXTERNAL_DETECTION
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -107,6 +112,13 @@ struct GPUInfo {
     bool        pcieInfoValid = false;  // True if we successfully queried PCIe info
     std::string pcieLocationPath;       // Device location path for identification
     
+    // Thunderbolt/USB4/USB detection (detected via device tree topology)
+    bool        isThunderbolt = false;      // Connected via Thunderbolt (Intel certified)
+    bool        isUSB4 = false;             // Connected via USB4 (includes TB4, AMD USB4)
+    bool        isUSB = false;              // Connected via any USB (USB3/USB4/TB)
+    int         thunderboltVersion = 0;     // 3 or 4 (0 if unknown or not TB)
+    std::string externalConnectionType;     // "Thunderbolt 4", "USB4", "AMD USB4", etc.
+    
     // Store adapter for reliable selection (handles hot-plug scenarios)
     ComPtr<IDXGIAdapter1> adapter;
 };
@@ -122,7 +134,21 @@ static const double PCIE_GEN_SPEEDS[] = {
     64.0   // Gen 6
 };
 
-// Calculate theoretical bandwidth for PCIe config (in GB/s)
+// Protocol overhead efficiency factors (accounts for TLP headers, DLLPs, flow control)
+// Gen 1-2: 8b/10b encoding (80%) + ~15% protocol overhead = ~65-70% efficiency
+// Gen 3+:  128b/130b encoding (98.5%) + ~10-15% protocol overhead = ~85% efficiency
+static const double PCIE_PROTOCOL_EFFICIENCY[] = {
+    0.0,   // Gen 0 (invalid)
+    0.65,  // Gen 1 (8b/10b + high overhead)
+    0.70,  // Gen 2 (8b/10b + moderate overhead)
+    0.85,  // Gen 3 (128b/130b + typical overhead)
+    0.85,  // Gen 4 (128b/130b + typical overhead)
+    0.85,  // Gen 5 (128b/130b + typical overhead)
+    0.85   // Gen 6 (128b/130b + typical overhead)
+};
+
+// Calculate theoretical (raw) bandwidth for PCIe config (in GB/s)
+// This is the maximum possible with perfect efficiency (encoding overhead only)
 inline double CalculatePCIeBandwidth(int gen, int lanes) {
     if (gen < 1 || gen > 6 || lanes < 1) return 0.0;
     // PCIe uses 128b/130b encoding for Gen3+, 8b/10b for Gen1-2
@@ -130,6 +156,16 @@ inline double CalculatePCIeBandwidth(int gen, int lanes) {
     double gtPerSec = PCIE_GEN_SPEEDS[gen];
     // GT/s * lanes * encoding efficiency / 8 bits per byte = GB/s
     return (gtPerSec * lanes * encodingEfficiency) / 8.0;
+}
+
+// Calculate realistic (achievable) bandwidth accounting for protocol overhead
+// This is what well-optimized software can typically achieve
+inline double CalculateRealisticPCIeBandwidth(int gen, int lanes) {
+    if (gen < 1 || gen > 6 || lanes < 1) return 0.0;
+    double gtPerSec = PCIE_GEN_SPEEDS[gen];
+    double efficiency = PCIE_PROTOCOL_EFFICIENCY[gen];
+    // GT/s * lanes * overall efficiency / 8 bits per byte = GB/s
+    return (gtPerSec * lanes * efficiency) / 8.0;
 }
 
 struct BenchmarkResult {
@@ -157,29 +193,31 @@ struct BenchmarkConfig {
 
 struct InterfaceSpeed {
     const char* name;
-    double      bandwidth;
+    double      bandwidth;       // Realistic achievable bandwidth (with protocol overhead)
+    double      theoretical;     // Raw theoretical bandwidth (encoding overhead only)
     const char* description;
 };
 
-// Updated interface standards with OCuLink, TB5, and PCIe 6.0
-// TB3 has variable PCIe allocation (typically 2 lanes), TB4 guarantees more bandwidth
+// Updated interface standards with realistic achievable bandwidth
+// PCIe Gen3+ uses ~85% efficiency (128b/130b encoding + TLP/DLLP overhead)
+// Thunderbolt/USB4 values are based on real-world measurements
 static const InterfaceSpeed INTERFACE_SPEEDS[] = {
-    {"PCIe 3.0 x4",    3.94,  "Entry-level GPU slot"},
-    {"PCIe 3.0 x8",    7.88,  "Mid-range GPU slot"},
-    {"PCIe 3.0 x16",   15.75, "Standard discrete GPU"},
-    {"PCIe 4.0 x4",    7.88,  "NVMe / Entry eGPU"},
-    {"PCIe 4.0 x8",    15.75, "Mid-range PCIe 4.0"},
-    {"PCIe 4.0 x16",   31.51, "High-end discrete GPU"},
-    {"PCIe 5.0 x8",    31.51, "PCIe 5.0 mid-range"},
-    {"PCIe 5.0 x16",   63.02, "High-end PCIe 5.0 GPU slot"},
-    {"PCIe 6.0 x16",   126.03, "Next-gen PCIe 6.0 GPU slot"},
-    {"OCuLink 1.0",    3.94,  "PCIe 3.0 x4 external"},
-    {"OCuLink 2.0",    7.88,  "PCIe 4.0 x4 external"},
-    {"Thunderbolt 3",  2.50,  "40 Gbps (variable PCIe allocation)"},
-    {"Thunderbolt 4",  3.00,  "40 Gbps (guaranteed PCIe bandwidth)"},
-    {"Thunderbolt 5",  10.00, "80 Gbps bi-directional / 120 Gbps boost"},
-    {"USB4 40Gbps",    4.00,  "40 Gbps external"},
-    {"USB4 80Gbps",    8.00,  "80 Gbps external"},
+    {"PCIe 3.0 x4",    3.40,   3.94,  "Entry-level GPU slot"},
+    {"PCIe 3.0 x8",    6.80,   7.88,  "Mid-range GPU slot"},
+    {"PCIe 3.0 x16",   13.60,  15.75, "Standard discrete GPU"},
+    {"PCIe 4.0 x4",    6.80,   7.88,  "NVMe / Entry eGPU"},
+    {"PCIe 4.0 x8",    13.60,  15.75, "Mid-range PCIe 4.0"},
+    {"PCIe 4.0 x16",   27.20,  31.51, "High-end discrete GPU"},
+    {"PCIe 5.0 x8",    27.20,  31.51, "PCIe 5.0 mid-range"},
+    {"PCIe 5.0 x16",   54.40,  63.02, "High-end PCIe 5.0 GPU slot"},
+    {"PCIe 6.0 x16",   108.80, 126.03, "Next-gen PCIe 6.0 GPU slot"},
+    {"OCuLink 1.0",    3.40,   3.94,  "PCIe 3.0 x4 external"},
+    {"OCuLink 2.0",    6.80,   7.88,  "PCIe 4.0 x4 external"},
+    {"Thunderbolt 3",  2.50,   2.80,  "40 Gbps (variable PCIe allocation)"},
+    {"Thunderbolt 4",  3.00,   3.50,  "40 Gbps (guaranteed PCIe bandwidth)"},
+    {"Thunderbolt 5",  10.00,  12.00, "80 Gbps bi-directional / 120 Gbps boost"},
+    {"USB4 40Gbps",    4.00,   5.00,  "40 Gbps external"},
+    {"USB4 80Gbps",    8.00,   10.00, "80 Gbps external"},
 };
 
 static const int NUM_INTERFACE_SPEEDS = sizeof(INTERFACE_SPEEDS) / sizeof(INTERFACE_SPEEDS[0]);
@@ -279,6 +317,10 @@ struct AppContext {
     bool        possibleEGPU = false;
     std::string eGPUConnectionType;
     
+    // Integrated GPU memory info
+    std::string integratedMemoryType;    // e.g., "DDR5"
+    std::string integratedFabricType;    // e.g., "AMD Infinity Fabric"
+    
     // Summary window
     bool        showSummaryWindow = false;
     double      actualPCIeBandwidth = 0;   // Theoretical max based on detected link
@@ -363,15 +405,81 @@ void FindClosestInterface(double measured, std::string& outName, double& outPerc
         outName = best->name;
         outPercentage = (measured / best->bandwidth) * 100.0;
     } else if (measured > 50) {
+        // Faster than any standard - compare to PCIe 5.0 x16 realistic bandwidth
         outName = "PCIe 5.0 x16";
-        outPercentage = (measured / 63.02) * 100.0;
+        outPercentage = (measured / 54.40) * 100.0;  // Realistic PCIe 5.0 x16 bandwidth
     } else {
         outName = "Unknown";
         outPercentage = 0;
     }
 }
 
-void DetectInterface(double upload, double download) {
+// Detect interface type for integrated GPUs (APUs)
+// These don't use PCIe - they share system memory via the CPU's memory controller
+void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo& gpu) {
+    g_app.uploadBW = upload;
+    g_app.downloadBW = download;
+    
+    // Determine memory type based on vendor and bandwidth
+    std::string memoryType;
+    std::string fabricType;
+    
+    double maxBandwidth = std::max(upload, download);
+    
+    // AMD APUs use Infinity Fabric, Intel uses ring bus/mesh
+    if (gpu.vendor == "AMD") {
+        fabricType = "AMD Infinity Fabric";
+        // Estimate DDR generation from bandwidth
+        // DDR4-3200 dual channel: ~51 GB/s theoretical, ~40 GB/s real
+        // DDR5-5600 dual channel: ~89 GB/s theoretical, ~70 GB/s real
+        // DDR5-6400 dual channel: ~102 GB/s theoretical, ~80 GB/s real
+        if (maxBandwidth > 60) {
+            memoryType = "DDR5";
+        } else if (maxBandwidth > 35) {
+            memoryType = "DDR4/DDR5";
+        } else {
+            memoryType = "DDR4";
+        }
+    } else if (gpu.vendor == "Intel") {
+        fabricType = "Intel Ring Bus / Mesh";
+        if (maxBandwidth > 50) {
+            memoryType = "DDR5";
+        } else {
+            memoryType = "DDR4";
+        }
+    } else {
+        fabricType = "On-die Interconnect";
+        memoryType = "System Memory";
+    }
+    
+    g_app.detectedInterface = "Integrated GPU (Shared Memory)";
+    g_app.detectedInterfaceDescription = "UMA - CPU and GPU share " + memoryType + " via " + fabricType;
+    
+    // Store memory info for display
+    g_app.integratedMemoryType = memoryType;
+    g_app.integratedFabricType = fabricType;
+    
+    // For percentage display, compare against typical DDR bandwidth instead of PCIe
+    // DDR5 dual-channel realistic: ~70 GB/s
+    // DDR4 dual-channel realistic: ~40 GB/s
+    double expectedBandwidth = (memoryType.find("DDR5") != std::string::npos) ? 70.0 : 40.0;
+    
+    g_app.closestUploadStandard = memoryType + " (typical)";
+    g_app.uploadPercentage = (upload / expectedBandwidth) * 100.0;
+    g_app.closestDownloadStandard = memoryType + " (typical)";
+    g_app.downloadPercentage = (download / expectedBandwidth) * 100.0;
+}
+
+void DetectInterface(double upload, double download, int gpuIndex) {
+    const GPUInfo& gpu = g_app.gpuList[gpuIndex];
+    
+    // For integrated GPUs, don't try to match PCIe standards - it's meaningless
+    if (gpu.isIntegrated) {
+        DetectIntegratedGPUInterface(upload, download, gpu);
+        return;
+    }
+    
+    // Discrete GPU - detect PCIe/Thunderbolt interface
     double measured = std::max(upload, download);
     const InterfaceSpeed* best = nullptr;
     double bestDiff = 1e9;
@@ -391,7 +499,7 @@ void DetectInterface(double upload, double download) {
         g_app.detectedInterfaceDescription = best->description;
     } else if (measured > 50) {
         g_app.detectedInterface = "PCIe 5.0 x16 (or faster)";
-        g_app.detectedInterfaceDescription = "Cutting-edge performance";
+        g_app.detectedInterfaceDescription = "High-performance discrete GPU";
     } else {
         g_app.detectedInterface = "Unknown";
         g_app.detectedInterfaceDescription = "";
@@ -405,21 +513,31 @@ void DetectInterface(double upload, double download) {
     FindClosestInterface(download, g_app.closestDownloadStandard, g_app.downloadPercentage);
 }
 
-// Detect if this might be an eGPU based on bandwidth and GPU type
-void DetectEGPU(double upload, double download, bool isIntegrated) {
+// Detect if this is an eGPU - prefer hardware detection, fall back to bandwidth heuristic
+void DetectEGPU(double upload, double download, const GPUInfo& gpu) {
     g_app.possibleEGPU = false;
     g_app.eGPUConnectionType.clear();
     
     // iGPUs are never eGPUs
-    if (isIntegrated) return;
+    if (gpu.isIntegrated) return;
     
+    // First, check if hardware detection found Thunderbolt/USB4/USB connection
+    if (gpu.isThunderbolt || gpu.isUSB4 || gpu.isUSB) {
+        g_app.possibleEGPU = true;
+        g_app.eGPUConnectionType = gpu.externalConnectionType;
+        // Don't log here - it was already logged during enumeration
+        return;
+    }
+    
+    // Fallback: Use bandwidth heuristic for cases where hardware detection failed
     double maxBandwidth = std::max(upload, download);
     
     // If a discrete GPU has suspiciously low bandwidth, it might be external
     if (maxBandwidth < Constants::EGPU_BANDWIDTH_THRESHOLD) {
         g_app.possibleEGPU = true;
         
-        // Try to identify the connection type
+        // Identify the connection type from bandwidth
+        // Don't add "inferred" qualifier - the eGPU detection itself is the confirmation
         if (maxBandwidth <= Constants::TB3_MAX_BANDWIDTH) {
             g_app.eGPUConnectionType = "Thunderbolt 3 / USB4 40Gbps";
         } else if (maxBandwidth <= Constants::TB4_MAX_BANDWIDTH) {
@@ -428,7 +546,7 @@ void DetectEGPU(double upload, double download, bool isIntegrated) {
             g_app.eGPUConnectionType = "External (OCuLink / USB4 80Gbps)";
         }
         
-        Log("[INFO] Possible eGPU detected via " + g_app.eGPUConnectionType);
+        Log("[INFO] eGPU detected - bandwidth indicates " + g_app.eGPUConnectionType);
     }
 }
 
@@ -565,6 +683,536 @@ std::string FormatPCIeConfig(int gen, int lanes) {
 }
 
 // ============================================================================
+// THUNDERBOLT / USB4 / USB DETECTION
+// ============================================================================
+
+// Vendor IDs
+static const uint32_t VENDOR_INTEL = 0x8086;
+static const uint32_t VENDOR_AMD = 0x1022;
+static const uint32_t VENDOR_ASMEDIA = 0x1B21;
+static const uint32_t VENDOR_REALTEK = 0x10EC;
+static const uint32_t VENDOR_VIA = 0x1106;
+static const uint32_t VENDOR_RENESAS = 0x1912;
+static const uint32_t VENDOR_FRESCO = 0x1B73;  // Fresco Logic (now Cadence)
+static const uint32_t VENDOR_ETRON = 0x1B6F;
+static const uint32_t VENDOR_TEXAS = 0x104C;   // Texas Instruments
+
+// Known Intel Thunderbolt controller device IDs (Vendor 0x8086)
+static const uint32_t INTEL_TB3_DEVICE_IDS[] = {
+    0x15D2, 0x15D9, 0x15DA, 0x15DB, 0x15DC, 0x15DD, 0x15DE, 0x15DF,  // Alpine Ridge
+    0x15E7, 0x15E8, 0x15EA, 0x15EB, 0x15EC, 0x15EF,                  // Titan Ridge
+    0x15BF, 0x15C0, 0x15C1,                                          // JHL6xxx
+};
+
+static const uint32_t INTEL_TB4_DEVICE_IDS[] = {
+    0x9A1B, 0x9A1C, 0x9A1D, 0x9A1E, 0x9A1F,  // Tiger Lake TB4
+    0x9A21, 0x9A23, 0x9A25, 0x9A27, 0x9A29,  // Tiger Lake TB4
+    0xA73E, 0xA73F, 0xA76D, 0xA76E,          // Alder Lake TB4
+    0x466D, 0x466E, 0x462E, 0x463E,          // Raptor Lake TB4
+    0x7EB2, 0x7EB4, 0x7EC2, 0x7EC4,          // Meteor Lake TB4
+    0xA0D3, 0xA0E3,                          // Ice Lake TB4
+};
+
+// Intel Thunderbolt/USB4 PCIe SWITCH device IDs (Vendor 0x8086)
+// These are the PCIe switches INSIDE TB/USB4 tunneling chips and enclosures
+// They appear in the device tree between the GPU and the root port
+static const uint32_t INTEL_TB_PCIE_SWITCH_IDS[] = {
+    // Goshen Ridge (USB4/TB4 PCIe switches) - found in USB4 eGPU enclosures
+    0x5780, 0x5781, 0x5782, 0x5783, 0x5784, 0x5785, 0x5786, 0x5787,
+    0x5788, 0x5789, 0x578A, 0x578B, 0x578C, 0x578D, 0x578E, 0x578F,
+    
+    // Titan Ridge PCIe switches
+    0x15E9, 0x15EA, 0x15EB,
+    
+    // Alpine Ridge PCIe switches  
+    0x1575, 0x1576, 0x1577, 0x1578, 0x1579,
+    
+    // JHL6xxx/JHL7xxx PCIe switches
+    0x15D3, 0x15D4, 0x15D5,
+    
+    // Maple Ridge (TB4) PCIe switches
+    0x1136, 0x1137,
+};
+
+// AMD USB4 controller device IDs (Vendor 0x1022)
+// AMD implements USB4 in their chipsets starting with Ryzen 7000 series
+static const uint32_t AMD_USB4_DEVICE_IDS[] = {
+    0x162E, 0x162F,  // AMD Pink Sardine USB4
+    0x163A, 0x163B, 0x163C, 0x163D,  // AMD USB4 Router
+    0x164A, 0x164B, 0x164C, 0x164D,  // Ryzen 7000 series USB4
+    0x14E9, 0x14EA,  // AMD Rembrandt USB4
+    0x15B6, 0x15B7, 0x15B8, 0x15B9,  // Phoenix USB4
+    0x1668, 0x1669,  // Hawk Point USB4
+};
+
+// ASMedia USB controllers (common in third-party USB cards/enclosures)
+static const uint32_t ASMEDIA_USB_DEVICE_IDS[] = {
+    0x2142,  // ASM2142 USB 3.1 Gen 2
+    0x3242,  // ASM3242 USB 3.2 Gen 2x2
+    0x3241,  // ASM3241 USB 3.2
+    0x1242,  // ASM1242 USB 3.1
+    0x1042,  // ASM1042 USB 3.0
+    0x1142,  // ASM1142 USB 3.1
+    0x2362,  // ASM2362 PCIe to USB 3.2 Bridge
+    0x2364,  // ASM2364 USB4/TB4 Controller
+    0x4242,  // ASM4242 USB4
+};
+
+// Intel USB xHCI controllers (for USB 3.x detection)
+static const uint32_t INTEL_USB_XHCI_IDS[] = {
+    0xA36D, 0xA2AF,  // 300 series
+    0x8D31, 0x8C31,  // 100 series
+    0x9D2F, 0x9DED,  // 100/200 series mobile
+    0xA0ED, 0xA1ED,  // 500 series
+    0x7A60, 0x7AE0,  // 600/700 series
+    0x460E, 0x461E,  // Alder Lake
+    0x7E7E, 0x7E7F,  // Meteor Lake
+};
+
+// Structure to hold detection result details
+struct ExternalConnectionInfo {
+    bool isExternal;
+    bool isThunderbolt;
+    bool isUSB4;
+    bool isUSB3;
+    int thunderboltVersion;  // 3 or 4, 0 if not TB
+    int usbGeneration;       // 3, 4 (for USB 3.x, USB4)
+    std::string connectionType;
+    std::string controllerName;
+};
+
+// Check if a device ID is a Thunderbolt controller
+bool IsThunderbolt3Controller(uint32_t vendorId, uint32_t deviceId) {
+    if (vendorId != VENDOR_INTEL) return false;
+    for (auto id : INTEL_TB3_DEVICE_IDS) {
+        if (deviceId == id) return true;
+    }
+    return false;
+}
+
+bool IsThunderbolt4Controller(uint32_t vendorId, uint32_t deviceId) {
+    if (vendorId != VENDOR_INTEL) return false;
+    for (auto id : INTEL_TB4_DEVICE_IDS) {
+        if (deviceId == id) return true;
+    }
+    return false;
+}
+
+// Check if a device is an Intel Thunderbolt/USB4 PCIe SWITCH
+// These are found INSIDE eGPU enclosures - they're the PCIe fabric inside the tunnel
+bool IsThunderboltPCIeSwitch(uint32_t vendorId, uint32_t deviceId) {
+    if (vendorId != VENDOR_INTEL) return false;
+    for (auto id : INTEL_TB_PCIE_SWITCH_IDS) {
+        if (deviceId == id) return true;
+    }
+    return false;
+}
+
+// Check if a device ID is a USB4 controller (non-Thunderbolt branded)
+bool IsUSB4Controller(uint32_t vendorId, uint32_t deviceId) {
+    // AMD USB4 controllers
+    if (vendorId == VENDOR_AMD) {
+        for (auto id : AMD_USB4_DEVICE_IDS) {
+            if (deviceId == id) return true;
+        }
+    }
+    
+    // ASMedia USB4 controllers
+    if (vendorId == VENDOR_ASMEDIA) {
+        if (deviceId == 0x2364 || deviceId == 0x4242) return true;
+    }
+    
+    return false;
+}
+
+// Check if a device ID is a USB 3.x controller that could be used for external GPUs
+bool IsUSB3Controller(uint32_t vendorId, uint32_t deviceId) {
+    // Intel xHCI controllers
+    if (vendorId == VENDOR_INTEL) {
+        for (auto id : INTEL_USB_XHCI_IDS) {
+            if (deviceId == id) return true;
+        }
+    }
+    
+    // ASMedia USB 3.x controllers
+    if (vendorId == VENDOR_ASMEDIA) {
+        for (auto id : ASMEDIA_USB_DEVICE_IDS) {
+            if (deviceId == id) return true;
+        }
+    }
+    
+    // Fresco Logic USB 3.0 controllers
+    if (vendorId == VENDOR_FRESCO) {
+        return true;  // All Fresco Logic devices are USB controllers
+    }
+    
+    // Renesas USB controllers
+    if (vendorId == VENDOR_RENESAS) {
+        return true;
+    }
+    
+    // VIA USB controllers
+    if (vendorId == VENDOR_VIA) {
+        if (deviceId == 0x3483 || deviceId == 0x3432) return true;
+    }
+    
+    // Etron USB controllers
+    if (vendorId == VENDOR_ETRON) {
+        return true;
+    }
+    
+    return false;
+}
+
+// Get friendly name for USB controller
+std::string GetUSBControllerName(uint32_t vendorId, uint32_t deviceId) {
+    if (vendorId == VENDOR_AMD) {
+        return "AMD USB4";
+    } else if (vendorId == VENDOR_ASMEDIA) {
+        if (deviceId == 0x2364 || deviceId == 0x4242) return "ASMedia USB4";
+        if (deviceId == 0x3242) return "ASMedia USB 3.2 Gen 2x2";
+        if (deviceId == 0x2142) return "ASMedia USB 3.1 Gen 2";
+        return "ASMedia USB";
+    } else if (vendorId == VENDOR_FRESCO) {
+        return "Fresco Logic USB 3.0";
+    } else if (vendorId == VENDOR_RENESAS) {
+        return "Renesas USB 3.0";
+    } else if (vendorId == VENDOR_INTEL) {
+        return "Intel USB";
+    }
+    return "USB Controller";
+}
+
+// Detect if a GPU is connected via Thunderbolt/USB4/USB by walking the device tree
+void DetectExternalConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPUInfo& outInfo) {
+    outInfo.isThunderbolt = false;
+    outInfo.isUSB4 = false;
+    outInfo.isUSB = false;
+    outInfo.thunderboltVersion = 0;
+    outInfo.externalConnectionType.clear();
+    
+    // Create device info set for PCI devices
+    HDEVINFO deviceInfoSet = SetupDiGetClassDevsW(
+        nullptr, L"PCI", nullptr, DIGCF_PRESENT | DIGCF_ALLCLASSES);
+    
+    if (deviceInfoSet == INVALID_HANDLE_VALUE) return;
+    
+    SP_DEVINFO_DATA deviceInfoData;
+    deviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+    
+    DEVINST gpuDevInst = 0;
+    
+    // Find our GPU in the device tree
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(deviceInfoSet, i, &deviceInfoData); i++) {
+        WCHAR hardwareId[512] = {0};
+        if (!SetupDiGetDeviceRegistryPropertyW(deviceInfoSet, &deviceInfoData,
+                SPDRP_HARDWAREID, nullptr, (PBYTE)hardwareId, sizeof(hardwareId), nullptr)) {
+            continue;
+        }
+        
+        // Match vendor/device ID
+        WCHAR searchVen[32], searchDev[32];
+        swprintf_s(searchVen, L"VEN_%04X", gpuVendorId);
+        swprintf_s(searchDev, L"DEV_%04X", gpuDeviceId);
+        
+        std::wstring hwIdStr(hardwareId);
+        if (hwIdStr.find(searchVen) != std::wstring::npos &&
+            hwIdStr.find(searchDev) != std::wstring::npos) {
+            gpuDevInst = deviceInfoData.DevInst;
+            break;
+        }
+    }
+    
+    SetupDiDestroyDeviceInfoList(deviceInfoSet);
+    
+    if (gpuDevInst == 0) return;
+    
+    // Track if we found a USB connection (lower priority than TB/USB4)
+    bool foundUSB3 = false;
+    std::string usb3ControllerName;
+    
+    // Debug: Log device tree traversal (can be enabled for troubleshooting)
+    #ifdef DEBUG_EXTERNAL_DETECTION
+    Log("[DEBUG] Starting external connection detection for GPU");
+    #endif
+    
+    // Walk up the device tree looking for Thunderbolt/USB4/USB3 controllers
+    DEVINST parentDevInst = gpuDevInst;
+    int depth = 0;
+    const int maxDepth = 15;  // Go a bit further up for USB chains
+    
+    while (depth < maxDepth) {
+        DEVINST nextParent;
+        if (CM_Get_Parent(&nextParent, parentDevInst, 0) != CR_SUCCESS) {
+            break;  // Reached the root
+        }
+        parentDevInst = nextParent;
+        depth++;
+        
+        // Get device instance ID of parent
+        WCHAR parentInstanceId[MAX_DEVICE_ID_LEN] = {0};
+        if (CM_Get_Device_IDW(parentDevInst, parentInstanceId, MAX_DEVICE_ID_LEN, 0) != CR_SUCCESS) {
+            continue;
+        }
+        
+        std::wstring instanceStr(parentInstanceId);
+        std::wstring upperInstance = instanceStr;
+        std::transform(upperInstance.begin(), upperInstance.end(), upperInstance.begin(), ::towupper);
+        
+        #ifdef DEBUG_EXTERNAL_DETECTION
+        // Log the device path for debugging
+        char pathBuf[512];
+        WideCharToMultiByte(CP_UTF8, 0, parentInstanceId, -1, pathBuf, 512, nullptr, nullptr);
+        Log("[DEBUG] Depth " + std::to_string(depth) + ": " + std::string(pathBuf));
+        #endif
+        
+        // ====== Check for Thunderbolt/USB4 in device path ======
+        if (upperInstance.find(L"THUNDERBOLT") != std::wstring::npos ||
+            upperInstance.find(L"\\TBT") != std::wstring::npos) {
+            outInfo.isThunderbolt = true;
+            outInfo.isUSB = true;  // TB is USB-based
+            // Try to determine version from path
+            if (upperInstance.find(L"TBT4") != std::wstring::npos ||
+                upperInstance.find(L"USB4") != std::wstring::npos) {
+                outInfo.thunderboltVersion = 4;
+                outInfo.isUSB4 = true;
+                outInfo.externalConnectionType = "Thunderbolt 4";
+            } else if (upperInstance.find(L"TBT3") != std::wstring::npos) {
+                outInfo.thunderboltVersion = 3;
+                outInfo.externalConnectionType = "Thunderbolt 3";
+            } else {
+                outInfo.externalConnectionType = "Thunderbolt";
+            }
+            return;
+        }
+        
+        // Check for USB4 in path (non-Thunderbolt branded)
+        // Patterns: USB4\, USB4-, \USB4, ACPI\USB4, USB\ROOT_HUB40 (USB4 root hub)
+        if (upperInstance.find(L"USB4") != std::wstring::npos ||
+            upperInstance.find(L"ROOT_HUB40") != std::wstring::npos) {  // USB4 root hub pattern
+            outInfo.isUSB4 = true;
+            outInfo.isUSB = true;
+            outInfo.externalConnectionType = "USB4 (PCIe Tunneling)";
+            return;
+        }
+        
+        // Check for USB/xHCI in path (indicates USB-based connection)
+        if (upperInstance.find(L"USB\\") != std::wstring::npos ||
+            upperInstance.find(L"XHCI") != std::wstring::npos ||
+            upperInstance.find(L"USBROOT") != std::wstring::npos) {
+            if (!foundUSB3) {
+                foundUSB3 = true;
+                usb3ControllerName = "USB";
+            }
+        }
+        
+        // ====== Check vendor/device IDs for known controllers ======
+        if (instanceStr.find(L"PCI\\VEN_") != std::wstring::npos) {
+            uint32_t parentVendor = 0, parentDevice = 0;
+            size_t venPos = instanceStr.find(L"VEN_");
+            size_t devPos = instanceStr.find(L"DEV_");
+            
+            if (venPos != std::wstring::npos && devPos != std::wstring::npos) {
+                swscanf_s(instanceStr.c_str() + venPos + 4, L"%04X", &parentVendor);
+                swscanf_s(instanceStr.c_str() + devPos + 4, L"%04X", &parentDevice);
+                
+                // Check for Intel Thunderbolt controllers (highest priority)
+                if (IsThunderbolt4Controller(parentVendor, parentDevice)) {
+                    outInfo.isThunderbolt = true;
+                    outInfo.isUSB4 = true;
+                    outInfo.isUSB = true;
+                    outInfo.thunderboltVersion = 4;
+                    outInfo.externalConnectionType = "Thunderbolt 4";
+                    return;
+                }
+                if (IsThunderbolt3Controller(parentVendor, parentDevice)) {
+                    outInfo.isThunderbolt = true;
+                    outInfo.isUSB = true;
+                    outInfo.thunderboltVersion = 3;
+                    outInfo.externalConnectionType = "Thunderbolt 3";
+                    return;
+                }
+                
+                // Check for Intel TB/USB4 PCIe SWITCHES (inside eGPU enclosures)
+                // These are the PCIe fabric chips inside the tunnel - indicates eGPU
+                if (IsThunderboltPCIeSwitch(parentVendor, parentDevice)) {
+                    outInfo.isUSB4 = true;
+                    outInfo.isUSB = true;
+                    // These switches are used in both TB and USB4 enclosures
+                    // We can't tell which from the switch alone, so report as USB4/TB
+                    outInfo.externalConnectionType = "USB4 / Thunderbolt (PCIe Tunnel)";
+                    #ifdef DEBUG_EXTERNAL_DETECTION
+                    char dbgBuf[128];
+                    snprintf(dbgBuf, sizeof(dbgBuf), "[DEBUG] Found Intel TB/USB4 PCIe Switch: %04X:%04X", parentVendor, parentDevice);
+                    Log(dbgBuf);
+                    #endif
+                    return;
+                }
+                
+                // Check for USB4 controllers (AMD, ASMedia, etc.)
+                if (IsUSB4Controller(parentVendor, parentDevice)) {
+                    outInfo.isUSB4 = true;
+                    outInfo.isUSB = true;
+                    std::string controllerName = GetUSBControllerName(parentVendor, parentDevice);
+                    outInfo.externalConnectionType = controllerName + " (PCIe Tunneling)";
+                    return;
+                }
+                
+                // Check for USB 3.x controllers (track but keep looking for TB/USB4)
+                if (IsUSB3Controller(parentVendor, parentDevice)) {
+                    if (!foundUSB3) {
+                        foundUSB3 = true;
+                        usb3ControllerName = GetUSBControllerName(parentVendor, parentDevice);
+                    }
+                }
+            }
+        }
+        
+        // ====== Check device description for keywords ======
+        HDEVINFO parentDevInfoSet = SetupDiGetClassDevsW(
+            nullptr, nullptr, nullptr, DIGCF_PRESENT | DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE);
+        
+        if (parentDevInfoSet != INVALID_HANDLE_VALUE) {
+            SP_DEVINFO_DATA parentInfoData;
+            parentInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+            
+            if (SetupDiOpenDeviceInfoW(parentDevInfoSet, parentInstanceId, nullptr, 0, &parentInfoData)) {
+                WCHAR deviceDesc[256] = {0};
+                if (SetupDiGetDeviceRegistryPropertyW(parentDevInfoSet, &parentInfoData,
+                        SPDRP_DEVICEDESC, nullptr, (PBYTE)deviceDesc, sizeof(deviceDesc), nullptr)) {
+                    std::wstring descStr(deviceDesc);
+                    std::wstring descUpper = descStr;
+                    std::transform(descUpper.begin(), descUpper.end(), descUpper.begin(), ::towupper);
+                    
+                    #ifdef DEBUG_EXTERNAL_DETECTION
+                    char descBuf[256];
+                    WideCharToMultiByte(CP_UTF8, 0, deviceDesc, -1, descBuf, 256, nullptr, nullptr);
+                    Log("[DEBUG]   Description: " + std::string(descBuf));
+                    #endif
+                    
+                    // Check for Thunderbolt (Intel certified)
+                    if (descUpper.find(L"THUNDERBOLT") != std::wstring::npos) {
+                        outInfo.isThunderbolt = true;
+                        outInfo.isUSB = true;
+                        if (descUpper.find(L"USB4") != std::wstring::npos || 
+                            descUpper.find(L" 4 ") != std::wstring::npos ||
+                            descUpper.find(L" 4)") != std::wstring::npos) {
+                            outInfo.thunderboltVersion = 4;
+                            outInfo.isUSB4 = true;
+                            outInfo.externalConnectionType = "Thunderbolt 4";
+                        } else if (descUpper.find(L" 3 ") != std::wstring::npos ||
+                                   descUpper.find(L" 3)") != std::wstring::npos) {
+                            outInfo.thunderboltVersion = 3;
+                            outInfo.externalConnectionType = "Thunderbolt 3";
+                        } else {
+                            outInfo.externalConnectionType = "Thunderbolt";
+                        }
+                        SetupDiDestroyDeviceInfoList(parentDevInfoSet);
+                        return;
+                    }
+                    
+                    // Check for USB4 - various patterns used by different vendors
+                    // AMD: "USB4(TM) Router", "USB4 Router", "AMD USB4 Host Router"
+                    // Generic: "USB4", "USB 4", "USB4 Host"
+                    bool isUSB4Device = false;
+                    std::string usb4Type;
+                    
+                    if (descUpper.find(L"USB4") != std::wstring::npos ||
+                        descUpper.find(L"USB 4") != std::wstring::npos) {
+                        isUSB4Device = true;
+                        
+                        // Determine the specific type
+                        if (descUpper.find(L"ROUTER") != std::wstring::npos) {
+                            // USB4 Router - this is a hub/dock/enclosure
+                            if (descUpper.find(L"AMD") != std::wstring::npos) {
+                                usb4Type = "AMD USB4 Router";
+                            } else {
+                                usb4Type = "USB4 Router";
+                            }
+                        } else if (descUpper.find(L"HOST") != std::wstring::npos) {
+                            // USB4 Host controller
+                            if (descUpper.find(L"AMD") != std::wstring::npos) {
+                                usb4Type = "AMD USB4";
+                            } else {
+                                usb4Type = "USB4 Host";
+                            }
+                        } else {
+                            // Generic USB4
+                            usb4Type = "USB4";
+                        }
+                    }
+                    
+                    if (isUSB4Device) {
+                        outInfo.isUSB4 = true;
+                        outInfo.isUSB = true;
+                        outInfo.externalConnectionType = usb4Type + " (PCIe Tunneling)";
+                        SetupDiDestroyDeviceInfoList(parentDevInfoSet);
+                        return;
+                    }
+                    
+                    // Check for USB 3.x (SuperSpeed)
+                    if (descUpper.find(L"USB 3") != std::wstring::npos ||
+                        descUpper.find(L"SUPERSPEED") != std::wstring::npos ||
+                        descUpper.find(L"XHCI") != std::wstring::npos) {
+                        if (!foundUSB3) {
+                            foundUSB3 = true;
+                            // Try to determine USB version
+                            if (descUpper.find(L"3.2") != std::wstring::npos ||
+                                descUpper.find(L"GEN 2X2") != std::wstring::npos ||
+                                descUpper.find(L"20GBPS") != std::wstring::npos) {
+                                usb3ControllerName = "USB 3.2 Gen 2x2";
+                            } else if (descUpper.find(L"3.1") != std::wstring::npos ||
+                                       descUpper.find(L"GEN 2") != std::wstring::npos ||
+                                       descUpper.find(L"10GBPS") != std::wstring::npos) {
+                                usb3ControllerName = "USB 3.1 Gen 2";
+                            } else {
+                                usb3ControllerName = "USB 3.x";
+                            }
+                        }
+                    }
+                }
+                
+                // Also check the hardware ID for USB4 patterns
+                WCHAR hardwareId[512] = {0};
+                if (SetupDiGetDeviceRegistryPropertyW(parentDevInfoSet, &parentInfoData,
+                        SPDRP_HARDWAREID, nullptr, (PBYTE)hardwareId, sizeof(hardwareId), nullptr)) {
+                    std::wstring hwIdUpper(hardwareId);
+                    std::transform(hwIdUpper.begin(), hwIdUpper.end(), hwIdUpper.begin(), ::towupper);
+                    
+                    // Check for USB4 in hardware ID (e.g., USB\USB4, ACPI\USB4)
+                    if (hwIdUpper.find(L"USB4") != std::wstring::npos) {
+                        outInfo.isUSB4 = true;
+                        outInfo.isUSB = true;
+                        if (outInfo.externalConnectionType.empty()) {
+                            outInfo.externalConnectionType = "USB4 (PCIe Tunneling)";
+                        }
+                        SetupDiDestroyDeviceInfoList(parentDevInfoSet);
+                        return;
+                    }
+                }
+            }
+            SetupDiDestroyDeviceInfoList(parentDevInfoSet);
+        }
+    }
+    
+    // If we found USB3 but not TB/USB4, report it
+    // This is unusual for GPUs (USB3 doesn't normally support PCIe tunneling)
+    // but some exotic setups might use it
+    if (foundUSB3) {
+        outInfo.isUSB = true;
+        outInfo.externalConnectionType = usb3ControllerName + " (External - Unusual)";
+        // Note: We don't set isUSB4 or isThunderbolt for USB3
+        // USB3 doesn't support PCIe tunneling in the standard, but we detected
+        // the GPU is somehow connected through a USB controller
+    }
+}
+
+// Wrapper for backward compatibility - calls the new function
+void DetectThunderboltConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPUInfo& outInfo) {
+    DetectExternalConnection(gpuVendorId, gpuDeviceId, outInfo);
+}
+
+// ============================================================================
 // GPU ENUMERATION
 // ============================================================================
 void EnumerateGPUs() {
@@ -599,7 +1247,38 @@ void EnumerateGPUs() {
         info.vendor = GetVendorName(desc.VendorId);
         info.dedicatedVRAM = desc.DedicatedVideoMemory;
         info.sharedMemory = desc.SharedSystemMemory;
-        info.isIntegrated = (desc.DedicatedVideoMemory == 0);
+        
+        // Detect integrated GPU using multiple heuristics:
+        // 1. No dedicated VRAM at all -> definitely integrated
+        // 2. Small dedicated VRAM (<512MB) with large shared memory -> likely integrated (APU)
+        // 3. Check for common iGPU naming patterns
+        bool likelyIntegrated = false;
+        
+        if (desc.DedicatedVideoMemory == 0) {
+            likelyIntegrated = true;
+        } else if (desc.DedicatedVideoMemory < 512ull * 1024 * 1024 && 
+                   desc.SharedSystemMemory > desc.DedicatedVideoMemory * 4) {
+            // Small dedicated + large shared = APU with carved-out memory
+            likelyIntegrated = true;
+        }
+        
+        // Check GPU name for common integrated GPU indicators
+        std::string nameLower = info.name;
+        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+        if (nameLower.find("graphics") != std::string::npos && 
+            (nameLower.find("intel") != std::string::npos || 
+             nameLower.find("radeon(tm)") != std::string::npos ||
+             nameLower.find("vega") != std::string::npos ||
+             nameLower.find("apu") != std::string::npos)) {
+            likelyIntegrated = true;
+        }
+        // Intel UHD/Iris are always integrated
+        if (nameLower.find("uhd") != std::string::npos || 
+            nameLower.find("iris") != std::string::npos) {
+            likelyIntegrated = true;
+        }
+        
+        info.isIntegrated = likelyIntegrated;
         info.isValid = true;
         
         // Store the adapter pointer for reliable selection later
@@ -607,6 +1286,15 @@ void EnumerateGPUs() {
         
         // Detect PCIe link configuration
         DetectPCIeLink(desc.VendorId, desc.DeviceId, info);
+        
+        // Detect Thunderbolt/USB4/USB connection via device tree topology
+        // This is more reliable than bandwidth-based detection
+        if (!info.isIntegrated) {
+            DetectThunderboltConnection(desc.VendorId, desc.DeviceId, info);
+            if (info.isThunderbolt || info.isUSB4 || info.isUSB) {
+                Log("[INFO] GPU '" + info.name + "' connected via " + info.externalConnectionType);
+            }
+        }
 
         g_app.gpuList.push_back(std::move(info));
         
@@ -895,7 +1583,20 @@ bool ShouldAbortBenchmark() {
     return g_app.cancelRequested || g_app.benchmarkAborted || IsGlobalTimeoutExceeded();
 }
 
-BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, size_t size, int copies, int batches) {
+// Bandwidth test with configurable measurement method
+// 
+// useCpuTiming = false (GPU timestamps): 
+//   - Accurate for integrated GPUs (shared memory, no ReBAR issue)
+//   - Accurate for GPU->CPU transfers on any GPU
+//   - INACCURATE for CPU->GPU on discrete GPUs with ReBAR (reports inflated speeds)
+//
+// useCpuTiming = true (Round-trip method):
+//   - Uploads data, then downloads from SAME buffer to create data dependency
+//   - Forces actual bus transfer to complete before measurement ends
+//   - Required for accurate CPU->GPU measurement on discrete GPUs with ReBAR
+//   - Slightly slower due to round-trip overhead, but accurate
+//
+BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, size_t size, int copies, int batches, bool useCpuTiming = false) {
     g_app.currentTest = name;
     BenchmarkResult result;
     result.testName = name;
@@ -906,94 +1607,197 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
         Log("[ERROR] Invalid source or destination buffer in bandwidth test");
         return result;
     }
-
-    // Create timestamp query heap
-    D3D12_QUERY_HEAP_DESC qhd = {};
-    qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    qhd.Count = 2;
-    ComPtr<ID3D12QueryHeap> queryHeap;
-    if (FAILED(g_app.benchDevice->CreateQueryHeap(&qhd, IID_PPV_ARGS(&queryHeap)))) {
-        Log("[ERROR] Failed to create timestamp query heap in bandwidth test");
-        return result;
-    }
-
-    auto queryReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, sizeof(UINT64) * 2, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!queryReadback) {
-        Log("[ERROR] Failed to create query readback buffer - aborting test");
-        return result;
-    }
-
-    UINT64 timestampFreq = 0;
-    HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-    if (FAILED(freqResult) || timestampFreq == 0) {
-        Log("[ERROR] Failed to get valid timestamp frequency (freq=" + std::to_string(timestampFreq) + ")");
-        return result;
-    }
-
+    
     std::vector<double> bandwidths;
     bandwidths.reserve(batches);
     int failedBatches = 0;
-
-    for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
-        // Small sleep to reduce CPU spin when checking cancellation
-        if (i % 8 == 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
-        }
-        
+    
+    // Warm-up pass to stabilize GPU clocks and fill any caches
+    {
         g_app.benchAllocator->Reset();
         g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-
-        // Record start timestamp
-        g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-        
-        // Perform copies
         for (int j = 0; j < copies; ++j) {
             g_app.benchList->CopyResource(dst.Get(), src.Get());
         }
-        
-        // Record end timestamp
-        g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-
-        g_app.benchList->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, queryReadback.Get(), 0);
         g_app.benchList->Close();
-
         ID3D12CommandList* lists[] = { g_app.benchList.Get() };
         g_app.benchQueue->ExecuteCommandLists(1, lists);
+        WaitForBenchFenceEx();
+    }
+
+    if (useCpuTiming) {
+        // Round-trip timing mode for accurate CPU->GPU measurement
+        // With ReBAR, GPU timestamps for uploads are unreliable because the GPU can
+        // access system memory directly through the BAR mapping without actual DMA.
+        // 
+        // Solution: Upload to VRAM, then immediately download from the SAME buffer.
+        // The download creates a data dependency - it MUST wait for upload to complete.
+        // Total time = upload + download, so upload = total - (known download speed)
+        // Or we can just report the upload portion based on the round-trip.
         
-        FenceWaitResult fenceResult = WaitForBenchFenceEx();
-        if (fenceResult == FenceWaitResult::Cancelled) {
-            break;
+        // Create a readback buffer same size as destination for round-trip verification
+        auto roundtripReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!roundtripReadback) {
+            Log("[WARNING] Could not create round-trip readback buffer - falling back to GPU timestamps");
+            useCpuTiming = false;  // Fall through to GPU timestamp mode
+        } else {
+            for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
+                if (i % 8 == 0) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                
+                g_app.benchAllocator->Reset();
+                g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+                
+                // Upload: CPU -> GPU (UPLOAD heap -> DEFAULT heap)
+                for (int j = 0; j < copies; ++j) {
+                    g_app.benchList->CopyResource(dst.Get(), src.Get());
+                }
+                
+                // Transition dst from COPY_DEST to COPY_SOURCE for readback
+                D3D12_RESOURCE_BARRIER barrier = {};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = dst.Get();
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                g_app.benchList->ResourceBarrier(1, &barrier);
+                
+                // Download: GPU -> CPU (DEFAULT heap -> READBACK heap)
+                // This MUST wait for upload to complete - data dependency!
+                for (int j = 0; j < copies; ++j) {
+                    g_app.benchList->CopyResource(roundtripReadback.Get(), dst.Get());
+                }
+                
+                // Transition dst back to COPY_DEST for next iteration
+                barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                g_app.benchList->ResourceBarrier(1, &barrier);
+                
+                g_app.benchList->Close();
+
+                ID3D12CommandList* lists[] = { g_app.benchList.Get() };
+                
+                // Start CPU timer just before submitting work
+                auto startTime = std::chrono::high_resolution_clock::now();
+                
+                g_app.benchQueue->ExecuteCommandLists(1, lists);
+                
+                // Wait for GPU completion
+                FenceWaitResult fenceResult = WaitForBenchFenceEx();
+                
+                // Stop CPU timer after fence signals
+                auto endTime = std::chrono::high_resolution_clock::now();
+                
+                if (fenceResult == FenceWaitResult::Cancelled) {
+                    break;
+                }
+                if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
+                    Log("[ERROR] Critical fence error - aborting bandwidth test");
+                    break;
+                }
+
+                double totalSeconds = std::chrono::duration<double>(endTime - startTime).count();
+                if (totalSeconds > 0) {
+                    // Total round-trip = upload + download
+                    // We measured download separately at ~3.5 GB/s
+                    // Upload time = total time - download time
+                    // But for simplicity, we report: upload = total_bytes / total_time / 2
+                    // This assumes roughly symmetric bandwidth (true for TB4)
+                    double totalBytes = static_cast<double>(size) * copies * 2;  // up + down
+                    double roundtripBw = (totalBytes / (1024.0 * 1024.0 * 1024.0)) / totalSeconds;
+                    // Report just the upload portion (half of round-trip)
+                    double uploadBw = roundtripBw / 2.0;
+                    bandwidths.push_back(uploadBw);
+                } else {
+                    failedBatches++;
+                }
+
+                g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
+            }
         }
-        if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
-            Log("[ERROR] Critical fence error - aborting bandwidth test");
-            break;
+    }
+    
+    if (!useCpuTiming) {
+        // GPU timestamp mode - accurate for GPU->CPU and bidirectional where GPU is the bottleneck
+        
+        D3D12_QUERY_HEAP_DESC qhd = {};
+        qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qhd.Count = 2;
+        ComPtr<ID3D12QueryHeap> queryHeap;
+        if (FAILED(g_app.benchDevice->CreateQueryHeap(&qhd, IID_PPV_ARGS(&queryHeap)))) {
+            Log("[ERROR] Failed to create timestamp query heap in bandwidth test");
+            return result;
         }
 
-        // Read timestamps
-        UINT64* timestamps = nullptr;
-        D3D12_RANGE readRange = { 0, sizeof(UINT64) * 2 };
-        if (SUCCEEDED(queryReadback->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
-            UINT64 delta = timestamps[1] - timestamps[0];
-            queryReadback->Unmap(0, nullptr);
+        auto queryReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, sizeof(UINT64) * 2, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!queryReadback) {
+            Log("[ERROR] Failed to create query readback buffer - aborting test");
+            return result;
+        }
+
+        UINT64 timestampFreq = 0;
+        HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
+        if (FAILED(freqResult) || timestampFreq == 0) {
+            Log("[ERROR] Failed to get valid timestamp frequency (freq=" + std::to_string(timestampFreq) + ")");
+            return result;
+        }
+
+        for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
+            if (i % 8 == 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
             
-            // Sanity check on delta
-            if (delta > 0 && timestampFreq > 0) {
-                double seconds = static_cast<double>(delta) / static_cast<double>(timestampFreq);
-                if (seconds > 0) {
-                    double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
-                    bandwidths.push_back(bw);
+            g_app.benchAllocator->Reset();
+            g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+
+            g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+            
+            for (int j = 0; j < copies; ++j) {
+                g_app.benchList->CopyResource(dst.Get(), src.Get());
+            }
+            
+            g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+
+            g_app.benchList->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, queryReadback.Get(), 0);
+            g_app.benchList->Close();
+
+            ID3D12CommandList* lists[] = { g_app.benchList.Get() };
+            g_app.benchQueue->ExecuteCommandLists(1, lists);
+            
+            FenceWaitResult fenceResult = WaitForBenchFenceEx();
+            if (fenceResult == FenceWaitResult::Cancelled) {
+                break;
+            }
+            if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
+                Log("[ERROR] Critical fence error - aborting bandwidth test");
+                break;
+            }
+
+            UINT64* timestamps = nullptr;
+            D3D12_RANGE readRange = { 0, sizeof(UINT64) * 2 };
+            if (SUCCEEDED(queryReadback->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
+                UINT64 delta = timestamps[1] - timestamps[0];
+                queryReadback->Unmap(0, nullptr);
+                
+                if (delta > 0 && timestampFreq > 0) {
+                    double seconds = static_cast<double>(delta) / static_cast<double>(timestampFreq);
+                    if (seconds > 0) {
+                        double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                        bandwidths.push_back(bw);
+                    } else {
+                        failedBatches++;
+                    }
                 } else {
                     failedBatches++;
                 }
             } else {
+                Log("[ERROR] Failed to map query readback buffer in bandwidth test");
                 failedBatches++;
             }
-        } else {
-            Log("[ERROR] Failed to map query readback buffer in bandwidth test");
-            failedBatches++;
-        }
 
-        g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
+            g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
+        }
     }
 
     // Calculate results only if we have valid samples
@@ -1241,30 +2045,25 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
         return result;
     }
 
-    D3D12_QUERY_HEAP_DESC qhd = {};
-    qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    qhd.Count = 2;
-    ComPtr<ID3D12QueryHeap> queryHeap;
-    if (FAILED(g_app.benchDevice->CreateQueryHeap(&qhd, IID_PPV_ARGS(&queryHeap)))) {
-        Log("[ERROR] Failed to create timestamp query heap in bidirectional test");
-        return result;
-    }
-
-    auto queryReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, sizeof(UINT64) * 2, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!queryReadback) return result;
-
-    UINT64 timestampFreq = 0;
-    HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-    if (FAILED(freqResult) || timestampFreq == 0) {
-        Log("[ERROR] Failed to get valid timestamp frequency");
-        return result;
-    }
-
     std::vector<double> bandwidths;
     bandwidths.reserve(batches);
+    
+    // Warm-up pass
+    {
+        g_app.benchAllocator->Reset();
+        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+        for (int j = 0; j < copies; ++j) {
+            g_app.benchList->CopyResource(gpuDefault.Get(), cpuUpload.Get());
+            g_app.benchList->CopyResource(cpuReadback.Get(), gpuSrc.Get());
+        }
+        g_app.benchList->Close();
+        ID3D12CommandList* lists[] = { g_app.benchList.Get() };
+        g_app.benchQueue->ExecuteCommandLists(1, lists);
+        WaitForBenchFenceEx();
+    }
 
+    // Use CPU wall-clock timing for accurate measurement
     for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
-        // Small sleep to reduce CPU spin
         if (i % 8 == 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
@@ -1272,39 +2071,33 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
         g_app.benchAllocator->Reset();
         g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
 
-        g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
         for (int j = 0; j < copies; ++j) {
             g_app.benchList->CopyResource(gpuDefault.Get(), cpuUpload.Get());
             g_app.benchList->CopyResource(cpuReadback.Get(), gpuSrc.Get());
         }
-        g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-
-        g_app.benchList->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, queryReadback.Get(), 0);
         g_app.benchList->Close();
 
         ID3D12CommandList* lists[] = { g_app.benchList.Get() };
+        
+        // Start CPU timer
+        auto startTime = std::chrono::high_resolution_clock::now();
+        
         g_app.benchQueue->ExecuteCommandLists(1, lists);
         
         FenceWaitResult fenceResult = WaitForBenchFenceEx();
+        
+        // Stop CPU timer
+        auto endTime = std::chrono::high_resolution_clock::now();
+        
         if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
             break;
         }
 
-        UINT64* timestamps = nullptr;
-        D3D12_RANGE readRange = { 0, sizeof(UINT64) * 2 };
-        if (SUCCEEDED(queryReadback->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
-            UINT64 delta = timestamps[1] - timestamps[0];
-            queryReadback->Unmap(0, nullptr);
-            
-            if (delta > 0 && timestampFreq > 0) {
-                double seconds = static_cast<double>(delta) / static_cast<double>(timestampFreq);
-                if (seconds > 0) {
-                    double bw = (static_cast<double>(size) * copies * 2 / (1024.0 * 1024.0 * 1024.0)) / seconds;
-                    bandwidths.push_back(bw);
-                }
-            }
-        } else {
-            Log("[ERROR] Failed to map query readback buffer in bidirectional test");
+        double seconds = std::chrono::duration<double>(endTime - startTime).count();
+        if (seconds > 0) {
+            // Total data = size * copies * 2 (upload + download)
+            double bw = (static_cast<double>(size) * copies * 2 / (1024.0 * 1024.0 * 1024.0)) / seconds;
+            bandwidths.push_back(bw);
         }
 
         g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
@@ -1374,6 +2167,14 @@ void BenchmarkThreadFunc() {
     Log("=== Benchmark Started ===");
     Log("GPU: " + g_app.gpuList[g_app.config.selectedGPU].name);
     
+    // Log GPU type and measurement method
+    bool isIntegratedGPU = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
+    if (isIntegratedGPU) {
+        Log("GPU Type: Integrated (using GPU timestamps for upload measurement)");
+    } else {
+        Log("GPU Type: Discrete (using round-trip method for accurate upload measurement)");
+    }
+    
     // Validate and potentially cap bandwidth size based on VRAM
     size_t originalSize = g_app.config.bandwidthSize;
     g_app.config.bandwidthSize = ValidateBandwidthSize(originalSize, g_app.config.selectedGPU);
@@ -1419,6 +2220,12 @@ void BenchmarkThreadFunc() {
         
         bool runHadCriticalFailure = false;
         std::string runSuffix = getRunSuffix(run, g_app.config.averageRuns);
+        
+        // Determine measurement method based on GPU type:
+        // - Integrated GPUs: Use GPU timestamps (accurate, no ReBAR issue since they share system RAM)
+        // - Discrete GPUs: Use round-trip method (needed to defeat ReBAR measurement artifacts)
+        bool isIntegrated = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
+        bool useRoundTrip = !isIntegrated;  // Round-trip for discrete, timestamps for integrated
 
         // Upload (CPU to GPU)
         auto cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -1444,7 +2251,8 @@ void BenchmarkThreadFunc() {
             cpuUpload, gpuDefault,
             g_app.config.bandwidthSize,
             g_app.config.copiesPerBatch,
-            g_app.config.bandwidthBatches);
+            g_app.config.bandwidthBatches,
+            useRoundTrip);  // Round-trip for discrete GPUs (ReBAR fix), timestamps for integrated
         
         if (!resUpload.samples.empty()) {
             allResults.push_back(resUpload);
@@ -1584,107 +2392,198 @@ void BenchmarkThreadFunc() {
             reportDownload = maxDownload;
         }
         
-        DetectInterface(reportUpload, reportDownload);
+        DetectInterface(reportUpload, reportDownload, g_app.config.selectedGPU);
         
-        // Check for possible eGPU
-        bool isIntegrated = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
-        DetectEGPU(reportUpload, reportDownload, isIntegrated);
+        // Check for eGPU - uses hardware detection if available, falls back to bandwidth
+        const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
+        bool isIntegrated = gpu.isIntegrated;
+        DetectEGPU(reportUpload, reportDownload, gpu);
 
         Log("=== Benchmark Complete ===");
-        Log("Detected Interface: " + g_app.detectedInterface);
         
-        if (g_app.possibleEGPU) {
-            Log("[INFO] This appears to be an eGPU connected via " + g_app.eGPUConnectionType);
-        }
-
-        // Log with percentages - indicate if using best or average
-        char uploadBuf[128], downloadBuf[128];
-        const char* modeStr = g_app.config.averageRuns ? "Avg" : "Best";
-        snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU (%s): %.2f GB/s (%.0f%% of %s)",
-            modeStr, reportUpload, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
-        snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU (%s): %.2f GB/s (%.0f%% of %s)",
-            modeStr, reportDownload, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
-        Log(uploadBuf);
-        Log(downloadBuf);
-        
-        // Generate summary comparing measured vs actual PCIe link
-        const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
+        // Generate summary comparing measured vs actual connection
         double measuredMax = std::max(reportUpload, reportDownload);
         
-        if (gpu.pcieInfoValid) {
-            g_app.actualPCIeConfig = FormatPCIeConfig(gpu.pcieGenCurrent, gpu.pcieLanesCurrent);
-            g_app.actualPCIeBandwidth = CalculatePCIeBandwidth(gpu.pcieGenCurrent, gpu.pcieLanesCurrent);
+        if (isIntegrated) {
+            // Integrated GPU - show UMA/shared memory info instead of PCIe
+            Log("Memory Path: " + g_app.detectedInterface);
+            Log("Fabric: " + g_app.integratedFabricType);
+            Log("Memory Type: " + g_app.integratedMemoryType);
+            Log("PCIe: Not Applicable (on-die GPU)");
             
-            Log("=== Actual PCIe Link ===");
-            char pcieBuf[128];
-            snprintf(pcieBuf, sizeof(pcieBuf), "Connected as: %s (theoretical max: %.2f GB/s)",
-                g_app.actualPCIeConfig.c_str(), g_app.actualPCIeBandwidth);
-            Log(pcieBuf);
-            
-            if (gpu.pcieGenMax > 0 && gpu.pcieLanesMax > 0) {
-                std::string maxConfig = FormatPCIeConfig(gpu.pcieGenMax, gpu.pcieLanesMax);
-                double maxBandwidth = CalculatePCIeBandwidth(gpu.pcieGenMax, gpu.pcieLanesMax);
-                snprintf(pcieBuf, sizeof(pcieBuf), "GPU capable of: %s (theoretical max: %.2f GB/s)",
-                    maxConfig.c_str(), maxBandwidth);
-                Log(pcieBuf);
+            if (g_app.possibleEGPU) {
+                Log("[INFO] This appears to be an eGPU connected via " + g_app.eGPUConnectionType);
             }
+
+            // Log with percentages vs DDR bandwidth
+            char uploadBuf[128], downloadBuf[128];
+            const char* modeStr = g_app.config.averageRuns ? "Avg" : "Best";
+            snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU (%s): %.2f GB/s (%.0f%% of %s)",
+                modeStr, reportUpload, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
+            snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU (%s): %.2f GB/s (%.0f%% of %s)",
+                modeStr, reportDownload, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+            Log(uploadBuf);
+            Log(downloadBuf);
             
-            // Generate explanation
-            double efficiency = (measuredMax / g_app.actualPCIeBandwidth) * 100.0;
+            // Generate explanation for integrated GPU
+            std::ostringstream oss;
+            oss << "INTEGRATED GPU (UMA Architecture)\n\n"
+                << "This is an APU/integrated GPU that shares system memory with the CPU. "
+                << "There are no PCIe lanes between the CPU and GPU cores - they communicate "
+                << "through the on-die fabric (" << g_app.integratedFabricType << ").\n\n"
+                << "Memory bandwidth is determined by:\n"
+                << "- System RAM speed (" << g_app.integratedMemoryType << ")\n"
+                << "- Memory controller configuration (channels, ranks)\n"
+                << "- Fabric/interconnect bandwidth\n"
+                << "- Contention with CPU memory access\n\n"
+                << "The asymmetry between upload (" << std::fixed << std::setprecision(1) << reportUpload 
+                << " GB/s) and download (" << reportDownload << " GB/s) is normal and reflects "
+                << "differences in how the GPU reads vs writes to different memory heap types.";
+            g_app.summaryExplanation = oss.str();
             
-            if (measuredMax > g_app.actualPCIeBandwidth * 1.1) {
-                // Measured faster than PCIe link should allow
-                if (gpu.isIntegrated) {
-                    g_app.summaryExplanation = "FASTER THAN PCIe LINK: This is expected for an integrated GPU. "
-                        "The GPU shares the CPU's memory controller and doesn't use a PCIe slot, "
-                        "so transfers bypass PCIe entirely.";
-                } else {
-                    g_app.summaryExplanation = "FASTER THAN PCIe LINK: Measured bandwidth exceeds the detected "
-                        "PCIe link capacity. This could indicate the GPU uses a different bus (e.g., "
-                        "on-die connection) or there may be PCIe detection limitations.";
-                }
-            } else if (measuredMax < g_app.actualPCIeBandwidth * 0.7) {
-                // Significantly slower than expected
-                std::ostringstream oss;
-                oss << "SLOWER THAN EXPECTED: Measured " << std::fixed << std::setprecision(0) 
-                    << efficiency << "% of theoretical maximum. Possible causes:\n"
-                    << "- PCIe slot may be sharing lanes with other devices (M.2 slots, USB controllers)\n"
-                    << "- BIOS settings may limit PCIe lanes\n"
-                    << "- Chipset limitations on this motherboard slot\n"
-                    << "- CPU PCIe lane limitations\n"
-                    << "- Thermal throttling or power limits";
-                g_app.summaryExplanation = oss.str();
-            } else if (measuredMax < g_app.actualPCIeBandwidth * 0.85) {
-                // Somewhat slower
-                std::ostringstream oss;
-                oss << "GOOD - " << std::fixed << std::setprecision(0) << efficiency 
-                    << "% of theoretical max. Some overhead is normal due to:\n"
-                    << "- Protocol overhead (headers, acknowledgements)\n"
-                    << "- Memory subsystem limitations\n"
-                    << "- Driver overhead";
-                g_app.summaryExplanation = oss.str();
-            } else {
-                // Very good - close to theoretical max
-                std::ostringstream oss;
-                oss << "EXCELLENT - " << std::fixed << std::setprecision(0) << efficiency 
-                    << "% of theoretical max! Your PCIe link is performing optimally.";
-                g_app.summaryExplanation = oss.str();
-            }
-            
-            // Check if running below max capability
-            if (gpu.pcieGenCurrent < gpu.pcieGenMax || gpu.pcieLanesCurrent < gpu.pcieLanesMax) {
-                std::ostringstream oss;
-                oss << g_app.summaryExplanation << "\n\nNOTE: GPU is running below its maximum capability. "
-                    << "Current: " << FormatPCIeConfig(gpu.pcieGenCurrent, gpu.pcieLanesCurrent)
-                    << ", Max: " << FormatPCIeConfig(gpu.pcieGenMax, gpu.pcieLanesMax) << ". "
-                    << "Check BIOS settings and slot placement.";
-                g_app.summaryExplanation = oss.str();
-            }
-        } else {
-            g_app.actualPCIeConfig = "Not detected";
+            // PCIe info is not meaningful for iGPUs
+            g_app.actualPCIeConfig = "N/A (Integrated)";
             g_app.actualPCIeBandwidth = 0;
-            g_app.summaryExplanation = "Could not query actual PCIe link configuration. "
-                "This may happen with some GPU drivers or on older systems.";
+            
+        } else {
+            // Discrete GPU - show PCIe interface info
+            // Show detected interface - for eGPUs, show the connection type
+            if (g_app.possibleEGPU) {
+                // Show detection method: hardware (device tree) vs bandwidth measurement
+                if (gpu.isThunderbolt || gpu.isUSB4 || gpu.isUSB) {
+                    Log("Connection: " + g_app.eGPUConnectionType + " (confirmed via device tree)");
+                } else {
+                    Log("Connection: " + g_app.eGPUConnectionType + " (detected via bandwidth)");
+                }
+                Log("eGPU Status: External GPU detected");
+            } else {
+                Log("Detected Interface: " + g_app.detectedInterface);
+            }
+
+            // Log with percentages - indicate if using best or average
+            char uploadBuf[128], downloadBuf[128];
+            const char* modeStr = g_app.config.averageRuns ? "Avg" : "Best";
+            snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU (%s): %.2f GB/s (%.0f%% of %s)",
+                modeStr, reportUpload, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
+            snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU (%s): %.2f GB/s (%.0f%% of %s)",
+                modeStr, reportDownload, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+            Log(uploadBuf);
+            Log(downloadBuf);
+            
+            if (gpu.pcieInfoValid) {
+                g_app.actualPCIeConfig = FormatPCIeConfig(gpu.pcieGenCurrent, gpu.pcieLanesCurrent);
+                double theoreticalBw = CalculatePCIeBandwidth(gpu.pcieGenCurrent, gpu.pcieLanesCurrent);
+                double realisticBw = CalculateRealisticPCIeBandwidth(gpu.pcieGenCurrent, gpu.pcieLanesCurrent);
+                g_app.actualPCIeBandwidth = realisticBw;  // Store realistic for comparisons
+                
+                if (g_app.possibleEGPU) {
+                    // For eGPUs, the PCIe link is between GPU and enclosure, not to host
+                    Log("=== PCIe Link (GPU to Enclosure) ===");
+                } else {
+                    Log("=== Actual PCIe Link ===");
+                }
+                char pcieBuf[256];
+                snprintf(pcieBuf, sizeof(pcieBuf), "Connected as: %s (achievable: %.2f GB/s, theoretical: %.2f GB/s)",
+                    g_app.actualPCIeConfig.c_str(), realisticBw, theoreticalBw);
+                Log(pcieBuf);
+                
+                if (gpu.pcieGenMax > 0 && gpu.pcieLanesMax > 0) {
+                    std::string maxConfig = FormatPCIeConfig(gpu.pcieGenMax, gpu.pcieLanesMax);
+                    double maxTheoretical = CalculatePCIeBandwidth(gpu.pcieGenMax, gpu.pcieLanesMax);
+                    double maxRealistic = CalculateRealisticPCIeBandwidth(gpu.pcieGenMax, gpu.pcieLanesMax);
+                    snprintf(pcieBuf, sizeof(pcieBuf), "GPU capable of: %s (achievable: %.2f GB/s, theoretical: %.2f GB/s)",
+                        maxConfig.c_str(), maxRealistic, maxTheoretical);
+                    Log(pcieBuf);
+                }
+                
+                // Generate explanation based on whether this is an eGPU
+                if (g_app.possibleEGPU) {
+                    // eGPU - bandwidth is limited by the external connection
+                    std::ostringstream oss;
+                    oss << "EXTERNAL GPU (" << g_app.eGPUConnectionType << ")\n\n"
+                        << "This GPU is connected externally. The bandwidth is limited by the "
+                        << g_app.eGPUConnectionType << " connection, not the GPU's PCIe capability.\n\n";
+                    
+                    if (gpu.thunderboltVersion == 4 || gpu.isUSB4) {
+                        if (gpu.isThunderbolt) {
+                            oss << "Thunderbolt 4 / USB4 provides:\n";
+                        } else {
+                            oss << "USB4 (PCIe Tunneling) provides:\n";
+                        }
+                        oss << "- 40 Gbps total bandwidth (~5 GB/s usable per direction)\n"
+                            << "- Approximately PCIe 3.0 x4 equivalent\n"
+                            << "- ~3.5 GB/s practical throughput per direction is normal\n\n";
+                    } else if (gpu.thunderboltVersion == 3) {
+                        oss << "Thunderbolt 3 provides:\n"
+                            << "- 40 Gbps total bandwidth (shared with other devices)\n"
+                            << "- Variable PCIe lane allocation\n"
+                            << "- Bandwidth depends on enclosure and host controller\n\n";
+                    } else if (gpu.isUSB) {
+                        // Generic USB connection (unusual for GPUs)
+                        oss << "USB Connection detected:\n"
+                            << "- This is an unusual configuration for external GPUs\n"
+                            << "- USB 3.2 Gen 2x2 provides up to 20 Gbps (~2.5 GB/s)\n"
+                            << "- USB 3.1 Gen 2 provides up to 10 Gbps (~1.2 GB/s)\n"
+                            << "- Performance may be limited compared to TB/USB4\n\n";
+                    }
+                    
+                    oss << "Your measured bandwidth (" << std::fixed << std::setprecision(2) 
+                        << measuredMax << " GB/s) is typical for this connection type.";
+                    g_app.summaryExplanation = oss.str();
+                } else {
+                    // Internal GPU - compare against REALISTIC bandwidth
+                    double efficiency = (measuredMax / realisticBw) * 100.0;
+                    
+                    if (measuredMax > realisticBw * 1.1) {
+                        // Measured faster than realistic PCIe bandwidth
+                        g_app.summaryExplanation = "FASTER THAN EXPECTED: Measured bandwidth exceeds typical "
+                            "achievable PCIe bandwidth. This could indicate excellent driver optimization, "
+                            "or the GPU uses a different bus (e.g., on-die connection).";
+                    } else if (measuredMax < realisticBw * 0.7) {
+                        // Significantly slower than expected
+                        std::ostringstream oss;
+                        oss << "SLOWER THAN EXPECTED: Measured " << std::fixed << std::setprecision(0) 
+                            << efficiency << "% of achievable bandwidth. Possible causes:\n"
+                            << "- PCIe slot may be sharing lanes with other devices (M.2 slots, USB controllers)\n"
+                            << "- BIOS settings may limit PCIe lanes\n"
+                            << "- Chipset limitations on this motherboard slot\n"
+                            << "- CPU PCIe lane limitations\n"
+                            << "- Thermal throttling or power limits";
+                        g_app.summaryExplanation = oss.str();
+                    } else if (measuredMax < realisticBw * 0.90) {
+                        // Somewhat slower
+                        std::ostringstream oss;
+                        oss << "GOOD - " << std::fixed << std::setprecision(0) << efficiency 
+                            << "% of achievable bandwidth. Minor overhead from:\n"
+                            << "- Memory subsystem limitations\n"
+                            << "- Driver/OS overhead\n"
+                            << "- System load variations";
+                        g_app.summaryExplanation = oss.str();
+                    } else {
+                        // Very good - close to achievable max
+                        std::ostringstream oss;
+                        oss << "EXCELLENT - " << std::fixed << std::setprecision(0) << efficiency 
+                            << "% of achievable bandwidth! Your PCIe link is performing optimally.";
+                        g_app.summaryExplanation = oss.str();
+                    }
+                }
+                
+                // Check if running below max capability (only relevant for internal GPUs)
+                if (!g_app.possibleEGPU && 
+                    (gpu.pcieGenCurrent < gpu.pcieGenMax || gpu.pcieLanesCurrent < gpu.pcieLanesMax)) {
+                    std::ostringstream oss;
+                    oss << g_app.summaryExplanation << "\n\nNOTE: GPU is running below its maximum capability. "
+                        << "Current: " << FormatPCIeConfig(gpu.pcieGenCurrent, gpu.pcieLanesCurrent)
+                        << ", Max: " << FormatPCIeConfig(gpu.pcieGenMax, gpu.pcieLanesMax) << ". "
+                        << "Check BIOS settings and slot placement.";
+                    g_app.summaryExplanation = oss.str();
+                }
+            } else {
+                g_app.actualPCIeConfig = "Not detected";
+                g_app.actualPCIeBandwidth = 0;
+                g_app.summaryExplanation = "Could not query actual PCIe link configuration. "
+                    "This may happen with some GPU drivers or on older systems.";
+            }
         }
         
         // Show summary window
@@ -1832,7 +2731,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v2.6 GUI");
+    ImGui::Text("GPU-PCIe-Test v2.7 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -2839,7 +3738,7 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v2.6 GUI Edition");
+        ImGui::Text("GPU-PCIe-Test v2.7 GUI Edition");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
@@ -3061,7 +3960,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.6 GUI",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.7 GUI",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,
