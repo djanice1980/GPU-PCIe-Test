@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v2.7 - GUI Edition
+// GPU-PCIe-Test v2.8 - GUI Edition
 // Dear ImGui + D3D12 Frontend
 // ============================================================================
 // This is a graphical frontend for the GPU/PCIe benchmark tool.
@@ -12,6 +12,7 @@
 // - eGPU auto-detection (Thunderbolt/USB4/USB via device tree)
 // - Integrated GPU (APU) proper detection - no fake PCIe reporting
 // - Actual PCIe link detection via SetupAPI
+// - Improved upload measurement: uses measured download speed for accuracy
 // ============================================================================
 
 // Uncomment to enable debug logging for external GPU detection
@@ -1594,9 +1595,13 @@ bool ShouldAbortBenchmark() {
 //   - Uploads data, then downloads from SAME buffer to create data dependency
 //   - Forces actual bus transfer to complete before measurement ends
 //   - Required for accurate CPU->GPU measurement on discrete GPUs with ReBAR
-//   - Slightly slower due to round-trip overhead, but accurate
+//   - Uses measured download speed to calculate true upload speed
 //
-BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, size_t size, int copies, int batches, bool useCpuTiming = false) {
+// measuredDownloadGB: If > 0 and useCpuTiming is true, uses this to calculate true upload:
+//   upload_time = round_trip_time - (size / measured_download_speed)
+//   upload_speed = size / upload_time
+//
+BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, size_t size, int copies, int batches, bool useCpuTiming = false, double measuredDownloadGB = 0.0) {
     g_app.currentTest = name;
     BenchmarkResult result;
     result.testName = name;
@@ -1699,15 +1704,44 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
 
                 double totalSeconds = std::chrono::duration<double>(endTime - startTime).count();
                 if (totalSeconds > 0) {
-                    // Total round-trip = upload + download
-                    // We measured download separately at ~3.5 GB/s
-                    // Upload time = total time - download time
-                    // But for simplicity, we report: upload = total_bytes / total_time / 2
-                    // This assumes roughly symmetric bandwidth (true for TB4)
-                    double totalBytes = static_cast<double>(size) * copies * 2;  // up + down
-                    double roundtripBw = (totalBytes / (1024.0 * 1024.0 * 1024.0)) / totalSeconds;
-                    // Report just the upload portion (half of round-trip)
-                    double uploadBw = roundtripBw / 2.0;
+                    double sizeGB = static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0);
+                    
+                    double uploadBw;
+                    bool usedImprovedMethod = false;
+                    
+                    if (measuredDownloadGB > 0.0) {
+                        // Improved method: use measured download speed to derive true upload
+                        // round_trip_time = upload_time + download_time
+                        // upload_time = round_trip_time - download_time
+                        // download_time = size / measured_download_speed
+                        double downloadTime = sizeGB / measuredDownloadGB;
+                        double uploadTime = totalSeconds - downloadTime;
+                        
+                        // Sanity check: uploadTime must be positive and reasonable
+                        // If uploadTime is too small, the result will be impossibly high
+                        // In that case, fall back to symmetric assumption
+                        if (uploadTime > (totalSeconds * 0.1)) {  // Upload should be at least 10% of total time
+                            double calculatedUpload = sizeGB / uploadTime;
+                            
+                            // Additional sanity check: result shouldn't exceed 2x download speed
+                            // (for most real-world scenarios, upload <= download)
+                            // Allow up to 3x to account for measurement variance
+                            if (calculatedUpload <= measuredDownloadGB * 3.0) {
+                                uploadBw = calculatedUpload;
+                                usedImprovedMethod = true;
+                            }
+                        }
+                    }
+                    
+                    if (!usedImprovedMethod) {
+                        // Fallback: assume symmetric bandwidth (divide by 2)
+                        // This is appropriate for bandwidth-limited links like Thunderbolt/USB4
+                        // where upload and download are naturally symmetric
+                        double totalBytes = static_cast<double>(size) * copies * 2;  // up + down
+                        double roundtripBw = (totalBytes / (1024.0 * 1024.0 * 1024.0)) / totalSeconds;
+                        uploadBw = roundtripBw / 2.0;
+                    }
+                    
                     bandwidths.push_back(uploadBw);
                 } else {
                     failedBatches++;
@@ -2226,49 +2260,13 @@ void BenchmarkThreadFunc() {
         // - Discrete GPUs: Use round-trip method (needed to defeat ReBAR measurement artifacts)
         bool isIntegrated = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
         bool useRoundTrip = !isIntegrated;  // Round-trip for discrete, timestamps for integrated
-
-        // Upload (CPU to GPU)
-        auto cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_GENERIC_READ);
-        if (!cpuUpload) {
-            Log("[CRITICAL] Failed to allocate upload buffer - aborting run");
-            runHadCriticalFailure = true;
-        }
         
-        auto gpuDefault = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!gpuDefault) {
-            Log("[CRITICAL] Failed to allocate GPU default buffer - aborting run");
-            runHadCriticalFailure = true;
-        }
+        // ============================================================
+        // DOWNLOAD TEST FIRST (GPU to CPU)
+        // We need this measurement to accurately calculate upload speed
+        // ============================================================
+        double currentDownloadSpeed = 0.0;
         
-        if (runHadCriticalFailure) {
-            // Skip the entire run if we can't allocate critical buffers
-            g_app.completedTests += testsPerRun;  // Mark tests as "completed" (skipped)
-            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-            continue;
-        }
-        
-        auto resUpload = RunBandwidthTest("CPU->GPU " + FormatSize(g_app.config.bandwidthSize) + runSuffix,
-            cpuUpload, gpuDefault,
-            g_app.config.bandwidthSize,
-            g_app.config.copiesPerBatch,
-            g_app.config.bandwidthBatches,
-            useRoundTrip);  // Round-trip for discrete GPUs (ReBAR fix), timestamps for integrated
-        
-        if (!resUpload.samples.empty()) {
-            allResults.push_back(resUpload);
-            avgUpload += resUpload.avgValue;
-            maxUpload = std::max(maxUpload, resUpload.maxValue);  // Track best run
-            uploadCount++;
-            Log("  CPU->GPU: " + std::to_string(resUpload.avgValue).substr(0, 5) + " GB/s");
-        } else {
-            Log("[WARNING] Upload test produced no valid samples");
-        }
-        
-        g_app.completedTests++;
-        g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-        if (ShouldAbortBenchmark()) break;
-
-        // Download (GPU to CPU)
         auto gpuSrc = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COPY_SOURCE);
         auto cpuReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COPY_DEST);
         
@@ -2286,8 +2284,9 @@ void BenchmarkThreadFunc() {
             if (!resDownload.samples.empty()) {
                 allResults.push_back(resDownload);
                 avgDownload += resDownload.avgValue;
-                maxDownload = std::max(maxDownload, resDownload.maxValue);  // Track best run
+                maxDownload = std::max(maxDownload, resDownload.maxValue);
                 downloadCount++;
+                currentDownloadSpeed = resDownload.avgValue;  // Store for upload calculation
                 Log("  GPU->CPU: " + std::to_string(resDownload.avgValue).substr(0, 5) + " GB/s");
             } else {
                 Log("[WARNING] Download test produced no valid samples");
@@ -2297,6 +2296,51 @@ void BenchmarkThreadFunc() {
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
         }
         
+        if (ShouldAbortBenchmark()) break;
+        
+        // ============================================================
+        // UPLOAD TEST (CPU to GPU)
+        // Uses measured download speed for accurate calculation
+        // ============================================================
+        auto cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!cpuUpload) {
+            Log("[CRITICAL] Failed to allocate upload buffer - aborting run");
+            runHadCriticalFailure = true;
+        }
+        
+        auto gpuDefault = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!gpuDefault) {
+            Log("[CRITICAL] Failed to allocate GPU default buffer - aborting run");
+            runHadCriticalFailure = true;
+        }
+        
+        if (runHadCriticalFailure) {
+            // Skip the rest of this run if we can't allocate critical buffers
+            g_app.completedTests += (testsPerRun - 1);  // Already counted download
+            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
+            continue;
+        }
+        
+        auto resUpload = RunBandwidthTest("CPU->GPU " + FormatSize(g_app.config.bandwidthSize) + runSuffix,
+            cpuUpload, gpuDefault,
+            g_app.config.bandwidthSize,
+            g_app.config.copiesPerBatch,
+            g_app.config.bandwidthBatches,
+            useRoundTrip,           // Round-trip for discrete GPUs (ReBAR fix), timestamps for integrated
+            currentDownloadSpeed);  // Pass measured download speed for accurate upload calculation
+        
+        if (!resUpload.samples.empty()) {
+            allResults.push_back(resUpload);
+            avgUpload += resUpload.avgValue;
+            maxUpload = std::max(maxUpload, resUpload.maxValue);
+            uploadCount++;
+            Log("  CPU->GPU: " + std::to_string(resUpload.avgValue).substr(0, 5) + " GB/s");
+        } else {
+            Log("[WARNING] Upload test produced no valid samples");
+        }
+        
+        g_app.completedTests++;
+        g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
         if (ShouldAbortBenchmark()) break;
 
         // Bidirectional
@@ -2457,7 +2501,7 @@ void BenchmarkThreadFunc() {
                 }
                 Log("eGPU Status: External GPU detected");
             } else {
-                Log("Detected Interface: " + g_app.detectedInterface);
+                Log("Speed Comparable To: " + g_app.detectedInterface);
             }
 
             // Log with percentages - indicate if using best or average
@@ -2631,7 +2675,7 @@ void ExportCSV(const std::string& filename) {
     }
 
     // Add interface detection info
-    file << "\nDetected Interface," << g_app.detectedInterface << "\n";
+    file << "\nSpeed Comparable To," << g_app.detectedInterface << "\n";
     file << "CPU->GPU," << g_app.uploadBW << " GB/s," << g_app.uploadPercentage << "% of " << g_app.closestUploadStandard << "\n";
     file << "GPU->CPU," << g_app.downloadBW << " GB/s," << g_app.downloadPercentage << "% of " << g_app.closestDownloadStandard << "\n";
     
@@ -2731,7 +2775,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v2.7 GUI");
+    ImGui::Text("GPU-PCIe-Test v2.8 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -3721,7 +3765,7 @@ void RenderGUI() {
         
         if (!g_app.detectedInterface.empty() && g_app.detectedInterface != "Unknown") {
             ImGui::Spacing();
-            ImGui::Text("Detected Interface:");
+            ImGui::Text("Speed Comparable To:");
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.5f, 1.0f), "%s", g_app.detectedInterface.c_str());
         }
@@ -3738,7 +3782,7 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v2.7 GUI Edition");
+        ImGui::Text("GPU-PCIe-Test v2.8 GUI Edition");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
@@ -3960,7 +4004,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.7 GUI",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.8 GUI",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,
