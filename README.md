@@ -1,151 +1,146 @@
-# GPU-PCIe-Test v2.0
+# GPU-PCIe-Test
 
-A comprehensive GPU bandwidth and latency benchmarking tool for measuring PCIe, Thunderbolt, and other interconnect performance. Supports both Direct3D 12 and Vulkan APIs.
+A Windows tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Measures real-world data transfer speeds between CPU and GPU memory.
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg)
+![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![DirectX](https://img.shields.io/badge/DirectX-12-green.svg)
 
 ## Features
 
-### New in v2.0
-- **Multi-run Averaging**: Runs each test 3 times by default, reports averaged results with standard deviation for more reliable measurements
-- **Bidirectional Bandwidth Test**: Measures simultaneous upload/download throughput for real-world workload simulation (ML inference, video streaming)
-- **GPU/PCIe Detection**: Reports detected GPU name, vendor, VRAM, driver version, and identifies integrated vs discrete GPUs
-- **Improved Code Structure**: constexpr constants, comprehensive comments explaining Vulkan memory flags and D3D12 heap types
+### Bandwidth Testing
+- **Upload Speed** - CPU to GPU transfer rates
+- **Download Speed** - GPU to CPU transfer rates  
+- **Bidirectional** - Simultaneous upload/download
+- **Latency** - Round-trip timing measurements
 
-### Core Features
-- Direct3D 12 and Vulkan API support
-- CPU-to-GPU and GPU-to-CPU bandwidth tests (256 MB default)
-- Command submission latency test
-- Small transfer latency tests (1 byte)
-- Automatic PCIe/Thunderbolt interface detection
-- CSV logging with timestamps
-- Configurable test parameters
+### VRAM Integrity Scanning
+- **Multi-chunk testing** - Tests up to 80-90% of VRAM by cycling through multiple allocations
+- **8 test patterns** - Zeros, ones, checkerboard, inverse checkerboard, address, random, marching ones, marching zeros
+- **Error clustering** - Groups nearby faults for easier diagnosis
+- **Progress tracking** - Real-time progress with cancellation support
+
+### Hardware Detection
+- **PCIe generation & lanes** - Detects PCIe 3.0/4.0/5.0 and x1-x16 configurations
+- **Thunderbolt/USB4** - Identifies external GPU connections
+- **OCuLink** - Detects OCuLink eGPU setups
+- **Integrated GPU detection** - Identifies iGPUs and shows system RAM bandwidth comparison
+- **System RAM info** - Displays DDR4/DDR5/LPDDR5 speed, channels, and theoretical bandwidth
+
+### Results & Export
+- **Min/Avg/Max graphs** - Visual bandwidth comparison
+- **Ranked comparison** - Compare results against PCIe/TB/USB4 standards
+- **CSV export** - Export benchmark data for analysis
+- **Clipboard copy** - Quick copy of VRAM scan results
+
+## Screenshots
+
+*Coming soon*
+
+## Requirements
+
+- Windows 10/11 (64-bit)
+- DirectX 12 compatible GPU
+- Visual Studio 2019+ (for building)
 
 ## Building
 
-### Prerequisites
-- Visual Studio 2019 or later with C++ Desktop workload
-- Vulkan SDK (optional, for Vulkan support) - https://vulkan.lunarg.com/
+### Quick Build (Recommended)
 
-### Build Steps
+1. Clone the repository:
+   ```cmd
+   git clone https://github.com/djanice1980/GPU-PCIe-Test.git
+   cd GPU-PCIe-Test
+   ```
 
-1. Open **Developer Command Prompt for VS 2019/2022**
-2. Navigate to the source directory
-3. Run `build.bat`
+2. Run the build script:
+   ```cmd
+   build_gui.bat
+   ```
+   
+   The script automatically downloads ImGui and ImPlot dependencies.
+
+3. Run the executable:
+   ```cmd
+   GPU-PCIe-Test.exe
+   ```
+
+### Manual Build
+
+If you prefer manual compilation:
 
 ```cmd
-cd C:\path\to\GPU-PCIe-Test
-build.bat
+cl /EHsc /O2 /DUNICODE /D_UNICODE main_gui.cpp imgui*.cpp implot*.cpp ^
+   /link d3d12.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib ^
+   /out:GPU-PCIe-Test.exe
 ```
-
-Output: `GPU-PCIe-Test.exe`
 
 ## Usage
 
-```cmd
-GPU-PCIe-Test.exe
-```
+### Bandwidth Benchmark
 
-### Menu Options
-1. **API Selection**: Choose D3D12, Vulkan, or both
-2. **Configuration** (press 'C'):
-   - Buffer sizes for bandwidth and latency tests
-   - Iteration counts
-   - Number of runs (1-10 for multi-run averaging)
-   - Enable/disable bidirectional test
-   - Enable/disable detailed GPU info
-   - Toggle logging of individual runs vs averages only
+1. Select your GPU from the dropdown
+2. Adjust test parameters (buffer size, iterations) if desired
+3. Click **Run Benchmark**
+4. View results in the graph and log panels
 
-### Configuration Menu
-```
-  1. Bandwidth buffer size: 256 MB
-  2. Latency buffer size:   1 B
-  3. Command iterations:    100000
-  4. Transfer iterations:   10000
-  5. Copies per batch:      8
-  6. Bandwidth batches:     32
-  7. Number of runs:        3 (multi-run averaging)
-  8. Log all runs:          No (averages only)
-  9. Bidirectional test:    Enabled
-  A. Detailed GPU info:     Enabled
-  C. Continuous mode:       Disabled
-  H. Show reference chart
-  0. Start benchmark
-```
+### VRAM Scan
 
-## Test Descriptions
+1. Select a discrete GPU (not available for integrated GPUs)
+2. Optionally enable **Full Scan (~90%)** for more thorough testing
+3. Click **VRAM Scan**
+4. Wait for completion - test covers multiple memory regions
 
-| Test | Description | Unit |
-|------|-------------|------|
-| CPU-to-GPU Bandwidth | Large buffer upload throughput | GB/s |
-| GPU-to-CPU Bandwidth | Large buffer download throughput | GB/s |
-| Bidirectional | Simultaneous upload + download | GB/s (combined) |
-| Command Latency | Empty command submission overhead | us |
-| CPU-to-GPU Latency | Small transfer round-trip time | us |
-| GPU-to-CPU Latency | Small transfer round-trip time | us |
+**Note:** VRAM scanning is a basic integrity test using D3D12. For chip-level diagnosis, use vendor tools like NVIDIA MATS or AMD memory diagnostics.
 
-## Output
+## How It Works
 
-### Console
-- Per-run results (Min, Avg, Max, P99, P99.9)
-- Aggregated results with standard deviation
-- Interface detection (PCIe generation and lane width)
+### Bandwidth Testing
+Uses D3D12 copy operations between upload heaps (CPU-visible) and default heaps (GPU-local) with fence synchronization for accurate timing.
 
-### CSV File
-Results are saved to `gpu_benchmark_results.csv`:
-```
-Timestamp,API,Test Name,Run,Min,Avg,Max,P99,P99.9,StdDev,Unit
-2026-01-25 12:00:00,D3D12,CPU->GPU 256 MB Bandwidth,AVG,45.2,48.5,52.1,51.8,52.0,1.2,GB/s
-```
+### VRAM Scanning
+1. Allocates 512MB test buffers (upload, GPU, readback)
+2. For each chunk (up to 25+ chunks for 80% coverage):
+   - Writes test pattern to upload buffer
+   - Copies to GPU buffer
+   - Copies back to readback buffer
+   - Compares against expected pattern
+   - Releases and reallocates to potentially hit different physical VRAM
+3. Reports errors by pattern type and memory region
 
-## Interface Detection
+### Interface Detection
+Queries PCIe link status registers via DXGI and applies heuristics for:
+- Thunderbolt (x4 links with specific bandwidth signatures)
+- USB4 (similar to TB but different enumeration patterns)
+- OCuLink (x4/x8 with PCIe-level bandwidth)
 
-The tool automatically identifies your connection type:
+## Limitations
 
-| Interface | Typical Bandwidth |
-|-----------|------------------|
-| PCIe 3.0 x16 | 12-15 GB/s |
-| PCIe 4.0 x16 | 25-30 GB/s |
-| PCIe 5.0 x16 | 50-60 GB/s |
-| Thunderbolt 3/4 | 2.0-2.5 GB/s |
-| Thunderbolt 5 | 5-6 GB/s |
+- **D3D12 abstraction** - Cannot directly address physical VRAM; relies on driver allocation patterns
+- **No stress testing** - Tests static memory, not thermal/power stress conditions
+- **Windows only** - Uses DirectX 12 and Windows-specific APIs
+- **No multi-GPU** - Tests one GPU at a time
 
-**Note**: Integrated GPUs (APUs) may show >100% efficiency because memory transfers don't traverse a real PCIe bus.
+## Version History
 
-## Interpreting Results
+See [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
 
-### Bandwidth
-- **60-95% of theoretical**: Normal, expected overhead
-- **>95%**: Exceptional efficiency
-- **<60%**: Possible bottleneck or throttling
+## Contributing
 
-### Latency
-- **D3D12 command latency**: ~1-2 us typical
-- **Vulkan command latency**: ~15-25 us typical (more driver overhead)
-- **Transfer latency**: ~15-50 us typical
-
-### Standard Deviation
-- Low StdDev (<5% of avg): Consistent results
-- High StdDev (>10% of avg): System noise, consider closing background apps
-
-## Troubleshooting
-
-### "No DirectX 12 capable GPU found"
-- Ensure you have a DirectX 12 compatible GPU
-- Update your graphics drivers
-
-### "No Vulkan-capable GPU found"
-- Install the Vulkan Runtime from your GPU vendor
-- Install Vulkan SDK for development
-
-### Inconsistent Results
-- Close background applications
-- Disable power saving modes
-- Increase number of runs (option 7)
-- Let the system warm up before testing
+Contributions welcome! Please feel free to submit issues and pull requests.
 
 ## License
 
-MIT License - See LICENSE file
+MIT License - see [LICENSE](LICENSE) for details.
 
 ## Author
 
-djanice1980 - https://github.com/djanice1980/GPU-PCIe-Test
+**David Janice**  
+Email: djanice1980@gmail.com  
+GitHub: [@djanice1980](https://github.com/djanice1980)
+
+## Acknowledgments
+
+- [Dear ImGui](https://github.com/ocornut/imgui) - Immediate mode GUI
+- [ImPlot](https://github.com/epezent/implot) - Plotting library for ImGui
+- Microsoft DirectX 12 documentation

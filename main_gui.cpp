@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v2.8 - GUI Edition
+// GPU-PCIe-Test v3.0 - GUI Edition
 // Dear ImGui + D3D12 Frontend
 // ============================================================================
 // This is a graphical frontend for the GPU/PCIe benchmark tool.
@@ -9,10 +9,13 @@
 // - Results graphs and charts with standard comparisons
 // - CSV export
 // - VRAM-aware buffer sizing
+// - VRAM integrity scanning (multiple test patterns, error clustering)
 // - eGPU auto-detection (Thunderbolt/USB4/USB via device tree)
 // - Integrated GPU (APU) proper detection - no fake PCIe reporting
 // - Actual PCIe link detection via SetupAPI
 // - Improved upload measurement: uses measured download speed for accuracy
+// - System RAM detection via WMI (speed, channels, type)
+// - Full Unicode support (UTF-8 internal)
 // ============================================================================
 
 // Uncomment to enable debug logging for external GPU detection
@@ -23,6 +26,8 @@
 #define NOMINMAX
 #endif
 
+#define _WIN32_DCOM  // Required for CoInitializeEx
+
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
@@ -32,6 +37,8 @@
 #include <cfgmgr32.h>
 #include <initguid.h>
 #include <devpropdef.h>
+#include <comdef.h>
+#include <wbemidl.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -46,11 +53,16 @@
 #include <iomanip>
 #include <cmath>
 #include <map>
+#include <set>
+#include <random>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
 
 // ImGui headers (must be in imgui/ subfolder)
 #include "imgui/imgui.h"
@@ -122,6 +134,54 @@ struct GPUInfo {
     
     // Store adapter for reliable selection (handles hot-plug scenarios)
     ComPtr<IDXGIAdapter1> adapter;
+};
+
+// System RAM information (detected via WMI)
+struct SystemMemoryInfo {
+    uint32_t speedMT = 0;              // Speed in MT/s (e.g., 6400)
+    uint32_t configuredSpeedMT = 0;    // Configured/actual speed in MT/s
+    uint32_t channels = 0;             // Number of channels (1, 2, 4, etc.)
+    uint32_t totalSticks = 0;          // Number of physical DIMMs
+    uint64_t totalCapacityGB = 0;      // Total capacity in GB
+    std::string type;                  // "DDR4", "DDR5", "LPDDR5", etc.
+    std::string formFactor;            // "DIMM", "SODIMM", etc.
+    double theoreticalBandwidth = 0;   // Calculated theoretical bandwidth in GB/s
+    bool detected = false;             // True if WMI query succeeded
+    std::string errorMessage;          // Error message if detection failed
+};
+
+// VRAM test pattern types
+enum class VRAMTestPattern {
+    AllZeros,           // 0x00000000
+    AllOnes,            // 0xFFFFFFFF
+    Checkerboard,       // 0xAAAAAAAA
+    InverseCheckerboard,// 0x55555555
+    Random,             // Random data
+    MarchingOnes,       // Walking 1 pattern
+    MarchingZeros,      // Walking 0 pattern
+    AddressPattern      // Address-based pattern for location detection
+};
+
+// VRAM error information
+struct VRAMError {
+    size_t offsetStart = 0;     // Start offset of error region
+    size_t offsetEnd = 0;       // End offset of error region
+    uint32_t expected = 0;      // Expected value
+    uint32_t actual = 0;        // Actual value read back
+    VRAMTestPattern pattern;    // Which pattern detected the error
+    size_t errorCount = 0;      // Number of errors in this region
+};
+
+// VRAM test results
+struct VRAMTestResult {
+    bool completed = false;
+    bool cancelled = false;
+    size_t totalBytesTested = 0;
+    size_t totalErrors = 0;
+    std::vector<VRAMError> errors;
+    std::vector<std::string> patternResults;  // Results per pattern
+    double testDurationSeconds = 0;
+    std::string summary;
 };
 
 // PCIe generation speed in GT/s (gigatransfers per second)
@@ -327,6 +387,19 @@ struct AppContext {
     double      actualPCIeBandwidth = 0;   // Theoretical max based on detected link
     std::string actualPCIeConfig;          // e.g., "PCIe 4.0 x16"
     std::string summaryExplanation;        // Explanation of measured vs actual
+    
+    // System memory info (detected via WMI)
+    SystemMemoryInfo systemMemory;
+    
+    // VRAM test state
+    std::atomic<bool> vramTestRunning{ false };
+    std::atomic<bool> vramTestCancelRequested{ false };
+    std::thread vramTestThread;
+    VRAMTestResult vramTestResult;
+    std::atomic<float> vramTestProgress{ 0.0f };
+    std::string vramTestCurrentPattern;
+    bool showVRAMTestWindow = false;
+    bool vramTestFullScan = false;  // If true, test ~90% of VRAM instead of 80%
 };
 
 static AppContext g_app;
@@ -347,6 +420,295 @@ void ClearLog() {
 }
 
 // ============================================================================
+// UNICODE HELPER FUNCTIONS (Full UTF-8 Support)
+// ============================================================================
+
+// Convert wide string (Windows native) to UTF-8 string
+std::string WideToUtf8(const std::wstring& wide) {
+    if (wide.empty()) return std::string();
+    int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), 
+                                    nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return std::string();
+    std::string utf8(size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), static_cast<int>(wide.size()), 
+                        &utf8[0], size, nullptr, nullptr);
+    return utf8;
+}
+
+// Convert UTF-8 string to wide string (Windows native)
+std::wstring Utf8ToWide(const std::string& utf8) {
+    if (utf8.empty()) return std::wstring();
+    int size = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), 
+                                   nullptr, 0);
+    if (size <= 0) return std::wstring();
+    std::wstring wide(size, 0);
+    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), 
+                        &wide[0], size);
+    return wide;
+}
+
+// Convert BSTR (COM) to UTF-8 string
+std::string BstrToUtf8(BSTR bstr) {
+    if (!bstr) return std::string();
+    int len = SysStringLen(bstr);
+    if (len == 0) return std::string();
+    return WideToUtf8(std::wstring(bstr, len));
+}
+
+// ============================================================================
+// SYSTEM MEMORY DETECTION (WMI)
+// ============================================================================
+
+// DDR type mapping from SMBIOSMemoryType
+std::string GetDDRTypeFromSMBIOS(uint16_t memoryType) {
+    switch (memoryType) {
+        case 20: return "DDR";
+        case 21: return "DDR2";
+        case 22: return "DDR2 FB-DIMM";
+        case 24: return "DDR3";
+        case 26: return "DDR4";
+        case 27: return "LPDDR";
+        case 28: return "LPDDR2";
+        case 29: return "LPDDR3";
+        case 30: return "LPDDR4";
+        case 34: return "DDR5";
+        case 35: return "LPDDR5";
+        default: return "Unknown";
+    }
+}
+
+// Form factor mapping
+std::string GetFormFactorName(uint16_t formFactor) {
+    switch (formFactor) {
+        case 8:  return "DIMM";
+        case 12: return "SODIMM";
+        case 13: return "SRIMM";
+        case 14: return "FB-DIMM";
+        default: return "Unknown";
+    }
+}
+
+// Detect system memory configuration via WMI
+SystemMemoryInfo DetectSystemMemory() {
+    SystemMemoryInfo info;
+    
+    HRESULT hr = CoInitializeEx(0, COINIT_MULTITHREADED);
+    // Track if WE initialized COM (S_OK or S_FALSE means we added a reference)
+    // RPC_E_CHANGED_MODE means COM was already init'd with different mode - we didn't init
+    bool weInitializedCom = (hr == S_OK || hr == S_FALSE);
+    bool comAvailable = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+    
+    if (!comAvailable) {
+        info.errorMessage = "Failed to initialize COM";
+        return info;
+    }
+    
+    // Set security levels
+    hr = CoInitializeSecurity(
+        nullptr, -1, nullptr, nullptr,
+        RPC_C_AUTHN_LEVEL_DEFAULT,
+        RPC_C_IMP_LEVEL_IMPERSONATE,
+        nullptr, EOAC_NONE, nullptr
+    );
+    // Ignore security errors if already initialized
+    
+    IWbemLocator* pLoc = nullptr;
+    hr = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER,
+                          IID_IWbemLocator, reinterpret_cast<void**>(&pLoc));
+    if (FAILED(hr)) {
+        info.errorMessage = "Failed to create WbemLocator";
+        if (weInitializedCom) CoUninitialize();
+        return info;
+    }
+    
+    IWbemServices* pSvc = nullptr;
+    hr = pLoc->ConnectServer(
+        _bstr_t(L"ROOT\\CIMV2"), nullptr, nullptr, 0, 0, 0, 0, &pSvc
+    );
+    if (FAILED(hr)) {
+        info.errorMessage = "Failed to connect to WMI";
+        pLoc->Release();
+        if (weInitializedCom) CoUninitialize();
+        return info;
+    }
+    
+    // Set proxy security
+    hr = CoSetProxyBlanket(
+        pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, nullptr,
+        RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, nullptr, EOAC_NONE
+    );
+    
+    // Query physical memory
+    IEnumWbemClassObject* pEnumerator = nullptr;
+    hr = pSvc->ExecQuery(
+        _bstr_t(L"WQL"),
+        _bstr_t(L"SELECT * FROM Win32_PhysicalMemory"),
+        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+        nullptr, &pEnumerator
+    );
+    
+    if (FAILED(hr)) {
+        info.errorMessage = "WMI query failed";
+        pSvc->Release();
+        pLoc->Release();
+        if (weInitializedCom) CoUninitialize();
+        return info;
+    }
+    
+    // Process results
+    IWbemClassObject* pclsObj = nullptr;
+    ULONG uReturn = 0;
+    uint32_t maxSpeed = 0;
+    uint32_t maxConfiguredSpeed = 0;
+    uint64_t totalCapacity = 0;
+    std::string detectedType;
+    std::string detectedFormFactor;
+    uint16_t detectedMemoryType = 0;  // SMBIOS memory type for DDR generation detection
+    int stickCount = 0;
+    std::set<std::string> uniqueBanks;  // To count channels
+    
+    while (pEnumerator) {
+        hr = pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn);
+        if (uReturn == 0) break;
+        
+        VARIANT vtProp;
+        
+        // Get speed (rated)
+        hr = pclsObj->Get(L"Speed", 0, &vtProp, 0, 0);
+        if (SUCCEEDED(hr) && vtProp.vt == VT_I4) {
+            if (static_cast<uint32_t>(vtProp.lVal) > maxSpeed) {
+                maxSpeed = static_cast<uint32_t>(vtProp.lVal);
+            }
+        }
+        VariantClear(&vtProp);
+        
+        // Get configured clock speed (actual running speed)
+        hr = pclsObj->Get(L"ConfiguredClockSpeed", 0, &vtProp, 0, 0);
+        if (SUCCEEDED(hr) && vtProp.vt == VT_I4) {
+            if (static_cast<uint32_t>(vtProp.lVal) > maxConfiguredSpeed) {
+                maxConfiguredSpeed = static_cast<uint32_t>(vtProp.lVal);
+            }
+        }
+        VariantClear(&vtProp);
+        
+        // Get capacity
+        hr = pclsObj->Get(L"Capacity", 0, &vtProp, 0, 0);
+        if (SUCCEEDED(hr) && vtProp.vt == VT_BSTR) {
+            totalCapacity += _wtoi64(vtProp.bstrVal);
+        }
+        VariantClear(&vtProp);
+        
+        // Get memory type (SMBIOSMemoryType)
+        hr = pclsObj->Get(L"SMBIOSMemoryType", 0, &vtProp, 0, 0);
+        if (SUCCEEDED(hr) && vtProp.vt == VT_I4) {
+            detectedMemoryType = static_cast<uint16_t>(vtProp.lVal);
+            detectedType = GetDDRTypeFromSMBIOS(detectedMemoryType);
+        }
+        VariantClear(&vtProp);
+        
+        // Get form factor
+        hr = pclsObj->Get(L"FormFactor", 0, &vtProp, 0, 0);
+        if (SUCCEEDED(hr) && vtProp.vt == VT_I4) {
+            detectedFormFactor = GetFormFactorName(static_cast<uint16_t>(vtProp.lVal));
+        }
+        VariantClear(&vtProp);
+        
+        // Get bank label (for channel counting)
+        hr = pclsObj->Get(L"BankLabel", 0, &vtProp, 0, 0);
+        if (SUCCEEDED(hr) && vtProp.vt == VT_BSTR) {
+            uniqueBanks.insert(BstrToUtf8(vtProp.bstrVal));
+        }
+        VariantClear(&vtProp);
+        
+        stickCount++;
+        pclsObj->Release();
+    }
+    
+    pEnumerator->Release();
+    pSvc->Release();
+    pLoc->Release();
+    if (weInitializedCom) CoUninitialize();
+    
+    // Fill in the info
+    // DDR5 and LPDDR5 (SMBIOS types 34 and 35) report speed directly in MT/s
+    // DDR4 and earlier report speed in MHz, which needs to be doubled for MT/s
+    bool isDDR5orLater = (detectedMemoryType == 34 || detectedMemoryType == 35);
+    
+    if (isDDR5orLater) {
+        // DDR5/LPDDR5: WMI already reports MT/s
+        info.speedMT = maxSpeed;
+        info.configuredSpeedMT = maxConfiguredSpeed;
+    } else {
+        // DDR4 and earlier: WMI reports MHz, double for MT/s
+        info.speedMT = maxSpeed * 2;
+        info.configuredSpeedMT = maxConfiguredSpeed * 2;
+    }
+    
+    info.totalSticks = stickCount;
+    info.totalCapacityGB = totalCapacity / (1024 * 1024 * 1024);
+    info.type = detectedType;
+    info.formFactor = detectedFormFactor;
+    
+    // Estimate channels from unique bank labels or stick count
+    // This is approximate - some systems report banks differently
+    if (uniqueBanks.size() >= 4) {
+        info.channels = 4;  // Quad channel
+    } else if (uniqueBanks.size() >= 2 || stickCount >= 2) {
+        info.channels = 2;  // Dual channel (typical)
+    } else {
+        info.channels = 1;  // Single channel
+    }
+    
+    // Calculate theoretical bandwidth
+    // DDR bandwidth = speed (MT/s) * 8 bytes * channels / 1000 = GB/s
+    if (info.configuredSpeedMT > 0) {
+        info.theoreticalBandwidth = (info.configuredSpeedMT * 8.0 * info.channels) / 1000.0;
+    } else if (info.speedMT > 0) {
+        info.theoreticalBandwidth = (info.speedMT * 8.0 * info.channels) / 1000.0;
+    }
+    
+    info.detected = (stickCount > 0);
+    return info;
+}
+
+// Format system memory info as a string for logging
+std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
+    if (!mem.detected) {
+        return "System Memory: Detection failed (" + mem.errorMessage + ")";
+    }
+    
+    std::ostringstream oss;
+    oss << "System Memory: ";
+    oss << mem.totalCapacityGB << "GB " << mem.type;
+    
+    if (mem.configuredSpeedMT > 0) {
+        oss << " @ " << mem.configuredSpeedMT << " MT/s";
+        if (mem.speedMT > 0 && mem.speedMT != mem.configuredSpeedMT) {
+            oss << " (rated " << mem.speedMT << " MT/s)";
+        }
+    } else if (mem.speedMT > 0) {
+        oss << " @ " << mem.speedMT << " MT/s";
+    }
+    
+    oss << ", " << mem.totalSticks << " stick" << (mem.totalSticks != 1 ? "s" : "");
+    
+    if (mem.channels > 0) {
+        oss << ", ";
+        if (mem.channels == 1) oss << "single";
+        else if (mem.channels == 2) oss << "dual";
+        else if (mem.channels == 4) oss << "quad";
+        else oss << mem.channels;
+        oss << "-channel";
+    }
+    
+    if (mem.theoreticalBandwidth > 0) {
+        oss << " (~" << std::fixed << std::setprecision(1) << mem.theoreticalBandwidth << " GB/s theoretical)";
+    }
+    
+    return oss.str();
+}
+
+// ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 std::string GetVendorName(uint32_t vendorId) {
@@ -360,10 +722,30 @@ std::string GetVendorName(uint32_t vendorId) {
 }
 
 std::string FormatSize(size_t bytes) {
-    if (bytes >= 1024ull * 1024 * 1024) return std::to_string(bytes / (1024 * 1024 * 1024)) + " GB";
-    if (bytes >= 1024 * 1024)           return std::to_string(bytes / (1024 * 1024)) + " MB";
-    if (bytes >= 1024)                  return std::to_string(bytes / 1024) + " KB";
-    return std::to_string(bytes) + " B";
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(0);
+    
+    if (bytes >= 1024ULL * 1024 * 1024) {
+        double gb = bytes / (1024.0 * 1024.0 * 1024.0);
+        if (gb >= 10.0) {
+            oss << static_cast<int>(gb) << " GB";
+        } else {
+            oss << std::setprecision(1) << gb << " GB";
+        }
+    } else if (bytes >= 1024ULL * 1024) {
+        double mb = bytes / (1024.0 * 1024.0);
+        if (mb >= 10.0) {
+            oss << static_cast<int>(mb) << " MB";
+        } else {
+            oss << std::setprecision(1) << mb << " MB";
+        }
+    } else if (bytes >= 1024) {
+        oss << (bytes / 1024) << " KB";
+    } else {
+        oss << bytes << " B";
+    }
+    
+    return oss.str();
 }
 
 std::string FormatMemory(size_t bytes) {
@@ -460,14 +842,32 @@ void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo&
     g_app.integratedMemoryType = memoryType;
     g_app.integratedFabricType = fabricType;
     
-    // For percentage display, compare against typical DDR bandwidth instead of PCIe
-    // DDR5 dual-channel realistic: ~70 GB/s
-    // DDR4 dual-channel realistic: ~40 GB/s
-    double expectedBandwidth = (memoryType.find("DDR5") != std::string::npos) ? 70.0 : 40.0;
+    // For percentage display, compare against actual system memory bandwidth if detected
+    // Otherwise fall back to typical DDR bandwidth estimates
+    double expectedBandwidth;
+    std::string bandwidthSource;
     
-    g_app.closestUploadStandard = memoryType + " (typical)";
+    if (g_app.systemMemory.detected && g_app.systemMemory.theoreticalBandwidth > 0) {
+        // Use detected RAM bandwidth with ~80% efficiency factor
+        expectedBandwidth = g_app.systemMemory.theoreticalBandwidth * 0.80;
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s @ %u MT/s (%.0f GB/s)", 
+                g_app.systemMemory.type.c_str(),
+                g_app.systemMemory.configuredSpeedMT > 0 ? 
+                    g_app.systemMemory.configuredSpeedMT : g_app.systemMemory.speedMT,
+                expectedBandwidth);
+        bandwidthSource = buf;
+    } else {
+        // Fall back to estimates
+        // DDR5 dual-channel realistic: ~70 GB/s
+        // DDR4 dual-channel realistic: ~40 GB/s
+        expectedBandwidth = (memoryType.find("DDR5") != std::string::npos) ? 70.0 : 40.0;
+        bandwidthSource = memoryType + " (estimated)";
+    }
+    
+    g_app.closestUploadStandard = bandwidthSource;
     g_app.uploadPercentage = (upload / expectedBandwidth) * 100.0;
-    g_app.closestDownloadStandard = memoryType + " (typical)";
+    g_app.closestDownloadStandard = bandwidthSource;
     g_app.downloadPercentage = (download / expectedBandwidth) * 100.0;
 }
 
@@ -649,9 +1049,7 @@ bool DetectPCIeLink(uint32_t vendorId, uint32_t deviceId, GPUInfo& outInfo) {
                 deviceInfoSet, &deviceInfoData,
                 SPDRP_LOCATION_INFORMATION, nullptr,
                 (PBYTE)locationPath, sizeof(locationPath), nullptr)) {
-            char pathBuffer[256];
-            WideCharToMultiByte(CP_UTF8, 0, locationPath, -1, pathBuffer, 256, nullptr, nullptr);
-            outInfo.pcieLocationPath = pathBuffer;
+            outInfo.pcieLocationPath = WideToUtf8(locationPath);
         }
         
         // Check if we got valid PCIe info
@@ -962,9 +1360,7 @@ void DetectExternalConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPUInf
         
         #ifdef DEBUG_EXTERNAL_DETECTION
         // Log the device path for debugging
-        char pathBuf[512];
-        WideCharToMultiByte(CP_UTF8, 0, parentInstanceId, -1, pathBuf, 512, nullptr, nullptr);
-        Log("[DEBUG] Depth " + std::to_string(depth) + ": " + std::string(pathBuf));
+        Log("[DEBUG] Depth " + std::to_string(depth) + ": " + WideToUtf8(parentInstanceId));
         #endif
         
         // ====== Check for Thunderbolt/USB4 in device path ======
@@ -1086,9 +1482,7 @@ void DetectExternalConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPUInf
                     std::transform(descUpper.begin(), descUpper.end(), descUpper.begin(), ::towupper);
                     
                     #ifdef DEBUG_EXTERNAL_DETECTION
-                    char descBuf[256];
-                    WideCharToMultiByte(CP_UTF8, 0, deviceDesc, -1, descBuf, 256, nullptr, nullptr);
-                    Log("[DEBUG]   Description: " + std::string(descBuf));
+                    Log("[DEBUG]   Description: " + WideToUtf8(deviceDesc));
                     #endif
                     
                     // Check for Thunderbolt (Intel certified)
@@ -1240,9 +1634,7 @@ void EnumerateGPUs() {
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
 
         GPUInfo info;
-        char nameBuffer[256];
-        WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, nameBuffer, 256, nullptr, nullptr);
-        info.name = nameBuffer;
+        info.name = WideToUtf8(desc.Description);
         info.vendorId = desc.VendorId;
         info.deviceId = desc.DeviceId;
         info.vendor = GetVendorName(desc.VendorId);
@@ -1492,6 +1884,7 @@ void CleanupBenchmarkDevice() {
     g_app.benchAllocator.Reset();
     g_app.benchQueue.Reset();
     g_app.benchDevice.Reset();
+    g_app.benchFenceValue = 1;  // Reset fence value for next initialization
 }
 
 // ============================================================================
@@ -1526,13 +1919,13 @@ ComPtr<ID3D12Resource> CreateBuffer(D3D12_HEAP_TYPE heapType, size_t size, D3D12
 
 // Enhanced fence wait with retry logic and global timeout checking
 FenceWaitResult WaitForBenchFenceEx() {
-    // Check for cancellation first
-    if (g_app.cancelRequested) {
+    // Check for cancellation first (both benchmark and VRAM test)
+    if (g_app.cancelRequested || g_app.vramTestCancelRequested) {
         return FenceWaitResult::Cancelled;
     }
     
-    // Check global timeout
-    if (IsGlobalTimeoutExceeded()) {
+    // Check global timeout (only if not in VRAM test mode, which has its own timing)
+    if (!g_app.vramTestRunning && IsGlobalTimeoutExceeded()) {
         Log("[ERROR] Global benchmark timeout exceeded (5 minutes)");
         return FenceWaitResult::Timeout;
     }
@@ -1849,6 +2242,10 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
         Log("[WARNING] No valid samples collected for " + name);
     }
 
+    // Explicit resource cleanup (ComPtr auto-releases, but this ensures immediate cleanup
+    // and prevents accumulation during multiple runs)
+    // Note: src and dst are passed in from caller, don't reset those
+    
     return result;
 }
 
@@ -1961,6 +2358,10 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
         Log("[WARNING] No valid latency samples collected for " + name);
     }
 
+    // Explicit resource cleanup
+    queryHeap.Reset();
+    readbackBuffer.Reset();
+
     return result;
 }
 
@@ -2060,10 +2461,22 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
         Log("[WARNING] No valid command latency samples collected");
     }
 
+    // Explicit resource cleanup
+    queryHeap.Reset();
+    readbackBuffer.Reset();
+
     return result;
 }
 
 BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
+    // TODO: Future enhancement - add GPU timestamps to measure individual direction
+    // performance during simultaneous transfers. This would show:
+    // - Upload speed under download contention
+    // - Download speed under upload contention
+    // - True overlap behavior in PCIe full-duplex mode
+    // Current implementation measures total throughput via CPU wall-clock timing,
+    // which is accurate for aggregate bandwidth but doesn't show per-direction details.
+    
     g_app.currentTest = "Bidirectional " + FormatSize(size);
     BenchmarkResult result;
     result.testName = g_app.currentTest;
@@ -2147,6 +2560,12 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
         Log("[WARNING] No valid bidirectional samples collected");
     }
 
+    // Explicit resource cleanup
+    cpuUpload.Reset();
+    gpuDefault.Reset();
+    gpuSrc.Reset();
+    cpuReadback.Reset();
+
     return result;
 }
 
@@ -2192,6 +2611,537 @@ std::vector<BenchmarkResult> AggregateResults(const std::vector<BenchmarkResult>
     return aggregated;
 }
 
+// ============================================================================
+// VRAM SCANNING / TESTING
+// ============================================================================
+// This provides a vendor-agnostic way to detect VRAM errors using D3D12.
+// It's NOT a replacement for vendor tools like NVIDIA MATS, but can help
+// identify obvious VRAM issues before RMA or troubleshooting.
+
+// Get pattern name for logging
+std::string GetPatternName(VRAMTestPattern pattern) {
+    switch (pattern) {
+        case VRAMTestPattern::AllZeros:            return "All Zeros (0x00)";
+        case VRAMTestPattern::AllOnes:             return "All Ones (0xFF)";
+        case VRAMTestPattern::Checkerboard:        return "Checkerboard (0xAA)";
+        case VRAMTestPattern::InverseCheckerboard: return "Inv. Checkerboard (0x55)";
+        case VRAMTestPattern::Random:              return "Random Data";
+        case VRAMTestPattern::MarchingOnes:        return "Marching Ones";
+        case VRAMTestPattern::MarchingZeros:       return "Marching Zeros";
+        case VRAMTestPattern::AddressPattern:      return "Address Pattern";
+        default:                                   return "Unknown";
+    }
+}
+
+// Generate test pattern data
+void GenerateTestPattern(VRAMTestPattern pattern, uint32_t* data, size_t count, int iteration = 0) {
+    switch (pattern) {
+        case VRAMTestPattern::AllZeros:
+            std::fill(data, data + count, 0x00000000);
+            break;
+            
+        case VRAMTestPattern::AllOnes:
+            std::fill(data, data + count, 0xFFFFFFFF);
+            break;
+            
+        case VRAMTestPattern::Checkerboard:
+            std::fill(data, data + count, 0xAAAAAAAA);
+            break;
+            
+        case VRAMTestPattern::InverseCheckerboard:
+            std::fill(data, data + count, 0x55555555);
+            break;
+            
+        case VRAMTestPattern::Random: {
+            // Use a fixed seed for reproducibility - the pattern just needs to be
+            // pseudo-random, not cryptographically random. Using iteration allows
+            // multiple passes to use different patterns.
+            // IMPORTANT: Must be exactly reproducible between write and verify!
+            const uint32_t RANDOM_BASE_SEED = 0xDEADBEEF;
+            std::mt19937 rng(RANDOM_BASE_SEED + static_cast<uint32_t>(iteration));
+            std::uniform_int_distribution<uint32_t> dist;
+            for (size_t i = 0; i < count; ++i) {
+                data[i] = dist(rng);
+            }
+            break;
+        }
+        
+        case VRAMTestPattern::MarchingOnes: {
+            // Walking 1 bit pattern - iteration determines which bit is set
+            uint32_t pattern_val = 1u << (iteration % 32);
+            std::fill(data, data + count, pattern_val);
+            break;
+        }
+        
+        case VRAMTestPattern::MarchingZeros: {
+            // Walking 0 bit pattern - all 1s except one bit
+            uint32_t pattern_val = ~(1u << (iteration % 32));
+            std::fill(data, data + count, pattern_val);
+            break;
+        }
+        
+        case VRAMTestPattern::AddressPattern:
+            // Each dword contains its offset - helps locate physical errors
+            for (size_t i = 0; i < count; ++i) {
+                data[i] = static_cast<uint32_t>(i);
+            }
+            break;
+    }
+}
+
+// Compare buffers and find errors
+void CompareBuffers(const uint32_t* expected, const uint32_t* actual, size_t count,
+                   VRAMTestPattern pattern, std::vector<VRAMError>& errors,
+                   size_t baseOffset, size_t& totalErrorCount) {
+    
+    const size_t CLUSTER_THRESHOLD = 256;  // Merge errors within this range
+    VRAMError currentCluster;
+    bool inCluster = false;
+    
+    for (size_t i = 0; i < count; ++i) {
+        if (expected[i] != actual[i]) {
+            totalErrorCount++;
+            size_t byteOffset = baseOffset + (i * sizeof(uint32_t));
+            
+            if (!inCluster) {
+                // Start new cluster
+                currentCluster = {};
+                currentCluster.offsetStart = byteOffset;
+                currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+                currentCluster.expected = expected[i];
+                currentCluster.actual = actual[i];
+                currentCluster.pattern = pattern;
+                currentCluster.errorCount = 1;
+                inCluster = true;
+            } else if (byteOffset - currentCluster.offsetEnd <= CLUSTER_THRESHOLD * sizeof(uint32_t)) {
+                // Extend current cluster
+                currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+                currentCluster.errorCount++;
+            } else {
+                // Close current cluster and start new one
+                errors.push_back(currentCluster);
+                currentCluster = {};
+                currentCluster.offsetStart = byteOffset;
+                currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+                currentCluster.expected = expected[i];
+                currentCluster.actual = actual[i];
+                currentCluster.pattern = pattern;
+                currentCluster.errorCount = 1;
+            }
+        }
+    }
+    
+    // Close final cluster if any
+    if (inCluster) {
+        errors.push_back(currentCluster);
+    }
+}
+
+// Format error address as hex string
+std::string FormatErrorAddress(size_t offset) {
+    std::ostringstream oss;
+    oss << "0x" << std::hex << std::uppercase << std::setfill('0') << std::setw(8) << offset;
+    return oss.str();
+}
+
+// Run a single pattern test on a VRAM region
+bool RunVRAMPatternTest(VRAMTestPattern pattern, size_t regionSize, size_t regionOffset,
+                        ComPtr<ID3D12Resource> uploadBuffer, ComPtr<ID3D12Resource> gpuBuffer,
+                        ComPtr<ID3D12Resource> readbackBuffer, std::vector<VRAMError>& errors,
+                        size_t& totalErrors, int iteration = 0) {
+    
+    if (g_app.vramTestCancelRequested) return false;
+    
+    // Ensure region size is aligned to 4 bytes (dword)
+    regionSize = regionSize & ~3ULL;  // Round down to multiple of 4
+    if (regionSize == 0) return true;  // Nothing to test
+    
+    size_t dwordCount = regionSize / sizeof(uint32_t);
+    
+    // Map upload buffer and write pattern
+    void* mappedData = nullptr;
+    D3D12_RANGE readRange = { 0, 0 };  // We're writing, not reading
+    if (FAILED(uploadBuffer->Map(0, &readRange, &mappedData))) {
+        Log("[ERROR] Failed to map upload buffer for VRAM test");
+        return false;
+    }
+    
+    // Check cancellation before long operation
+    if (g_app.vramTestCancelRequested) {
+        uploadBuffer->Unmap(0, nullptr);
+        return false;
+    }
+    
+    uint32_t* uploadData = static_cast<uint32_t*>(mappedData);
+    GenerateTestPattern(pattern, uploadData, dwordCount, iteration);
+    
+    D3D12_RANGE writeRange = { 0, regionSize };
+    uploadBuffer->Unmap(0, &writeRange);
+    
+    // Copy pattern to GPU
+    g_app.benchAllocator->Reset();
+    g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+    g_app.benchList->CopyResource(gpuBuffer.Get(), uploadBuffer.Get());
+    g_app.benchList->Close();
+    
+    ID3D12CommandList* lists[] = { g_app.benchList.Get() };
+    g_app.benchQueue->ExecuteCommandLists(1, lists);
+    
+    FenceWaitResult result = WaitForBenchFenceEx();
+    if (result != FenceWaitResult::Success) {
+        Log("[ERROR] GPU fence wait failed during VRAM write");
+        return false;
+    }
+    
+    if (g_app.vramTestCancelRequested) return false;
+    
+    // Transition and copy back
+    g_app.benchAllocator->Reset();
+    g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+    
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = gpuBuffer.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_app.benchList->ResourceBarrier(1, &barrier);
+    
+    g_app.benchList->CopyResource(readbackBuffer.Get(), gpuBuffer.Get());
+    
+    // Transition back for next write
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g_app.benchList->ResourceBarrier(1, &barrier);
+    
+    g_app.benchList->Close();
+    g_app.benchQueue->ExecuteCommandLists(1, lists);
+    
+    result = WaitForBenchFenceEx();
+    if (result != FenceWaitResult::Success) {
+        Log("[ERROR] GPU fence wait failed during VRAM read");
+        return false;
+    }
+    
+    // Map readback buffer and compare
+    D3D12_RANGE readbackRange = { 0, regionSize };
+    void* readbackData = nullptr;
+    if (FAILED(readbackBuffer->Map(0, &readbackRange, &readbackData))) {
+        Log("[ERROR] Failed to map readback buffer for VRAM test");
+        return false;
+    }
+    
+    // Regenerate expected pattern for comparison
+    std::vector<uint32_t> expectedData(dwordCount);
+    GenerateTestPattern(pattern, expectedData.data(), dwordCount, iteration);
+    
+    // Compare
+    const uint32_t* actualData = static_cast<const uint32_t*>(readbackData);
+    CompareBuffers(expectedData.data(), actualData, dwordCount, pattern, errors, regionOffset, totalErrors);
+    
+    readbackBuffer->Unmap(0, nullptr);
+    
+    return true;
+}
+
+// Main VRAM test thread function
+void VRAMTestThreadFunc() {
+    auto startTime = std::chrono::steady_clock::now();
+    
+    Log("=== VRAM Scan Started ===");
+    Log("GPU: " + g_app.gpuList[g_app.config.selectedGPU].name);
+    Log("");
+    Log("DISCLAIMER: This is a basic VRAM integrity test using D3D12.");
+    Log("It can detect obvious errors but is NOT a replacement for");
+    Log("vendor-specific tools like NVIDIA MATS or AMD memory diagnostics.");
+    Log("For chip-level diagnosis, use manufacturer tools.");
+    Log("");
+    
+    g_app.vramTestResult = {};  // Reset results
+    g_app.vramTestProgress = 0.0f;
+    
+    // Reset fence timeout counter for fresh start
+    g_app.fenceTimeoutCount = 0;
+    g_app.benchmarkAborted = false;
+    
+    // Always reinitialize benchmark device for clean state
+    // (previous benchmarks may have left it in inconsistent state)
+    CleanupBenchmarkDevice();
+    if (!InitBenchmarkDevice(g_app.config.selectedGPU)) {
+        Log("[ERROR] Failed to initialize benchmark device for VRAM test");
+        g_app.vramTestResult.completed = false;
+        g_app.vramTestRunning = false;
+        return;
+    }
+    
+    // Calculate test size
+    // Default: 80% of VRAM (safe margin for driver/system use)
+    // Full scan: Try to find maximum allocatable, starting at 90%
+    const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
+    
+    // Calculate target test size based on percentage
+    double targetPercent = g_app.vramTestFullScan ? 0.90 : Constants::VRAM_SAFETY_MARGIN;
+    size_t targetTestSize = static_cast<size_t>(gpu.dedicatedVRAM * targetPercent);
+    
+    if (g_app.vramTestFullScan) {
+        Log("FULL SCAN MODE: Attempting to test up to " + FormatSize(targetTestSize) + " (~90%) of VRAM");
+        Log("[WARNING] Full scan allocates maximum possible VRAM - may cause instability");
+    } else {
+        Log("Testing up to " + FormatSize(targetTestSize) + " (~80%) of VRAM");
+        Log("(Enable 'Full Scan' for more thorough testing)");
+    }
+    Log("");
+    
+    // Explanation for partial VRAM testing
+    Log("NOTE: GPU drivers and OS reserve some VRAM for:");
+    Log("  - Command buffers and page tables");
+    Log("  - Desktop compositor (Windows DWM)");
+    Log("  - D3D12 runtime scratch space");
+    Log("We test as much as can be allocated via D3D12.");
+    Log("");
+    
+    // Define test patterns
+    std::vector<VRAMTestPattern> patterns = {
+        VRAMTestPattern::AllZeros,
+        VRAMTestPattern::AllOnes,
+        VRAMTestPattern::Checkerboard,
+        VRAMTestPattern::InverseCheckerboard,
+        VRAMTestPattern::AddressPattern,
+        VRAMTestPattern::Random
+    };
+    
+    // Marching patterns iterations
+    const int MARCH_ITERATIONS = 4;  // Reduced from 8 for speed in multi-chunk mode
+    
+    // Use manageable chunk sizes - large contiguous allocations often fail
+    // We'll cycle through multiple allocations to cover more physical VRAM
+    const size_t PREFERRED_CHUNK_SIZE = 512 * 1024 * 1024;  // 512 MB
+    const size_t MIN_CHUNK_SIZE = 128 * 1024 * 1024;        // 128 MB minimum
+    
+    // First, find the largest chunk size that works
+    size_t chunkSize = PREFERRED_CHUNK_SIZE;
+    
+    Log("Finding optimal chunk size...");
+    
+    {
+        ComPtr<ID3D12Resource> testUpload, testGpu, testReadback;
+        while (chunkSize >= MIN_CHUNK_SIZE) {
+            if (g_app.vramTestCancelRequested) {
+                g_app.vramTestResult.cancelled = true;
+                g_app.vramTestRunning = false;
+                return;
+            }
+            
+            testUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, chunkSize, D3D12_RESOURCE_STATE_GENERIC_READ);
+            testGpu = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, chunkSize, D3D12_RESOURCE_STATE_COPY_DEST);
+            testReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, chunkSize, D3D12_RESOURCE_STATE_COPY_DEST);
+            
+            if (testUpload && testGpu && testReadback) {
+                Log("Using " + FormatSize(chunkSize) + " chunk size");
+                break;
+            }
+            
+            testUpload.Reset();
+            testGpu.Reset();
+            testReadback.Reset();
+            chunkSize /= 2;
+        }
+        
+        if (chunkSize < MIN_CHUNK_SIZE) {
+            Log("[ERROR] Failed to allocate test buffers even at " + FormatSize(MIN_CHUNK_SIZE));
+            Log("[ERROR] Try closing other applications to free VRAM");
+            g_app.vramTestResult.completed = false;
+            g_app.vramTestRunning = false;
+            return;
+        }
+        // Release test buffers - we'll allocate fresh ones in the loop
+    }
+    
+    // Calculate number of chunks to test
+    size_t numChunks = (targetTestSize + chunkSize - 1) / chunkSize;
+    size_t patternsPerChunk = patterns.size() + 2;  // Basic patterns + marching ones + marching zeros
+    size_t totalSteps = numChunks * patternsPerChunk;
+    size_t completedSteps = 0;
+    
+    double targetPercentDisplay = (static_cast<double>(targetTestSize) / gpu.dedicatedVRAM) * 100.0;
+    char percentBuf[64];
+    snprintf(percentBuf, sizeof(percentBuf), "%.0f%%", targetPercentDisplay);
+    
+    Log("");
+    Log("Will test " + FormatSize(targetTestSize) + " (" + percentBuf + " of VRAM) in " + 
+        std::to_string(numChunks) + " chunks");
+    Log("Each chunk: 6 basic patterns + marching ones + marching zeros");
+    Log("Reallocating between chunks to potentially hit different physical regions");
+    Log("");
+    
+    size_t totalErrors = 0;
+    std::vector<VRAMError> allErrors;
+    bool hadCriticalFailure = false;
+    size_t totalBytesTested = 0;
+    
+    // ========== MULTI-CHUNK TESTING LOOP ==========
+    // Allocate fresh buffers for each chunk to potentially hit different physical VRAM regions
+    for (size_t chunkNum = 0; chunkNum < numChunks && !g_app.vramTestCancelRequested && !hadCriticalFailure; ++chunkNum) {
+        size_t chunkOffset = chunkNum * chunkSize;
+        size_t thisChunkSize = std::min(chunkSize, targetTestSize - chunkOffset);
+        
+        Log("=== Chunk " + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + 
+            " (" + FormatSize(thisChunkSize) + " at logical offset " + FormatSize(chunkOffset) + ") ===");
+        
+        // Allocate fresh buffers for this chunk
+        ComPtr<ID3D12Resource> uploadBuffer = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, thisChunkSize, D3D12_RESOURCE_STATE_GENERIC_READ);
+        ComPtr<ID3D12Resource> gpuBuffer = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, thisChunkSize, D3D12_RESOURCE_STATE_COPY_DEST);
+        ComPtr<ID3D12Resource> readbackBuffer = CreateBuffer(D3D12_HEAP_TYPE_READBACK, thisChunkSize, D3D12_RESOURCE_STATE_COPY_DEST);
+        
+        if (!uploadBuffer || !gpuBuffer || !readbackBuffer) {
+            Log("[WARNING] Failed to allocate buffers for chunk " + std::to_string(chunkNum + 1) + " - stopping");
+            break;
+        }
+        
+        size_t chunkErrors = 0;
+        bool chunkFailed = false;
+        
+        // Run basic patterns on this chunk
+        for (const auto& pattern : patterns) {
+            if (g_app.vramTestCancelRequested || chunkFailed) break;
+            
+            std::string patternName = GetPatternName(pattern);
+            g_app.vramTestCurrentPattern = patternName + " [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+            
+            g_app.fenceTimeoutCount = 0;
+            size_t patternErrors = 0;
+            
+            if (!RunVRAMPatternTest(pattern, thisChunkSize, chunkOffset,
+                                    uploadBuffer, gpuBuffer, readbackBuffer,
+                                    allErrors, patternErrors)) {
+                if (!g_app.vramTestCancelRequested) {
+                    Log("  [WARNING] " + patternName + " failed");
+                    chunkFailed = true;
+                }
+                break;
+            }
+            
+            chunkErrors += patternErrors;
+        }
+        
+        // Run marching ones (condensed - 4 iterations per chunk)
+        if (!g_app.vramTestCancelRequested && !chunkFailed) {
+            g_app.vramTestCurrentPattern = "Marching [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+            g_app.fenceTimeoutCount = 0;
+            
+            for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
+                size_t marchErrors = 0;
+                if (!RunVRAMPatternTest(VRAMTestPattern::MarchingOnes, thisChunkSize, chunkOffset,
+                                  uploadBuffer, gpuBuffer, readbackBuffer,
+                                  allErrors, marchErrors, iter)) {
+                    chunkFailed = true;
+                    break;
+                }
+                chunkErrors += marchErrors;
+            }
+            
+            for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
+                size_t marchErrors = 0;
+                if (!RunVRAMPatternTest(VRAMTestPattern::MarchingZeros, thisChunkSize, chunkOffset,
+                                  uploadBuffer, gpuBuffer, readbackBuffer,
+                                  allErrors, marchErrors, iter)) {
+                    chunkFailed = true;
+                    break;
+                }
+                chunkErrors += marchErrors;
+            }
+        }
+        
+        // Release buffers to free VRAM for next chunk allocation
+        uploadBuffer.Reset();
+        gpuBuffer.Reset();
+        readbackBuffer.Reset();
+        
+        // Record chunk results
+        if (!chunkFailed) {
+            totalBytesTested += thisChunkSize;
+        }
+        totalErrors += chunkErrors;
+        
+        std::string chunkResult = chunkFailed ? "INCOMPLETE" : 
+                                  (chunkErrors == 0) ? "PASS" : "FAIL (" + std::to_string(chunkErrors) + " errors)";
+        Log("  Chunk " + std::to_string(chunkNum + 1) + " result: " + chunkResult);
+        
+        if (chunkFailed && !g_app.vramTestCancelRequested) {
+            hadCriticalFailure = true;
+        }
+        
+        // Update progress
+        completedSteps += patternsPerChunk;
+        g_app.vramTestProgress = static_cast<float>(completedSteps) / static_cast<float>(totalSteps);
+        
+        // Brief pause between chunks to let GPU settle
+        if (chunkNum < numChunks - 1 && !g_app.vramTestCancelRequested) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    
+    // Store pattern results summary
+    double coveragePercent = (static_cast<double>(totalBytesTested) / gpu.dedicatedVRAM) * 100.0;
+    snprintf(percentBuf, sizeof(percentBuf), "%.1f%%", coveragePercent);
+    g_app.vramTestResult.patternResults.push_back(
+        std::to_string(totalBytesTested / (1024*1024)) + " MB tested (" + percentBuf + " coverage)");
+    
+    auto endTime = std::chrono::steady_clock::now();
+    double duration = std::chrono::duration<double>(endTime - startTime).count();
+    
+    // Generate summary
+    g_app.vramTestResult.completed = !g_app.vramTestCancelRequested;
+    g_app.vramTestResult.cancelled = g_app.vramTestCancelRequested;
+    g_app.vramTestResult.totalBytesTested = totalBytesTested;
+    g_app.vramTestResult.totalErrors = totalErrors;
+    g_app.vramTestResult.errors = std::move(allErrors);
+    g_app.vramTestResult.testDurationSeconds = duration;
+    
+    Log("");
+    Log("=== VRAM Scan " + std::string(g_app.vramTestCancelRequested ? "Cancelled" : "Complete") + " ===");
+    snprintf(percentBuf, sizeof(percentBuf), "%.1f%%", coveragePercent);
+    Log("Tested: " + FormatSize(totalBytesTested) + " (" + percentBuf + " of " + FormatSize(gpu.dedicatedVRAM) + ")");
+    
+    char durationBuf[64];
+    snprintf(durationBuf, sizeof(durationBuf), "Duration: %.1f seconds", duration);
+    Log(durationBuf);
+    
+    if (totalErrors == 0) {
+        Log("Result: PASS - No errors detected");
+        g_app.vramTestResult.summary = "PASS - No errors in " + FormatSize(totalBytesTested) + " (" + percentBuf + " coverage)";
+    } else {
+        Log("Result: FAIL - " + std::to_string(totalErrors) + " total errors detected!");
+        g_app.vramTestResult.summary = "FAIL - " + std::to_string(totalErrors) + " errors in " + FormatSize(totalBytesTested);
+        
+        // Log error clusters
+        Log("");
+        Log("Error Regions:");
+        for (const auto& err : g_app.vramTestResult.errors) {
+            if (err.errorCount > 0) {
+                Log("  " + FormatErrorAddress(err.offsetStart) + " - " + 
+                    FormatErrorAddress(err.offsetEnd) + " (" + 
+                    std::to_string(err.errorCount) + " errors, pattern: " + 
+                    GetPatternName(err.pattern) + ")");
+            }
+        }
+        
+        Log("");
+        Log("NOTE: Error addresses are logical offsets in the test buffer,");
+        Log("not physical VRAM addresses. For chip-level diagnosis, use");
+        Log("vendor tools like NVIDIA MATS or AMD memory diagnostics.");
+    }
+    
+    Log("");
+    
+    // Cleanup benchmark device to leave in clean state for next benchmark
+    CleanupBenchmarkDevice();
+    
+    g_app.vramTestRunning = false;
+    g_app.vramTestProgress = 1.0f;
+    g_app.showVRAMTestWindow = true;
+}
+
 void BenchmarkThreadFunc() {
     g_app.benchmarkThreadRunning = true;
     g_app.benchmarkStartTime = std::chrono::steady_clock::now();
@@ -2207,6 +3157,28 @@ void BenchmarkThreadFunc() {
         Log("GPU Type: Integrated (using GPU timestamps for upload measurement)");
     } else {
         Log("GPU Type: Discrete (using round-trip method for accurate upload measurement)");
+    }
+    
+    // Detect and log system memory info (helps diagnose RAM-related bottlenecks)
+    g_app.systemMemory = DetectSystemMemory();
+    if (g_app.systemMemory.detected) {
+        Log(FormatSystemMemoryInfo(g_app.systemMemory));
+        
+        // Warn if RAM speed seems low relative to capability
+        if (g_app.systemMemory.configuredSpeedMT > 0 && 
+            g_app.systemMemory.speedMT > 0 &&
+            g_app.systemMemory.configuredSpeedMT < g_app.systemMemory.speedMT * 0.85) {
+            Log("[WARNING] RAM running at " + std::to_string(g_app.systemMemory.configuredSpeedMT) + 
+                " MT/s (rated for " + std::to_string(g_app.systemMemory.speedMT) + 
+                " MT/s) - XMP/EXPO may not be enabled");
+        }
+        
+        // Warn about single-channel config
+        if (g_app.systemMemory.channels == 1) {
+            Log("[WARNING] Single-channel RAM detected - this may bottleneck PCIe bandwidth");
+        }
+    } else {
+        Log("[INFO] System memory detection: " + g_app.systemMemory.errorMessage);
     }
     
     // Validate and potentially cap bandwidth size based on VRAM
@@ -2679,6 +3651,18 @@ void ExportCSV(const std::string& filename) {
     file << "CPU->GPU," << g_app.uploadBW << " GB/s," << g_app.uploadPercentage << "% of " << g_app.closestUploadStandard << "\n";
     file << "GPU->CPU," << g_app.downloadBW << " GB/s," << g_app.downloadPercentage << "% of " << g_app.closestDownloadStandard << "\n";
     
+    // Add system memory info
+    if (g_app.systemMemory.detected) {
+        file << "\nSystem Memory\n";
+        file << "Type," << g_app.systemMemory.type << "\n";
+        file << "Rated Speed," << g_app.systemMemory.speedMT << " MT/s\n";
+        file << "Actual Speed," << g_app.systemMemory.configuredSpeedMT << " MT/s\n";
+        file << "Channels," << g_app.systemMemory.channels << "\n";
+        file << "DIMMs," << g_app.systemMemory.totalSticks << "\n";
+        file << "Total Capacity," << g_app.systemMemory.totalCapacityGB << " GB\n";
+        file << "Theoretical Bandwidth," << std::fixed << std::setprecision(1) << g_app.systemMemory.theoreticalBandwidth << " GB/s\n";
+    }
+    
     // Add eGPU detection info
     if (g_app.possibleEGPU) {
         file << "\neGPU Detection,Possible eGPU," << g_app.eGPUConnectionType << "\n";
@@ -2775,7 +3759,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v2.8 GUI");
+    ImGui::Text("GPU-PCIe-Test v3.0 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -2839,6 +3823,37 @@ void RenderGUI() {
         } else {
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "  No valid GPU detected!");
             ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "  Check your graphics drivers.");
+        }
+        
+        // System RAM info (useful for diagnosing bottlenecks)
+        if (g_app.systemMemory.detected) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.6f, 0.8f, 0.6f, 1.0f), "System RAM:");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+            
+            // Format: "64GB DDR5 @ 6000 MT/s"
+            char ramBuf[128];
+            if (g_app.systemMemory.configuredSpeedMT > 0) {
+                snprintf(ramBuf, sizeof(ramBuf), "  %lluGB %s @ %u MT/s",
+                        g_app.systemMemory.totalCapacityGB,
+                        g_app.systemMemory.type.c_str(),
+                        g_app.systemMemory.configuredSpeedMT);
+            } else {
+                snprintf(ramBuf, sizeof(ramBuf), "  %lluGB %s",
+                        g_app.systemMemory.totalCapacityGB,
+                        g_app.systemMemory.type.c_str());
+            }
+            ImGui::Text("%s", ramBuf);
+            
+            // Channel config and theoretical bandwidth
+            const char* channelStr = (g_app.systemMemory.channels == 1) ? "single" :
+                                     (g_app.systemMemory.channels == 2) ? "dual" :
+                                     (g_app.systemMemory.channels == 4) ? "quad" : "multi";
+            snprintf(ramBuf, sizeof(ramBuf), "  %s-channel (~%.0f GB/s)",
+                    channelStr, g_app.systemMemory.theoreticalBandwidth * 0.8);  // ~80% efficiency
+            ImGui::Text("%s", ramBuf);
+            
+            ImGui::PopStyleColor();
         }
     }
 
@@ -2942,7 +3957,8 @@ void RenderGUI() {
     ImGui::Spacing();
 
     // Can start when Idle OR when Completed (to run more tests)
-    bool canStart = (g_app.state == AppState::Idle || g_app.state == AppState::Completed) && hasValidGPU;
+    bool canStart = (g_app.state == AppState::Idle || g_app.state == AppState::Completed) && 
+                    hasValidGPU && !g_app.vramTestRunning;
     bool canStop = (g_app.state == AppState::Running);
     bool hasResults = !g_app.results.empty();  // Changed: check if results exist, not state
 
@@ -2981,6 +3997,13 @@ void RenderGUI() {
         }
         
         g_app.benchmarkThread = std::thread(BenchmarkThreadFunc);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (g_app.vramTestRunning) {
+            ImGui::SetTooltip("Wait for VRAM scan to complete first");
+        } else if (!hasValidGPU) {
+            ImGui::SetTooltip("No valid GPU selected");
+        }
     }
     if (!canStart) ImGui::EndDisabled();
 
@@ -3066,6 +4089,96 @@ void RenderGUI() {
         ImGui::SetTooltip("Reset all settings to default values\n(Does not clear chart data)");
     }
     if (canStop) ImGui::EndDisabled();
+    
+    // ========== VRAM Scan Section ==========
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "VRAM Diagnostics");
+    ImGui::Spacing();
+    
+    bool isIntegratedGPU = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
+    bool vramScanDisabled = canStop || g_app.vramTestRunning || isIntegratedGPU;
+    
+    // Explain why VRAM scan isn't available for iGPUs
+    if (isIntegratedGPU) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+        ImGui::TextWrapped("VRAM scan unavailable: Integrated GPUs use system RAM. "
+                          "Test with MemTest86+ or Windows Memory Diagnostic instead.");
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+    
+    // Full Scan checkbox (only when not running and not iGPU)
+    if (!g_app.vramTestRunning && !isIntegratedGPU) {
+        ImGui::Checkbox("Full Scan (~90%)", &g_app.vramTestFullScan);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Test ~90%% of VRAM instead of default ~80%%.\n"
+                             "More thorough but may cause instability.\n"
+                             "Use if standard scan passes but you suspect issues.");
+        }
+        ImGui::Spacing();
+    }
+    
+    if (vramScanDisabled) ImGui::BeginDisabled();
+    if (ImGui::Button("VRAM Scan", ImVec2(-1, 35))) {
+        if (!g_app.vramTestRunning && !g_app.benchmarkThreadRunning) {
+            // Clear any previous results immediately
+            g_app.vramTestResult = {};
+            g_app.vramTestCurrentPattern.clear();
+            
+            g_app.vramTestCancelRequested = false;
+            g_app.vramTestRunning = true;
+            g_app.vramTestProgress = 0.0f;
+            if (g_app.vramTestThread.joinable()) {
+                g_app.vramTestThread.join();
+            }
+            g_app.vramTestThread = std::thread(VRAMTestThreadFunc);
+        }
+    }
+    if (vramScanDisabled) ImGui::EndDisabled();
+    
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        if (g_app.gpuList[g_app.config.selectedGPU].isIntegrated) {
+            ImGui::SetTooltip("VRAM scan not available for integrated GPUs\n(uses shared system memory)");
+        } else if (g_app.vramTestRunning) {
+            ImGui::SetTooltip("VRAM scan in progress...");
+        } else {
+            ImGui::SetTooltip("Scan VRAM for errors using multiple test patterns.\n"
+                             "This can help detect faulty video memory.\n\n"
+                             "NOTE: This is a basic test, not a replacement for\n"
+                             "vendor tools like NVIDIA MATS.");
+        }
+    }
+    
+    // Cancel button for VRAM test
+    if (g_app.vramTestRunning) {
+        if (ImGui::Button("Cancel VRAM Scan", ImVec2(-1, 30))) {
+            g_app.vramTestCancelRequested = true;
+            Log("[INFO] VRAM scan cancellation requested...");
+        }
+        
+        // Show VRAM test progress
+        ImGui::Spacing();
+        ImGui::ProgressBar(g_app.vramTestProgress, ImVec2(-1, 20));
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern: %s", 
+                          g_app.vramTestCurrentPattern.c_str());
+    }
+    
+    // Show VRAM test results button if test completed
+    if (g_app.vramTestResult.completed || g_app.vramTestResult.cancelled) {
+        if (ImGui::Button("View VRAM Results", ImVec2(-1, 30))) {
+            g_app.showVRAMTestWindow = true;
+        }
+        
+        // Quick status indicator
+        if (g_app.vramTestResult.totalErrors == 0) {
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Last scan: PASS");
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Last scan: %zu errors!", 
+                              g_app.vramTestResult.totalErrors);
+        }
+    }
 
     ImGui::End();
 
@@ -3773,6 +4886,148 @@ void RenderGUI() {
         ImGui::End();
     }
 
+    // ========== VRAM Test Results Window ==========
+    if (g_app.showVRAMTestWindow) {
+        ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
+        ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+        ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+        
+        if (ImGui::Begin("VRAM Scan Results", &g_app.showVRAMTestWindow)) {
+            const auto& result = g_app.vramTestResult;
+            
+            // Header with status
+            if (result.cancelled) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "VRAM Scan: CANCELLED");
+            } else if (result.totalErrors == 0) {
+                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "VRAM Scan: PASS");
+            } else {
+                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "VRAM Scan: FAIL");
+            }
+            
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            // Summary stats
+            ImGui::Text("GPU: %s", g_app.gpuList[g_app.config.selectedGPU].name.c_str());
+            ImGui::Text("Tested: %s", FormatSize(result.totalBytesTested).c_str());
+            
+            char durationBuf[64];
+            snprintf(durationBuf, sizeof(durationBuf), "Duration: %.1f seconds", result.testDurationSeconds);
+            ImGui::Text("%s", durationBuf);
+            
+            ImGui::Spacing();
+            
+            if (result.totalErrors > 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), 
+                                  "Total Errors: %zu", result.totalErrors);
+            } else {
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), 
+                                  "Total Errors: 0");
+            }
+            
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            // Pattern results
+            ImGui::Text("Pattern Results:");
+            ImGui::Spacing();
+            
+            for (const auto& patternResult : result.patternResults) {
+                if (patternResult.find("PASS") != std::string::npos) {
+                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "  %s", patternResult.c_str());
+                } else if (patternResult.find("FAIL") != std::string::npos) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "  %s", patternResult.c_str());
+                } else {
+                    ImGui::Text("  %s", patternResult.c_str());
+                }
+            }
+            
+            // Error details if any
+            if (!result.errors.empty()) {
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Error Regions:");
+                ImGui::Spacing();
+                
+                ImGui::BeginChild("ErrorList", ImVec2(0, 150), true, ImGuiWindowFlags_HorizontalScrollbar);
+                for (const auto& err : result.errors) {
+                    char errBuf[256];
+                    snprintf(errBuf, sizeof(errBuf), 
+                            "0x%08zX - 0x%08zX: %zu errors (%s)",
+                            err.offsetStart, err.offsetEnd, err.errorCount,
+                            GetPatternName(err.pattern).c_str());
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", errBuf);
+                }
+                ImGui::EndChild();
+            }
+            
+            // Disclaimer
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
+            ImGui::TextWrapped(
+                "DISCLAIMER: This is a basic VRAM integrity test using D3D12. "
+                "Error addresses shown are logical offsets in the test buffer, "
+                "not physical VRAM addresses. For chip-level diagnosis and precise "
+                "fault location, use vendor-specific tools such as:"
+            );
+            ImGui::Spacing();
+            ImGui::BulletText("NVIDIA: MATS (Manufacturing Acceptance Test Software)");
+            ImGui::BulletText("AMD: Memory diagnostics in driver utilities");
+            ImGui::BulletText("Third-party: OCCT, FurMark (stress testing)");
+            ImGui::PopStyleColor();
+            
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            // Buttons
+            float buttonWidth = 100.0f;
+            float totalWidth = buttonWidth * 2 + ImGui::GetStyle().ItemSpacing.x;
+            ImGui::SetCursorPosX((ImGui::GetWindowWidth() - totalWidth) * 0.5f);
+            
+            if (ImGui::Button("Copy", ImVec2(buttonWidth, 30))) {
+                std::ostringstream ss;
+                ss << "=== VRAM Scan Results ===\n";
+                ss << "GPU: " << g_app.gpuList[g_app.config.selectedGPU].name << "\n";
+                ss << "Tested: " << FormatSize(result.totalBytesTested) << "\n";
+                ss << "Duration: " << std::fixed << std::setprecision(1) << result.testDurationSeconds << " seconds\n";
+                ss << "Total Errors: " << result.totalErrors << "\n\n";
+                ss << "Pattern Results:\n";
+                for (const auto& pr : result.patternResults) {
+                    ss << "  " << pr << "\n";
+                }
+                if (!result.errors.empty()) {
+                    ss << "\nError Regions:\n";
+                    for (const auto& err : result.errors) {
+                        char errBuf[256];
+                        snprintf(errBuf, sizeof(errBuf), 
+                                "  0x%08zX - 0x%08zX: %zu errors (%s)\n",
+                                err.offsetStart, err.offsetEnd, err.errorCount,
+                                GetPatternName(err.pattern).c_str());
+                        ss << errBuf;
+                    }
+                }
+                ss << "\nNote: Use vendor tools (NVIDIA MATS, etc.) for chip-level diagnosis.\n";
+                
+                ImGui::SetClipboardText(ss.str().c_str());
+                Log("[INFO] VRAM test results copied to clipboard");
+            }
+            
+            ImGui::SameLine();
+            
+            if (ImGui::Button("Close", ImVec2(buttonWidth, 30))) {
+                g_app.showVRAMTestWindow = false;
+            }
+        }
+        ImGui::End();
+    }
+
     // ========== About Dialog ==========
     if (g_app.showAboutDialog) {
         ImGui::OpenPopup("About GPU-PCIe-Test");
@@ -3782,7 +5037,7 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v2.8 GUI Edition");
+        ImGui::Text("GPU-PCIe-Test v3.0 GUI Edition");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
@@ -3792,13 +5047,22 @@ void RenderGUI() {
         ImGui::BulletText("Upload/Download bandwidth tests");
         ImGui::BulletText("Bidirectional bandwidth test");
         ImGui::BulletText("Latency measurements");
+        ImGui::BulletText("VRAM integrity scanning");
         ImGui::BulletText("Interface detection (PCIe/TB/USB4/OCuLink)");
         ImGui::BulletText("eGPU auto-detection");
+        ImGui::BulletText("System RAM detection");
         ImGui::BulletText("VRAM-aware buffer sizing");
         ImGui::BulletText("Average or individual run recording");
         ImGui::BulletText("Min/Avg/Max graphs");
         ImGui::BulletText("Ranked comparison to standards");
         ImGui::BulletText("CSV export");
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::Text("Author: David Janice");
+        ImGui::Text("Email: djanice1980@gmail.com");
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "https://github.com/djanice1980/GPU-PCIe-Test");
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
@@ -4004,7 +5268,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v2.8 GUI",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.0 GUI",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,
@@ -4028,6 +5292,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Enumerate GPUs
     EnumerateGPUs();
+    
+    // Detect system memory early (needed for iGPU comparison and config display)
+    g_app.systemMemory = DetectSystemMemory();
 
     // Prepare GPU combo (build once, not per frame)
     g_app.gpuComboNames.clear();
@@ -4126,11 +5393,36 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Cleanup - request cancellation and wait for benchmark thread
     g_app.cancelRequested = true;
     if (g_app.benchmarkThread.joinable()) {
-        // Give the thread a moment to notice cancellation
+        // Give the thread a moment to notice cancellation (max 5 seconds)
+        bool threadStopped = false;
         for (int i = 0; i < 50 && g_app.benchmarkThreadRunning; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        g_app.benchmarkThread.join();
+        threadStopped = !g_app.benchmarkThreadRunning;
+        
+        if (threadStopped) {
+            g_app.benchmarkThread.join();
+        } else {
+            // Thread is hung - detach to allow clean exit
+            // (This leaks the thread but prevents app hang on exit)
+            g_app.benchmarkThread.detach();
+        }
+    }
+    
+    // Cleanup VRAM test thread  
+    g_app.vramTestCancelRequested = true;
+    if (g_app.vramTestThread.joinable()) {
+        bool threadStopped = false;
+        for (int i = 0; i < 50 && g_app.vramTestRunning; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        threadStopped = !g_app.vramTestRunning;
+        
+        if (threadStopped) {
+            g_app.vramTestThread.join();
+        } else {
+            g_app.vramTestThread.detach();
+        }
     }
     
     WaitForGPU();
