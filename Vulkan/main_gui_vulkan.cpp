@@ -1,76 +1,91 @@
 // ============================================================================
-// GPU-PCIe-Test v3.0 - GUI Edition
-// Dear ImGui + D3D12 Frontend
+// GPU-PCIe-Test v3.0 - GUI Edition (Vulkan)
+// Dear ImGui + Vulkan Frontend
 // ============================================================================
 // Graphical frontend for the GPU/PCIe benchmark tool.
 //
 // UNIFIED BENCHMARK METHODOLOGY
 // ─────────────────────────────────────────────────────────────────────────────
 // This methodology is designed to be API-agnostic. The same approach applies
-// to both the D3D12 and Vulkan versions, ensuring comparable results that can
+// to both the Vulkan and D3D12 versions, ensuring comparable results that can
 // be cross-validated. The key principle: always test through the GPU's DMA
 // copy engines directly, never through the graphics command processor.
 //
 // Queue Selection (the foundation of consistent results):
-//   D3D12   → D3D12_COMMAND_LIST_TYPE_DIRECT queue. The driver internally
-//             routes CopyResource calls to the GPU's DMA copy engines.
-//             (COPY queues are unreliable on some driver/hardware combos,
-//             notably eGPU over Thunderbolt, so DIRECT is used for safety.)
 //   Vulkan  → Dedicated transfer queue family (VK_QUEUE_TRANSFER_BIT, no
-//             VK_QUEUE_GRAPHICS_BIT). Maps directly to DMA copy engines.
-//   Note:     D3D12 DIRECT queue adds driver-level scheduling that may
-//             auto-optimize copy routing. Vulkan transfer queues give raw
-//             DMA engine access. Small measurement differences are expected.
+//             VK_QUEUE_GRAPHICS_BIT). Falls back to graphics+transfer if no
+//             dedicated transfer family has timestamp support.
+//   D3D12   → D3D12_COMMAND_LIST_TYPE_COPY queue (equivalent to above).
+//             Falls back to DIRECT queue.
+//   Why:      Both map directly to the GPU's DMA copy engine hardware.
+//             Graphics queues add scheduling overhead and may auto-route
+//             copies differently per vendor, making results non-comparable.
 //
 // Bandwidth Tests:
 //   Download (GPU→CPU):
-//     GPU timestamps bracketing the copy commands on the DIRECT queue.
-//     D3D12: EndQuery(TIMESTAMP) before/after CopyResource.
+//     GPU timestamps bracketing the copy commands on the copy/transfer queue.
+//     Accurate on all GPU types since the DMA engine controls the transfer.
 //
 //   Upload (CPU→GPU) - Discrete GPUs:
-//     CPU round-trip timing. Records: upload + readback from same buffer.
-//     Uses previously measured download speed to subtract download time:
-//       upload_speed = data_size / (round_trip_time - download_time).
-//     Required because ReBAR/BAR mapping can cause GPU timestamps to report
-//     completion before data actually reaches VRAM over the PCIe bus.
+//     CPU round-trip timing. Records: upload + barrier + download from same
+//     buffer. Uses previously measured download speed to subtract download
+//     time: upload_speed = data_size / (round_trip_time - download_time).
+//     Required because ReBAR allows GPU timestamps to complete before data
+//     actually reaches VRAM over the PCIe bus.
 //
 //   Upload (CPU→GPU) - Integrated GPUs:
 //     GPU timestamps, same as download. No ReBAR issue because both "CPU"
 //     and "GPU" memory are the same physical RAM with no bus transfer.
 //
 // Bidirectional Test:
-//   Dual DIRECT queues submitted simultaneously:
+//   Dual copy/transfer queues submitted simultaneously:
 //     Queue 1: upload copies (CPU→GPU)
 //     Queue 2: download copies (GPU→CPU)
 //   Wait for both fences, measure total wall-clock time.
 //   Total bandwidth = (upload_bytes + download_bytes) / elapsed_time.
-//   Falls back to single-queue interleaved copies if creation fails.
-//   Vulkan equivalent: 2 × dedicated transfer queues.
+//   Falls back to single-queue interleaved copies if only 1 queue available.
+//   D3D12 equivalent: 2 × COPY queues with simultaneous ExecuteCommandLists.
 //
 // Latency Tests:
-//   GPU timestamps per individual small copy on the DIRECT queue.
-//   D3D12: EndQuery(TIMESTAMP) which serializes with prior work.
+//   GPU timestamps per individual small copy on the copy/transfer queue.
+//   Both start and end timestamps use the equivalent of "after all prior work
+//   completes" (Vulkan: VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, D3D12:
+//   EndQuery with TIMESTAMP type) to prevent overlap between measurements.
 //
 // Command Latency:
 //   Back-to-back timestamp pairs with no work between them.
-//   Measures minimum per-command dispatch overhead of the DIRECT queue.
+//   Measures minimum per-command dispatch overhead of the copy/transfer queue.
 //
 // CROSS-API EQUIVALENCES
 // ─────────────────────────────────────────────────────────────────────────────
-//   D3D12                              Vulkan
+//   Vulkan                           D3D12
 //   ──────────────────────────────── ──────────────────────────────────────
-//   ID3D12Device (bench)              VkDevice (bench)
-//   COMMAND_LIST_TYPE_DIRECT queue     Transfer queue family
-//   (driver routes to DMA engine)     (direct DMA engine access)
-//   CopyResource / CopyBufferRegion   vkCmdCopyBuffer
-//   EndQuery(TIMESTAMP)                vkCmdWriteTimestamp
-//   ID3D12QueryHeap (TIMESTAMP)        VkQueryPool (TIMESTAMP)
-//   ResolveQueryData + Map readback    vkGetQueryPoolResults
-//   GetTimestampFrequency (ticks/sec)  benchTimestampPeriod (ns/tick)
-//   D3D12_HEAP_TYPE_UPLOAD             VK_MEMORY_PROPERTY_HOST_VISIBLE
-//   D3D12_HEAP_TYPE_DEFAULT            VK_MEMORY_PROPERTY_DEVICE_LOCAL
-//   D3D12_HEAP_TYPE_READBACK           HOST_VISIBLE + HOST_CACHED
-//   2 × DIRECT queues (bidir)          Dual transfer queues (bidir)
+//   VkDevice (bench)                 ID3D12Device (bench)
+//   Transfer queue family            D3D12_COMMAND_LIST_TYPE_COPY queue
+//   vkCmdCopyBuffer                  CopyResource / CopyBufferRegion
+//   vkCmdWriteTimestamp              EndQuery(TIMESTAMP)
+//   VkQueryPool (TIMESTAMP)          ID3D12QueryHeap (TIMESTAMP)
+//   vkGetQueryPoolResults            ResolveQueryData + Map readback
+//   benchTimestampPeriod (ns/tick)   GetTimestampFrequency (ticks/sec)
+//   VK_MEMORY_PROPERTY_HOST_VISIBLE  D3D12_HEAP_TYPE_UPLOAD
+//   VK_MEMORY_PROPERTY_DEVICE_LOCAL  D3D12_HEAP_TYPE_DEFAULT
+//   HOST_VISIBLE + HOST_CACHED       D3D12_HEAP_TYPE_READBACK
+//   vkQueueSubmit + vkWaitForFences  ExecuteCommandLists + Signal/Wait fence
+//   Dual transfer queues (bidir)     2 × COPY queues (bidir)
+//
+// D3D12 BACKPORT NOTES
+// ─────────────────────────────────────────────────────────────────────────────
+// To make D3D12 use the same methodology as this Vulkan version:
+//   1. Change benchQueue from COMMAND_LIST_TYPE_DIRECT to COMMAND_LIST_TYPE_COPY
+//   2. Create a second COPY queue + allocator + command list for bidirectional
+//   3. Bidirectional: submit upload to COPY queue 1, download to COPY queue 2,
+//      wait on both fences. (Currently uses DIRECT queue auto-routing which
+//      gives higher numbers due to internal driver optimization.)
+//   4. All bandwidth/latency tests already use CopyResource which works on COPY
+//      queues - no changes needed to the copy commands themselves.
+//   5. The round-trip upload method is API-agnostic, works identically.
+//   6. Expected result: D3D12 numbers should converge with Vulkan numbers
+//      since both will test through the same DMA copy engine hardware path.
 //
 // ============================================================================
 // Features:
@@ -83,13 +98,11 @@
 // - eGPU auto-detection (Thunderbolt/USB4/USB via device tree)
 // - Integrated GPU (APU) proper detection - no fake PCIe reporting
 // - Actual PCIe link detection via SetupAPI
-// - Improved upload measurement: uses measured download speed for accuracy
 // - System RAM detection via WMI (speed, channels, type)
 // - Full Unicode support (UTF-8 internal)
 // ============================================================================
 
 // Uncomment to enable debug logging for external GPU detection
-// This will log the device tree traversal to help diagnose detection issues
 // #define DEBUG_EXTERNAL_DETECTION
 
 #ifndef NOMINMAX
@@ -97,11 +110,10 @@
 #endif
 
 #define _WIN32_DCOM  // Required for CoInitializeEx
+#define VK_USE_PLATFORM_WIN32_KHR
 
 #include <windows.h>
-#include <d3d12.h>
-#include <dxgi1_6.h>
-#include <wrl.h>
+#include <vulkan/vulkan.h>
 #include <setupapi.h>
 #include <devpkey.h>
 #include <cfgmgr32.h>
@@ -125,9 +137,11 @@
 #include <map>
 #include <set>
 #include <random>
+#include <functional>
+#include <optional>
+#include <cassert>
 
-#pragma comment(lib, "d3d12.lib")
-#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "vulkan-1.lib")
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "wbemuuid.lib")
@@ -137,11 +151,14 @@
 // ImGui headers (must be in imgui/ subfolder)
 #include "imgui/imgui.h"
 #include "imgui/imgui_impl_win32.h"
-#include "imgui/imgui_impl_dx12.h"
+#include "imgui/imgui_impl_vulkan.h"
 #include "imgui/implot.h"
 #include "imgui/imgui_internal.h"
 
-using Microsoft::WRL::ComPtr;
+// Vulkan check macros
+#define VK_CHECK(x) do { VkResult _r = (x); if (_r != VK_SUCCESS) { Log("[VULKAN ERROR] " + std::string(#x) + " = " + std::to_string((int)_r)); } } while(0)
+#define VK_CHECK_RETURN(x, ret) do { VkResult _r = (x); if (_r != VK_SUCCESS) { Log("[VULKAN ERROR] " + std::string(#x) + " = " + std::to_string((int)_r)); return ret; } } while(0)
+
 
 // ============================================================================
 // CONSTANTS
@@ -155,23 +172,20 @@ namespace Constants {
     constexpr size_t DEFAULT_LATENCY_SIZE = 1;
     constexpr int DEFAULT_BANDWIDTH_BATCHES = 32;
     constexpr int DEFAULT_COPIES_PER_BATCH = 8;
-    constexpr int DEFAULT_LATENCY_ITERS = 2000; // Reduced from 10000 - still accurate, much faster
+    constexpr int DEFAULT_LATENCY_ITERS = 2000;
     constexpr int DEFAULT_NUM_RUNS = 3;
-    constexpr float BASE_FONT_SCALE = 1.0f;  // User's preferred 2x scaling
+    constexpr float BASE_FONT_SCALE = 1.0f;
     
-    // Timeout and retry constants
-    constexpr DWORD FENCE_WAIT_TIMEOUT_MS = 8000;       // 8 seconds per fence wait
-    constexpr int MAX_FENCE_RETRIES = 3;                // Max retries before aborting
-    constexpr DWORD GLOBAL_BENCHMARK_TIMEOUT_MS = 300000; // 5 minute global timeout
+    constexpr DWORD FENCE_WAIT_TIMEOUT_MS = 8000;
+    constexpr int MAX_FENCE_RETRIES = 3;
+    constexpr DWORD GLOBAL_BENCHMARK_TIMEOUT_MS = 300000;
     
-    // VRAM safety margin (leave 20% free for system use)
     constexpr double VRAM_SAFETY_MARGIN = 0.8;
-    constexpr size_t MIN_BANDWIDTH_SIZE = 16ull * 1024 * 1024;  // 16 MB minimum
+    constexpr size_t MIN_BANDWIDTH_SIZE = 16ull * 1024 * 1024;
     
-    // eGPU detection thresholds
-    constexpr double EGPU_BANDWIDTH_THRESHOLD = 5.0;  // GB/s - below this suggests external connection
-    constexpr double TB3_MAX_BANDWIDTH = 3.5;         // Thunderbolt 3 typical max
-    constexpr double TB4_MAX_BANDWIDTH = 4.5;         // Thunderbolt 4 typical max
+    constexpr double EGPU_BANDWIDTH_THRESHOLD = 5.0;
+    constexpr double TB3_MAX_BANDWIDTH = 3.5;
+    constexpr double TB4_MAX_BANDWIDTH = 4.5;
 }
 
 // ============================================================================
@@ -185,117 +199,90 @@ struct GPUInfo {
     size_t      dedicatedVRAM = 0;
     size_t      sharedMemory = 0;
     bool        isIntegrated = false;
-    bool        isValid = true;  // False for "no GPU found" placeholder
+    bool        isValid = true;
     
-    // PCIe link information (detected via SetupAPI)
-    int         pcieGenCurrent = 0;     // Current PCIe generation (1-6)
-    int         pcieLanesCurrent = 0;   // Current lane width (1,2,4,8,16,32)
-    int         pcieGenMax = 0;         // Max supported PCIe generation
-    int         pcieLanesMax = 0;       // Max supported lane width
-    bool        pcieInfoValid = false;  // True if we successfully queried PCIe info
-    std::string pcieLocationPath;       // Device location path for identification
+    int         pcieGenCurrent = 0;
+    int         pcieLanesCurrent = 0;
+    int         pcieGenMax = 0;
+    int         pcieLanesMax = 0;
+    bool        pcieInfoValid = false;
+    std::string pcieLocationPath;
     
-    // Thunderbolt/USB4/USB detection (detected via device tree topology)
-    bool        isThunderbolt = false;      // Connected via Thunderbolt (Intel certified)
-    bool        isUSB4 = false;             // Connected via USB4 (includes TB4, AMD USB4)
-    bool        isUSB = false;              // Connected via any USB (USB3/USB4/TB)
-    int         thunderboltVersion = 0;     // 3 or 4 (0 if unknown or not TB)
-    std::string externalConnectionType;     // "Thunderbolt 4", "USB4", "AMD USB4", etc.
+    bool        isThunderbolt = false;
+    bool        isUSB4 = false;
+    bool        isUSB = false;
+    int         thunderboltVersion = 0;
+    std::string externalConnectionType;
     
-    // Store adapter for reliable selection (handles hot-plug scenarios)
-    ComPtr<IDXGIAdapter1> adapter;
+    // Vulkan physical device handle for reliable selection
+    VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 };
 
 // System RAM information (detected via WMI)
 struct SystemMemoryInfo {
-    uint32_t speedMT = 0;              // Speed in MT/s (e.g., 6400)
-    uint32_t configuredSpeedMT = 0;    // Configured/actual speed in MT/s
-    uint32_t channels = 0;             // Number of channels (1, 2, 4, etc.)
-    uint32_t totalSticks = 0;          // Number of physical DIMMs
-    uint64_t totalCapacityGB = 0;      // Total capacity in GB
-    std::string type;                  // "DDR4", "DDR5", "LPDDR5", etc.
-    std::string formFactor;            // "DIMM", "SODIMM", etc.
-    double theoreticalBandwidth = 0;   // Calculated theoretical bandwidth in GB/s
-    bool detected = false;             // True if WMI query succeeded
-    std::string errorMessage;          // Error message if detection failed
+    uint32_t speedMT = 0;
+    uint32_t configuredSpeedMT = 0;
+    uint32_t channels = 0;
+    uint32_t totalSticks = 0;
+    uint64_t totalCapacityGB = 0;
+    std::string type;
+    std::string formFactor;
+    double theoreticalBandwidth = 0;
+    bool detected = false;
+    std::string errorMessage;
 };
 
 // VRAM test pattern types
 enum class VRAMTestPattern {
-    AllZeros,           // 0x00000000
-    AllOnes,            // 0xFFFFFFFF
-    Checkerboard,       // 0xAAAAAAAA
-    InverseCheckerboard,// 0x55555555
-    Random,             // Random data
-    MarchingOnes,       // Walking 1 pattern
-    MarchingZeros,      // Walking 0 pattern
-    AddressPattern      // Address-based pattern for location detection
+    AllZeros,
+    AllOnes,
+    Checkerboard,
+    InverseCheckerboard,
+    Random,
+    MarchingOnes,
+    MarchingZeros,
+    AddressPattern
 };
 
-// VRAM error information
 struct VRAMError {
-    size_t offsetStart = 0;     // Start offset of error region
-    size_t offsetEnd = 0;       // End offset of error region
-    uint32_t expected = 0;      // Expected value
-    uint32_t actual = 0;        // Actual value read back
-    VRAMTestPattern pattern;    // Which pattern detected the error
-    size_t errorCount = 0;      // Number of errors in this region
+    size_t offsetStart = 0;
+    size_t offsetEnd = 0;
+    uint32_t expected = 0;
+    uint32_t actual = 0;
+    VRAMTestPattern pattern;
+    size_t errorCount = 0;
 };
 
-// VRAM test results
 struct VRAMTestResult {
     bool completed = false;
     bool cancelled = false;
     size_t totalBytesTested = 0;
     size_t totalErrors = 0;
     std::vector<VRAMError> errors;
-    std::vector<std::string> patternResults;  // Results per pattern
+    std::vector<std::string> patternResults;
     double testDurationSeconds = 0;
     std::string summary;
 };
 
-// PCIe generation speed in GT/s (gigatransfers per second)
 static const double PCIE_GEN_SPEEDS[] = {
-    0.0,   // Gen 0 (invalid)
-    2.5,   // Gen 1
-    5.0,   // Gen 2
-    8.0,   // Gen 3
-    16.0,  // Gen 4
-    32.0,  // Gen 5
-    64.0   // Gen 6
+    0.0, 2.5, 5.0, 8.0, 16.0, 32.0, 64.0
 };
 
-// Protocol overhead efficiency factors (accounts for TLP headers, DLLPs, flow control)
-// Gen 1-2: 8b/10b encoding (80%) + ~15% protocol overhead = ~65-70% efficiency
-// Gen 3+:  128b/130b encoding (98.5%) + ~10-15% protocol overhead = ~85% efficiency
 static const double PCIE_PROTOCOL_EFFICIENCY[] = {
-    0.0,   // Gen 0 (invalid)
-    0.65,  // Gen 1 (8b/10b + high overhead)
-    0.70,  // Gen 2 (8b/10b + moderate overhead)
-    0.85,  // Gen 3 (128b/130b + typical overhead)
-    0.85,  // Gen 4 (128b/130b + typical overhead)
-    0.85,  // Gen 5 (128b/130b + typical overhead)
-    0.85   // Gen 6 (128b/130b + typical overhead)
+    0.0, 0.65, 0.70, 0.85, 0.85, 0.85, 0.85
 };
 
-// Calculate theoretical (raw) bandwidth for PCIe config (in GB/s)
-// This is the maximum possible with perfect efficiency (encoding overhead only)
 inline double CalculatePCIeBandwidth(int gen, int lanes) {
     if (gen < 1 || gen > 6 || lanes < 1) return 0.0;
-    // PCIe uses 128b/130b encoding for Gen3+, 8b/10b for Gen1-2
     double encodingEfficiency = (gen >= 3) ? (128.0 / 130.0) : (8.0 / 10.0);
     double gtPerSec = PCIE_GEN_SPEEDS[gen];
-    // GT/s * lanes * encoding efficiency / 8 bits per byte = GB/s
     return (gtPerSec * lanes * encodingEfficiency) / 8.0;
 }
 
-// Calculate realistic (achievable) bandwidth accounting for protocol overhead
-// This is what well-optimized software can typically achieve
 inline double CalculateRealisticPCIeBandwidth(int gen, int lanes) {
     if (gen < 1 || gen > 6 || lanes < 1) return 0.0;
     double gtPerSec = PCIE_GEN_SPEEDS[gen];
     double efficiency = PCIE_PROTOCOL_EFFICIENCY[gen];
-    // GT/s * lanes * overall efficiency / 8 bits per byte = GB/s
     return (gtPerSec * lanes * efficiency) / 8.0;
 }
 
@@ -305,7 +292,7 @@ struct BenchmarkResult {
     double            avgValue = 0;
     double            maxValue = 0;
     std::string       unit;
-    std::vector<double> samples;  // For graphing
+    std::vector<double> samples;
 };
 
 struct BenchmarkConfig {
@@ -318,20 +305,17 @@ struct BenchmarkConfig {
     bool   runBidirectional = true;
     bool   runLatency = true;
     bool   quickMode = false;
-    bool   averageRuns = true;  // When false, record each run individually
+    bool   averageRuns = true;
     int    selectedGPU = 0;
 };
 
 struct InterfaceSpeed {
     const char* name;
-    double      bandwidth;       // Realistic achievable bandwidth (with protocol overhead)
-    double      theoretical;     // Raw theoretical bandwidth (encoding overhead only)
+    double      bandwidth;
+    double      theoretical;
     const char* description;
 };
 
-// Updated interface standards with realistic achievable bandwidth
-// PCIe Gen3+ uses ~85% efficiency (128b/130b encoding + TLP/DLLP overhead)
-// Thunderbolt/USB4 values are based on real-world measurements
 static const InterfaceSpeed INTERFACE_SPEEDS[] = {
     {"PCIe 3.0 x4",    3.40,   3.94,  "Entry-level GPU slot"},
     {"PCIe 3.0 x8",    6.80,   7.88,  "Mid-range GPU slot"},
@@ -354,6 +338,33 @@ static const InterfaceSpeed INTERFACE_SPEEDS[] = {
 static const int NUM_INTERFACE_SPEEDS = sizeof(INTERFACE_SPEEDS) / sizeof(INTERFACE_SPEEDS[0]);
 
 // ============================================================================
+// VULKAN BUFFER ALLOCATION HELPER
+// ============================================================================
+// Replaces ComPtr<ID3D12Resource> for buffer management
+enum class VkBufferType {
+    Upload,     // HOST_VISIBLE | HOST_COHERENT (replaces D3D12_HEAP_TYPE_UPLOAD)
+    DeviceLocal,// DEVICE_LOCAL (replaces D3D12_HEAP_TYPE_DEFAULT)
+    Readback    // HOST_VISIBLE | HOST_CACHED (replaces D3D12_HEAP_TYPE_READBACK)
+};
+
+struct VkBufferAllocation {
+    VkBuffer       buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize   size = 0;
+    void*          mappedPtr = nullptr;  // For persistently mapped buffers
+    
+    bool IsValid() const { return buffer != VK_NULL_HANDLE && memory != VK_NULL_HANDLE; }
+    operator bool() const { return IsValid(); }
+    
+    void Destroy(VkDevice device) {
+        if (buffer != VK_NULL_HANDLE) { vkDestroyBuffer(device, buffer, nullptr); buffer = VK_NULL_HANDLE; }
+        if (memory != VK_NULL_HANDLE) { vkFreeMemory(device, memory, nullptr); memory = VK_NULL_HANDLE; }
+        mappedPtr = nullptr;
+        size = 0;
+    }
+};
+
+// ============================================================================
 // APPLICATION STATE
 // ============================================================================
 enum class AppState { Idle, Running, Completed };
@@ -367,40 +378,46 @@ struct AppContext {
     int  windowWidth = Constants::WINDOW_WIDTH;
     int  windowHeight = Constants::WINDOW_HEIGHT;
 
-    // D3D12 Device (for rendering)
-    ComPtr<ID3D12Device>              device;
-    ComPtr<ID3D12CommandQueue>        commandQueue;
-    ComPtr<IDXGISwapChain3>           swapChain;
-    ComPtr<ID3D12DescriptorHeap>      rtvHeap;
-    ComPtr<ID3D12DescriptorHeap>      srvHeap;
-    ComPtr<ID3D12CommandAllocator>    commandAllocators[Constants::NUM_FRAMES_IN_FLIGHT];
-    ComPtr<ID3D12GraphicsCommandList> commandList;
-    ComPtr<ID3D12Resource>            renderTargets[Constants::NUM_FRAMES_IN_FLIGHT];
-    ComPtr<ID3D12Fence>               fence;
-    HANDLE                            fenceEvent = nullptr;
-    UINT64                            fenceValues[Constants::NUM_FRAMES_IN_FLIGHT] = {};
-    UINT64                            currentFenceValue = 0;
-    UINT                              frameIndex = 0;
-    UINT                              rtvDescriptorSize = 0;
+    // Vulkan Rendering State
+    VkInstance                 instance = VK_NULL_HANDLE;
+    VkPhysicalDevice           renderPhysicalDevice = VK_NULL_HANDLE;
+    VkDevice                   device = VK_NULL_HANDLE;
+    VkQueue                    graphicsQueue = VK_NULL_HANDLE;
+    uint32_t                   graphicsQueueFamily = UINT32_MAX;
+    VkSurfaceKHR               surface = VK_NULL_HANDLE;
+    VkSwapchainKHR             swapChain = VK_NULL_HANDLE;
+    VkFormat                   swapChainFormat = VK_FORMAT_B8G8R8A8_UNORM;
+    VkExtent2D                 swapChainExtent = {};
+    std::vector<VkImage>       swapChainImages;
+    std::vector<VkImageView>   swapChainImageViews;
+    std::vector<VkFramebuffer> swapChainFramebuffers;
+    VkRenderPass               renderPass = VK_NULL_HANDLE;
+    VkCommandPool              commandPool = VK_NULL_HANDLE;
+    VkCommandBuffer            commandBuffers[Constants::NUM_FRAMES_IN_FLIGHT] = {};
+    VkSemaphore                imageAvailableSemaphores[Constants::NUM_FRAMES_IN_FLIGHT] = {};
+    VkSemaphore                renderFinishedSemaphores[Constants::NUM_FRAMES_IN_FLIGHT] = {};
+    VkFence                    inFlightFences[Constants::NUM_FRAMES_IN_FLIGHT] = {};
+    VkDescriptorPool           imguiDescriptorPool = VK_NULL_HANDLE;
+    uint32_t                   frameIndex = 0;
+    uint32_t                   imageIndex = 0;
 
-    // D3D12 Benchmark Device (separate for benchmarking)
-    ComPtr<ID3D12Device>              benchDevice;
-    ComPtr<ID3D12CommandQueue>        benchQueue;
-    ComPtr<ID3D12CommandAllocator>    benchAllocator;
-    ComPtr<ID3D12GraphicsCommandList> benchList;
-    ComPtr<ID3D12Fence>               benchFence;
-    HANDLE                            benchFenceEvent = nullptr;
-    UINT64                            benchFenceValue = 1;
-    D3D12_COMMAND_LIST_TYPE           benchQueueType = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    // Vulkan Benchmark Device (separate device for benchmarking)
+    VkPhysicalDevice           benchPhysicalDevice = VK_NULL_HANDLE;
+    VkDevice                   benchDevice = VK_NULL_HANDLE;
+    VkQueue                    benchQueue = VK_NULL_HANDLE;
+    uint32_t                   benchQueueFamily = UINT32_MAX;
+    VkCommandPool              benchCommandPool = VK_NULL_HANDLE;
+    VkCommandBuffer            benchCommandBuffer = VK_NULL_HANDLE;
+    VkFence                    benchFence = VK_NULL_HANDLE;
+    uint64_t                   benchFenceValue = 1;
+    float                      benchTimestampPeriod = 0.0f;  // nanoseconds per tick
 
     // Second queue for bidirectional transfers (allows true simultaneous upload/download)
-    ComPtr<ID3D12CommandQueue>        benchQueue2;
-    ComPtr<ID3D12CommandAllocator>    benchAllocator2;
-    ComPtr<ID3D12GraphicsCommandList> benchList2;
-    ComPtr<ID3D12Fence>               benchFence2;
-    HANDLE                            benchFenceEvent2 = nullptr;
-    UINT64                            benchFenceValue2 = 1;
-    bool                              hasDualQueues = false;
+    VkQueue                    benchQueue2 = VK_NULL_HANDLE;
+    VkCommandPool              benchCommandPool2 = VK_NULL_HANDLE;
+    VkCommandBuffer            benchCommandBuffer2 = VK_NULL_HANDLE;
+    VkFence                    benchFence2 = VK_NULL_HANDLE;
+    bool                       hasDualQueues = false;
 
     // GPU list
     std::vector<GPUInfo>              gpuList;
@@ -418,27 +435,27 @@ struct AppContext {
     std::atomic<int>   totalTests{ 0 };
     std::atomic<int>   completedTests{ 0 };
     std::atomic<bool>  cancelRequested{ false };
-    std::atomic<bool>  benchmarkAborted{ false };  // For critical failures
-    std::atomic<int>   fenceTimeoutCount{ 0 };     // Track consecutive timeouts
+    std::atomic<bool>  benchmarkAborted{ false };
+    std::atomic<int>   fenceTimeoutCount{ 0 };
     std::string        currentTest;
     std::mutex         resultsMutex;
     std::vector<BenchmarkResult> results;
     std::thread        benchmarkThread;
-    std::atomic<bool>  benchmarkThreadRunning{ false };  // Track if thread is active
+    std::atomic<bool>  benchmarkThreadRunning{ false };
     
     // Benchmark timing for global timeout
     std::chrono::steady_clock::time_point benchmarkStartTime;
 
-    // UI State (removed g_ prefix - cleaner inside struct)
+    // UI State
     bool showResultsWindow = false;
     bool showGraphsWindow = false;
-    bool showCompareWindow = false;  // NEW: Compare to standards window
+    bool showCompareWindow = false;
     bool showAboutDialog = false;
     bool dockingInitialized = false;
-    bool isResizing = false;         // Was: g_isResizing
-    bool pendingResize = false;      // Was: g_pendingResize
-    int  pendingWidth = 0;           // Was: g_pendingWidth
-    int  pendingHeight = 0;          // Was: g_pendingHeight
+    bool isResizing = false;
+    bool pendingResize = false;
+    int  pendingWidth = 0;
+    int  pendingHeight = 0;
 
     // Log buffer
     std::mutex                 logMutex;
@@ -449,24 +466,24 @@ struct AppContext {
     std::string detectedInterfaceDescription;
     double      uploadBW = 0;
     double      downloadBW = 0;
-    double      uploadPercentage = 0;      // Percentage of closest standard
-    double      downloadPercentage = 0;    // Percentage of closest standard
-    std::string closestUploadStandard;     // Name of closest standard
-    std::string closestDownloadStandard;   // Name of closest standard
+    double      uploadPercentage = 0;
+    double      downloadPercentage = 0;
+    std::string closestUploadStandard;
+    std::string closestDownloadStandard;
     
     // eGPU detection
     bool        possibleEGPU = false;
     std::string eGPUConnectionType;
     
     // Integrated GPU memory info
-    std::string integratedMemoryType;    // e.g., "DDR5"
-    std::string integratedFabricType;    // e.g., "AMD Infinity Fabric"
+    std::string integratedMemoryType;
+    std::string integratedFabricType;
     
     // Summary window
     bool        showSummaryWindow = false;
-    double      actualPCIeBandwidth = 0;   // Theoretical max based on detected link
-    std::string actualPCIeConfig;          // e.g., "PCIe 4.0 x16"
-    std::string summaryExplanation;        // Explanation of measured vs actual
+    double      actualPCIeBandwidth = 0;
+    std::string actualPCIeConfig;
+    std::string summaryExplanation;
     
     // System memory info (detected via WMI)
     SystemMemoryInfo systemMemory;
@@ -479,7 +496,7 @@ struct AppContext {
     std::atomic<float> vramTestProgress{ 0.0f };
     std::string vramTestCurrentPattern;
     bool showVRAMTestWindow = false;
-    bool vramTestFullScan = false;  // If true, test ~90% of VRAM instead of 80%
+    bool vramTestFullScan = false;
 };
 
 static AppContext g_app;
@@ -1688,93 +1705,157 @@ void DetectThunderboltConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPU
 }
 
 // ============================================================================
-// GPU ENUMERATION
+// GPU ENUMERATION (Vulkan)
 // ============================================================================
 void EnumerateGPUs() {
     g_app.gpuList.clear();
 
-    ComPtr<IDXGIFactory6> factory;
-    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
-        Log("[ERROR] Failed to create DXGI factory");
-        // Add placeholder for no GPU
+    // We need a temporary VkInstance to enumerate physical devices
+    // If g_app.instance is already created, use that
+    VkInstance enumInstance = g_app.instance;
+    bool createdTempInstance = false;
+    
+    if (enumInstance == VK_NULL_HANDLE) {
+        // This shouldn't happen in normal flow (InitVulkan creates instance first)
+        // but handle it gracefully
+        VkApplicationInfo appInfo = {};
+        appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+        appInfo.pApplicationName = "GPU-PCIe-Test";
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 0, 0);
+        appInfo.pEngineName = "No Engine";
+        appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+        appInfo.apiVersion = VK_API_VERSION_1_1;
+
+        VkInstanceCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+        createInfo.pApplicationInfo = &appInfo;
+
+        const char* extensions[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
+        createInfo.enabledExtensionCount = 2;
+        createInfo.ppEnabledExtensionNames = extensions;
+
+        if (vkCreateInstance(&createInfo, nullptr, &enumInstance) != VK_SUCCESS) {
+            Log("[ERROR] Failed to create Vulkan instance for enumeration");
+            GPUInfo placeholder;
+            placeholder.name = "No GPU Found";
+            placeholder.vendor = "N/A";
+            placeholder.isValid = false;
+            g_app.gpuList.push_back(placeholder);
+            return;
+        }
+        createdTempInstance = true;
+    }
+
+    uint32_t deviceCount = 0;
+    vkEnumeratePhysicalDevices(enumInstance, &deviceCount, nullptr);
+
+    if (deviceCount == 0) {
+        Log("[WARNING] No Vulkan physical devices found!");
         GPUInfo placeholder;
-        placeholder.name = "No GPU Found";
+        placeholder.name = "No GPU Found - Check drivers";
         placeholder.vendor = "N/A";
         placeholder.isValid = false;
         g_app.gpuList.push_back(placeholder);
+        if (createdTempInstance) vkDestroyInstance(enumInstance, nullptr);
         return;
     }
 
-    ComPtr<IDXGIAdapter1> adapter;
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC1 desc;
-        adapter->GetDesc1(&desc);
+    std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
+    vkEnumeratePhysicalDevices(enumInstance, &deviceCount, physicalDevices.data());
 
-        // Skip software adapters
-        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+    for (const auto& physDevice : physicalDevices) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(physDevice, &props);
+
+        VkPhysicalDeviceMemoryProperties memProps;
+        vkGetPhysicalDeviceMemoryProperties(physDevice, &memProps);
+
+        // Skip CPU-only / software devices
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) continue;
 
         GPUInfo info;
-        info.name = WideToUtf8(desc.Description);
-        info.vendorId = desc.VendorId;
-        info.deviceId = desc.DeviceId;
-        info.vendor = GetVendorName(desc.VendorId);
-        info.dedicatedVRAM = desc.DedicatedVideoMemory;
-        info.sharedMemory = desc.SharedSystemMemory;
+        info.name = props.deviceName;
+        info.vendorId = props.vendorID;
+        info.deviceId = props.deviceID;
+        info.vendor = GetVendorName(props.vendorID);
+        info.physicalDevice = physDevice;
+
+        // Calculate VRAM: sum of DEVICE_LOCAL heaps that aren't HOST_VISIBLE
+        // Also track shared memory (HOST_VISIBLE + DEVICE_LOCAL)
+        size_t dedicatedVRAM = 0;
+        size_t sharedMemory = 0;
         
-        // Detect integrated GPU using multiple heuristics:
-        // 1. No dedicated VRAM at all -> definitely integrated
-        // 2. Small dedicated VRAM (<512MB) with large shared memory -> likely integrated (APU)
-        // 3. Check for common iGPU naming patterns
-        bool likelyIntegrated = false;
-        
-        if (desc.DedicatedVideoMemory == 0) {
-            likelyIntegrated = true;
-        } else if (desc.DedicatedVideoMemory < 512ull * 1024 * 1024 && 
-                   desc.SharedSystemMemory > desc.DedicatedVideoMemory * 4) {
-            // Small dedicated + large shared = APU with carved-out memory
-            likelyIntegrated = true;
+        for (uint32_t i = 0; i < memProps.memoryHeapCount; i++) {
+            bool isDeviceLocal = (memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+            
+            if (isDeviceLocal) {
+                // Check if any memory type using this heap is also HOST_VISIBLE
+                bool hasHostVisible = false;
+                for (uint32_t j = 0; j < memProps.memoryTypeCount; j++) {
+                    if (memProps.memoryTypes[j].heapIndex == i &&
+                        (memProps.memoryTypes[j].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                        hasHostVisible = true;
+                        break;
+                    }
+                }
+                
+                if (hasHostVisible) {
+                    // HOST_VISIBLE + DEVICE_LOCAL heap
+                    sharedMemory += memProps.memoryHeaps[i].size;
+                    // For discrete GPUs with ReBAR, this is still dedicated VRAM
+                    // (the entire VRAM is CPU-mappable via resizable BAR)
+                    // For integrated GPUs, this is carved from system RAM
+                    dedicatedVRAM += memProps.memoryHeaps[i].size;
+                } else {
+                    // Pure device-local = dedicated VRAM
+                    dedicatedVRAM += memProps.memoryHeaps[i].size;
+                }
+            } else {
+                // Non-device-local heaps (system RAM visible to GPU)
+                sharedMemory += memProps.memoryHeaps[i].size;
+            }
         }
         
-        // Check GPU name for common integrated GPU indicators
-        std::string nameLower = info.name;
-        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
-        if (nameLower.find("graphics") != std::string::npos && 
-            (nameLower.find("intel") != std::string::npos || 
-             nameLower.find("radeon(tm)") != std::string::npos ||
-             nameLower.find("vega") != std::string::npos ||
-             nameLower.find("apu") != std::string::npos)) {
-            likelyIntegrated = true;
-        }
-        // Intel UHD/Iris are always integrated
-        if (nameLower.find("uhd") != std::string::npos || 
-            nameLower.find("iris") != std::string::npos) {
-            likelyIntegrated = true;
-        }
+        info.dedicatedVRAM = dedicatedVRAM;
+        info.sharedMemory = sharedMemory;
+
+        // Detect integrated GPU
+        bool likelyIntegrated = (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
         
+        if (!likelyIntegrated) {
+            // Additional heuristics from name
+            std::string nameLower = info.name;
+            std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+            if (nameLower.find("graphics") != std::string::npos && 
+                (nameLower.find("intel") != std::string::npos || 
+                 nameLower.find("radeon(tm)") != std::string::npos ||
+                 nameLower.find("vega") != std::string::npos ||
+                 nameLower.find("apu") != std::string::npos)) {
+                likelyIntegrated = true;
+            }
+            if (nameLower.find("uhd") != std::string::npos || 
+                nameLower.find("iris") != std::string::npos) {
+                likelyIntegrated = true;
+            }
+        }
+
         info.isIntegrated = likelyIntegrated;
         info.isValid = true;
-        
-        // Store the adapter pointer for reliable selection later
-        info.adapter = adapter;
-        
-        // Detect PCIe link configuration
-        DetectPCIeLink(desc.VendorId, desc.DeviceId, info);
-        
+
+        // Detect PCIe link configuration (uses SetupAPI, not graphics API)
+        DetectPCIeLink(props.vendorID, props.deviceID, info);
+
         // Detect Thunderbolt/USB4/USB connection via device tree topology
-        // This is more reliable than bandwidth-based detection
         if (!info.isIntegrated) {
-            DetectThunderboltConnection(desc.VendorId, desc.DeviceId, info);
+            DetectThunderboltConnection(props.vendorID, props.deviceID, info);
             if (info.isThunderbolt || info.isUSB4 || info.isUSB) {
                 Log("[INFO] GPU '" + info.name + "' connected via " + info.externalConnectionType);
             }
         }
 
         g_app.gpuList.push_back(std::move(info));
-        
-        // Reset for next iteration
-        adapter.Reset();
     }
-    
+
     // If no hardware GPUs found, add a placeholder
     if (g_app.gpuList.empty()) {
         Log("[WARNING] No hardware GPUs found!");
@@ -1784,6 +1865,8 @@ void EnumerateGPUs() {
         placeholder.isValid = false;
         g_app.gpuList.push_back(placeholder);
     }
+
+    if (createdTempInstance) vkDestroyInstance(enumInstance, nullptr);
 }
 
 // Get safe maximum bandwidth size based on GPU VRAM
@@ -1801,14 +1884,12 @@ size_t GetSafeMaxBandwidthSize(int gpuIndex) {
     
     // For iGPUs, use shared memory but be more conservative
     if (gpu.isIntegrated) {
-        availableVRAM = gpu.sharedMemory / 4;  // Use 25% of shared memory max
+        availableVRAM = gpu.sharedMemory / 4;
     }
     
     // Apply safety margin and account for needing multiple buffers
-    // (upload, download, GPU-side buffers = ~4x the test size)
     size_t safeMax = static_cast<size_t>(availableVRAM * Constants::VRAM_SAFETY_MARGIN / 4);
     
-    // Clamp to reasonable bounds
     safeMax = std::max(safeMax, Constants::MIN_BANDWIDTH_SIZE);
     safeMax = std::min(safeMax, 2ull * 1024 * 1024 * 1024);  // 2GB max
     
@@ -1829,75 +1910,330 @@ size_t ValidateBandwidthSize(size_t requestedSize, int gpuIndex) {
 }
 
 // ============================================================================
-//                      D3D12 INITIALIZATION (Rendering)
+//                      VULKAN INITIALIZATION (Rendering)
 // ============================================================================
 
-bool InitD3D12() {
-    ComPtr<IDXGIFactory6> factory;
-    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return false;
+// Helper: Find a memory type index that satisfies the requirements
+uint32_t FindMemoryType(VkPhysicalDevice physDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(physDevice, &memProperties);
 
-    ComPtr<IDXGIAdapter1> adapter;
-    factory->EnumAdapters1(0, &adapter);
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i)) &&
+            (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+    return UINT32_MAX;  // Not found
+}
 
-    if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_app.device)))) return false;
+// Helper: Find a queue family that supports the given flags
+uint32_t FindQueueFamily(VkPhysicalDevice physDevice, VkQueueFlags flags, VkSurfaceKHR surface = VK_NULL_HANDLE) {
+    uint32_t queueFamilyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physDevice, &queueFamilyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(physDevice, &queueFamilyCount, queueFamilies.data());
 
-    // Command queue
-    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
-    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    if (FAILED(g_app.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&g_app.commandQueue)))) return false;
+    for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        if ((queueFamilies[i].queueFlags & flags) == flags) {
+            if (surface != VK_NULL_HANDLE) {
+                VkBool32 presentSupport = false;
+                vkGetPhysicalDeviceSurfaceSupportKHR(physDevice, i, surface, &presentSupport);
+                if (presentSupport) return i;
+            } else {
+                return i;
+            }
+        }
+    }
+    return UINT32_MAX;
+}
 
-    // Swap chain
-    DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
-    swapChainDesc.BufferCount = Constants::NUM_FRAMES_IN_FLIGHT;
-    swapChainDesc.Width = g_app.windowWidth;
-    swapChainDesc.Height = g_app.windowHeight;
-    swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    swapChainDesc.SampleDesc.Count = 1;
+// Create Vulkan swapchain
+bool CreateSwapChain() {
+    VkSurfaceCapabilitiesKHR capabilities;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_app.renderPhysicalDevice, g_app.surface, &capabilities);
 
-    ComPtr<IDXGISwapChain1> swapChain1;
-    if (FAILED(factory->CreateSwapChainForHwnd(g_app.commandQueue.Get(), g_app.hwnd, &swapChainDesc, nullptr, nullptr, &swapChain1))) return false;
-    swapChain1.As(&g_app.swapChain);
-    g_app.frameIndex = g_app.swapChain->GetCurrentBackBufferIndex();
+    // Choose surface format
+    uint32_t formatCount;
+    vkGetPhysicalDeviceSurfaceFormatsKHR(g_app.renderPhysicalDevice, g_app.surface, &formatCount, nullptr);
+    std::vector<VkSurfaceFormatKHR> formats(formatCount);
+    vkGetPhysicalDeviceSurfaceFormatsKHR(g_app.renderPhysicalDevice, g_app.surface, &formatCount, formats.data());
 
-    // RTV heap
-    D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
-    rtvHeapDesc.NumDescriptors = Constants::NUM_FRAMES_IN_FLIGHT;
-    rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    if (FAILED(g_app.device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&g_app.rtvHeap)))) return false;
-    g_app.rtvDescriptorSize = g_app.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    VkSurfaceFormatKHR surfaceFormat = formats[0];
+    for (const auto& f : formats) {
+        if (f.format == VK_FORMAT_B8G8R8A8_UNORM && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            surfaceFormat = f;
+            break;
+        }
+    }
+    g_app.swapChainFormat = surfaceFormat.format;
 
-    // SRV heap (for ImGui fonts)
-    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-    srvHeapDesc.NumDescriptors = 64;
-    srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(g_app.device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&g_app.srvHeap)))) return false;
+    // Choose present mode (FIFO = VSync, guaranteed available)
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
 
-    // Create RTVs and command allocators
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_app.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT i = 0; i < Constants::NUM_FRAMES_IN_FLIGHT; i++) {
-        g_app.swapChain->GetBuffer(i, IID_PPV_ARGS(&g_app.renderTargets[i]));
-        g_app.device->CreateRenderTargetView(g_app.renderTargets[i].Get(), nullptr, rtvHandle);
-        rtvHandle.ptr += g_app.rtvDescriptorSize;
-        g_app.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_app.commandAllocators[i]));
+    // Choose extent
+    VkExtent2D extent;
+    if (capabilities.currentExtent.width != UINT32_MAX) {
+        extent = capabilities.currentExtent;
+    } else {
+        extent.width = std::clamp((uint32_t)g_app.windowWidth, capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
+        extent.height = std::clamp((uint32_t)g_app.windowHeight, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
+    }
+    g_app.swapChainExtent = extent;
+
+    uint32_t imageCount = std::max(capabilities.minImageCount, (uint32_t)Constants::NUM_FRAMES_IN_FLIGHT);
+    if (capabilities.maxImageCount > 0 && imageCount > capabilities.maxImageCount) {
+        imageCount = capabilities.maxImageCount;
     }
 
-    // Command list
-    g_app.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_app.commandAllocators[0].Get(), nullptr, IID_PPV_ARGS(&g_app.commandList));
-    g_app.commandList->Close();
+    VkSwapchainCreateInfoKHR createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    createInfo.surface = g_app.surface;
+    createInfo.minImageCount = imageCount;
+    createInfo.imageFormat = surfaceFormat.format;
+    createInfo.imageColorSpace = surfaceFormat.colorSpace;
+    createInfo.imageExtent = extent;
+    createInfo.imageArrayLayers = 1;
+    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    createInfo.preTransform = capabilities.currentTransform;
+    createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    createInfo.presentMode = presentMode;
+    createInfo.clipped = VK_TRUE;
+    createInfo.oldSwapchain = VK_NULL_HANDLE;
 
-    // Fence
-    g_app.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_app.fence));
-    g_app.currentFenceValue = 0;
-    g_app.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    VK_CHECK_RETURN(vkCreateSwapchainKHR(g_app.device, &createInfo, nullptr, &g_app.swapChain), false);
+
+    // Get swapchain images
+    uint32_t swapImageCount;
+    vkGetSwapchainImagesKHR(g_app.device, g_app.swapChain, &swapImageCount, nullptr);
+    g_app.swapChainImages.resize(swapImageCount);
+    vkGetSwapchainImagesKHR(g_app.device, g_app.swapChain, &swapImageCount, g_app.swapChainImages.data());
+
+    // Create image views
+    g_app.swapChainImageViews.resize(swapImageCount);
+    for (uint32_t i = 0; i < swapImageCount; i++) {
+        VkImageViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = g_app.swapChainImages[i];
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = g_app.swapChainFormat;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+        VK_CHECK_RETURN(vkCreateImageView(g_app.device, &viewInfo, nullptr, &g_app.swapChainImageViews[i]), false);
+    }
+
+    return true;
+}
+
+// Create render pass
+bool CreateRenderPass() {
+    VkAttachmentDescription colorAttachment = {};
+    colorAttachment.format = g_app.swapChainFormat;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    VkAttachmentReference colorAttachmentRef = {};
+    colorAttachmentRef.attachment = 0;
+    colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass = {};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorAttachmentRef;
+
+    VkSubpassDependency dependency = {};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcAccessMask = 0;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo renderPassInfo = {};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &colorAttachment;
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    renderPassInfo.dependencyCount = 1;
+    renderPassInfo.pDependencies = &dependency;
+
+    VK_CHECK_RETURN(vkCreateRenderPass(g_app.device, &renderPassInfo, nullptr, &g_app.renderPass), false);
+    return true;
+}
+
+// Create framebuffers for swapchain
+bool CreateFramebuffers() {
+    g_app.swapChainFramebuffers.resize(g_app.swapChainImageViews.size());
+    for (size_t i = 0; i < g_app.swapChainImageViews.size(); i++) {
+        VkFramebufferCreateInfo fbInfo = {};
+        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbInfo.renderPass = g_app.renderPass;
+        fbInfo.attachmentCount = 1;
+        fbInfo.pAttachments = &g_app.swapChainImageViews[i];
+        fbInfo.width = g_app.swapChainExtent.width;
+        fbInfo.height = g_app.swapChainExtent.height;
+        fbInfo.layers = 1;
+        VK_CHECK_RETURN(vkCreateFramebuffer(g_app.device, &fbInfo, nullptr, &g_app.swapChainFramebuffers[i]), false);
+    }
+    return true;
+}
+
+// Cleanup swapchain resources (for resize)
+void CleanupSwapChain() {
+    vkDeviceWaitIdle(g_app.device);
+    
+    for (auto fb : g_app.swapChainFramebuffers) {
+        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(g_app.device, fb, nullptr);
+    }
+    g_app.swapChainFramebuffers.clear();
+
+    for (auto iv : g_app.swapChainImageViews) {
+        if (iv != VK_NULL_HANDLE) vkDestroyImageView(g_app.device, iv, nullptr);
+    }
+    g_app.swapChainImageViews.clear();
+    g_app.swapChainImages.clear();
+
+    if (g_app.swapChain != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(g_app.device, g_app.swapChain, nullptr);
+        g_app.swapChain = VK_NULL_HANDLE;
+    }
+}
+
+bool InitVulkan() {
+    // Create Vulkan Instance
+    VkApplicationInfo appInfo = {};
+    appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    appInfo.pApplicationName = "GPU-PCIe-Test";
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 0, 0);
+    appInfo.pEngineName = "No Engine";
+    appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    appInfo.apiVersion = VK_API_VERSION_1_1;
+
+    const char* instanceExtensions[] = {
+        VK_KHR_SURFACE_EXTENSION_NAME,
+        VK_KHR_WIN32_SURFACE_EXTENSION_NAME
+    };
+
+    VkInstanceCreateInfo instanceInfo = {};
+    instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    instanceInfo.pApplicationInfo = &appInfo;
+    instanceInfo.enabledExtensionCount = 2;
+    instanceInfo.ppEnabledExtensionNames = instanceExtensions;
+
+    VK_CHECK_RETURN(vkCreateInstance(&instanceInfo, nullptr, &g_app.instance), false);
+
+    // Create Win32 Surface
+    VkWin32SurfaceCreateInfoKHR surfaceInfo = {};
+    surfaceInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+    surfaceInfo.hinstance = GetModuleHandle(nullptr);
+    surfaceInfo.hwnd = g_app.hwnd;
+    VK_CHECK_RETURN(vkCreateWin32SurfaceKHR(g_app.instance, &surfaceInfo, nullptr, &g_app.surface), false);
+
+    // Pick physical device (use first discrete GPU, fallback to any)
+    uint32_t deviceCount = 0;
+    vkEnumeratePhysicalDevices(g_app.instance, &deviceCount, nullptr);
+    if (deviceCount == 0) return false;
+
+    std::vector<VkPhysicalDevice> devices(deviceCount);
+    vkEnumeratePhysicalDevices(g_app.instance, &deviceCount, devices.data());
+
+    g_app.renderPhysicalDevice = devices[0];  // Default to first
+    for (auto& d : devices) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(d, &props);
+        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+            g_app.renderPhysicalDevice = d;
+            break;
+        }
+    }
+
+    // Find queue family supporting graphics + present
+    g_app.graphicsQueueFamily = FindQueueFamily(g_app.renderPhysicalDevice, VK_QUEUE_GRAPHICS_BIT, g_app.surface);
+    if (g_app.graphicsQueueFamily == UINT32_MAX) return false;
+
+    // Create logical device
+    float queuePriority = 1.0f;
+    VkDeviceQueueCreateInfo queueCreateInfo = {};
+    queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queueCreateInfo.queueFamilyIndex = g_app.graphicsQueueFamily;
+    queueCreateInfo.queueCount = 1;
+    queueCreateInfo.pQueuePriorities = &queuePriority;
+
+    const char* deviceExtensions[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+
+    VkDeviceCreateInfo deviceCreateInfo = {};
+    deviceCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    deviceCreateInfo.queueCreateInfoCount = 1;
+    deviceCreateInfo.pQueueCreateInfos = &queueCreateInfo;
+    deviceCreateInfo.enabledExtensionCount = 1;
+    deviceCreateInfo.ppEnabledExtensionNames = deviceExtensions;
+
+    VK_CHECK_RETURN(vkCreateDevice(g_app.renderPhysicalDevice, &deviceCreateInfo, nullptr, &g_app.device), false);
+    vkGetDeviceQueue(g_app.device, g_app.graphicsQueueFamily, 0, &g_app.graphicsQueue);
+
+    // Create swapchain
+    if (!CreateSwapChain()) return false;
+
+    // Create render pass
+    if (!CreateRenderPass()) return false;
+
+    // Create framebuffers
+    if (!CreateFramebuffers()) return false;
+
+    // Create command pool and command buffers
+    VkCommandPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = g_app.graphicsQueueFamily;
+    VK_CHECK_RETURN(vkCreateCommandPool(g_app.device, &poolInfo, nullptr, &g_app.commandPool), false);
+
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = g_app.commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = Constants::NUM_FRAMES_IN_FLIGHT;
+    VK_CHECK_RETURN(vkAllocateCommandBuffers(g_app.device, &allocInfo, g_app.commandBuffers), false);
+
+    // Create sync objects
+    VkSemaphoreCreateInfo semInfo = {};
+    semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    VkFenceCreateInfo fenceInfo = {};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+    for (int i = 0; i < Constants::NUM_FRAMES_IN_FLIGHT; i++) {
+        VK_CHECK_RETURN(vkCreateSemaphore(g_app.device, &semInfo, nullptr, &g_app.imageAvailableSemaphores[i]), false);
+        VK_CHECK_RETURN(vkCreateSemaphore(g_app.device, &semInfo, nullptr, &g_app.renderFinishedSemaphores[i]), false);
+        VK_CHECK_RETURN(vkCreateFence(g_app.device, &fenceInfo, nullptr, &g_app.inFlightFences[i]), false);
+    }
+
+    // Create descriptor pool for ImGui
+    VkDescriptorPoolSize poolSizes[] = {
+        { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64 }
+    };
+    VkDescriptorPoolCreateInfo dpInfo = {};
+    dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpInfo.maxSets = 64;
+    dpInfo.poolSizeCount = 1;
+    dpInfo.pPoolSizes = poolSizes;
+    VK_CHECK_RETURN(vkCreateDescriptorPool(g_app.device, &dpInfo, nullptr, &g_app.imguiDescriptorPool), false);
 
     return true;
 }
 
 // ============================================================================
-//                      D3D12 BENCHMARK DEVICE
+//                      VULKAN BENCHMARK DEVICE
 // ============================================================================
 
 bool InitBenchmarkDevice(int gpuIndex) {
@@ -1908,230 +2244,385 @@ bool InitBenchmarkDevice(int gpuIndex) {
     
     const GPUInfo& selectedGPU = g_app.gpuList[gpuIndex];
     
-    // Check if this is a valid GPU
     if (!selectedGPU.isValid) {
         Log("[ERROR] Cannot benchmark - no valid GPU selected");
         return false;
     }
     
-    // Use the stored adapter pointer for reliable selection
-    if (selectedGPU.adapter) {
-        if (FAILED(D3D12CreateDevice(selectedGPU.adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_app.benchDevice)))) {
-            Log("[ERROR] Failed to create D3D12 device on selected adapter");
-            return false;
+    if (selectedGPU.physicalDevice == VK_NULL_HANDLE) {
+        Log("[ERROR] No Vulkan physical device handle for selected GPU");
+        return false;
+    }
+    
+    g_app.benchPhysicalDevice = selectedGPU.physicalDevice;
+    
+    // Get timestamp period for this device
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(g_app.benchPhysicalDevice, &props);
+    g_app.benchTimestampPeriod = props.limits.timestampPeriod;  // nanoseconds per tick
+    
+    if (g_app.benchTimestampPeriod == 0) {
+        Log("[WARNING] GPU reports zero timestamp period - timestamps may not be supported");
+    }
+    
+    // Find a queue family that supports transfer (and preferably compute)
+    uint32_t queueFamilyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(g_app.benchPhysicalDevice, &queueFamilyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(g_app.benchPhysicalDevice, &queueFamilyCount, queueFamilies.data());
+    
+    // Queue family selection strategy:
+    // 1. Prefer dedicated TRANSFER family (no GRAPHICS bit) with timestamps
+    //    - Maps directly to GPU DMA copy engines
+    //    - Multiple queues map to separate upload/download DMA engines
+    //    - This is critical for bidirectional overlap (NVIDIA has 2 dedicated transfer queues)
+    // 2. Fall back to GRAPHICS+TRANSFER family if no dedicated transfer with timestamps
+    //    - D3D12 DIRECT queue internally routes to DMA engines, but Vulkan graphics queues don't
+    
+    // Step 1: Look for dedicated transfer family with timestamps
+    uint32_t dedicatedTransferFamily = UINT32_MAX;
+    uint32_t graphicsTransferFamily = UINT32_MAX;
+    
+    for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        bool hasTransfer = (queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT) != 0;
+        bool hasGraphics = (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+        bool hasTimestamps = queueFamilies[i].timestampValidBits > 0;
+        
+        if (hasTransfer && !hasGraphics && hasTimestamps && dedicatedTransferFamily == UINT32_MAX) {
+            dedicatedTransferFamily = i;
         }
-    } else {
-        // Fallback: Re-enumerate and match by index (legacy behavior)
-        Log("[WARNING] Using fallback adapter enumeration - adapter pointer was null");
-        ComPtr<IDXGIFactory6> factory;
-        CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
-
-        ComPtr<IDXGIAdapter1> adapter;
-        int idx = 0;
-        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-            DXGI_ADAPTER_DESC1 desc;
-            adapter->GetDesc1(&desc);
-            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-            if (idx == gpuIndex) break;
-            idx++;
-            adapter.Reset();
-        }
-
-        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&g_app.benchDevice)))) {
-            Log("[ERROR] Failed to create D3D12 device via fallback enumeration");
-            return false;
+        if (hasTransfer && hasGraphics && hasTimestamps && graphicsTransferFamily == UINT32_MAX) {
+            graphicsTransferFamily = i;
         }
     }
-
-    // Create benchmark queue
-    // We use DIRECT queues because D3D12 COPY queues are unreliable on some
-    // driver/hardware combinations (notably eGPU over Thunderbolt).
-    // The NVIDIA DIRECT queue driver internally routes CopyResource calls to
-    // the GPU's DMA copy engines, so bandwidth results are comparable.
-    // For bidirectional, we create a second DIRECT queue to enable simultaneous
-    // upload + download submission (matching Vulkan's dual transfer queues).
-    D3D12_COMMAND_LIST_TYPE listType = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    D3D12_COMMAND_QUEUE_DESC qd = {};
-    qd.Type = listType;
-    if (FAILED(g_app.benchDevice->CreateCommandQueue(&qd, IID_PPV_ARGS(&g_app.benchQueue)))) return false;
-    if (FAILED(g_app.benchDevice->CreateCommandAllocator(listType, IID_PPV_ARGS(&g_app.benchAllocator)))) return false;
-    if (FAILED(g_app.benchDevice->CreateCommandList(0, listType, g_app.benchAllocator.Get(), nullptr, IID_PPV_ARGS(&g_app.benchList)))) return false;
-    g_app.benchList->Close();
-    if (FAILED(g_app.benchDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_app.benchFence)))) return false;
-    g_app.benchFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    g_app.benchFenceValue = 1;
-    g_app.fenceTimeoutCount = 0;
-    g_app.benchQueueType = listType;
     
-    Log("[INFO] Using DIRECT queue for benchmark operations");
-    
-    // Create second DIRECT queue for bidirectional transfers
-    // Two DIRECT queues allow simultaneous upload + download submission.
-    // The driver may or may not route these to separate DMA engines.
-    g_app.hasDualQueues = false;
-    D3D12_COMMAND_QUEUE_DESC qd2 = {};
-    qd2.Type = listType;
-    if (SUCCEEDED(g_app.benchDevice->CreateCommandQueue(&qd2, IID_PPV_ARGS(&g_app.benchQueue2)))) {
-        if (SUCCEEDED(g_app.benchDevice->CreateCommandAllocator(listType, IID_PPV_ARGS(&g_app.benchAllocator2)))) {
-            if (SUCCEEDED(g_app.benchDevice->CreateCommandList(0, listType, g_app.benchAllocator2.Get(), nullptr, IID_PPV_ARGS(&g_app.benchList2)))) {
-                g_app.benchList2->Close();
-                if (SUCCEEDED(g_app.benchDevice->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_app.benchFence2)))) {
-                    g_app.benchFenceEvent2 = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-                    g_app.benchFenceValue2 = 1;
-                    g_app.hasDualQueues = true;
-                    Log("[INFO] Dual queues available for bidirectional overlap");
-                }
+    // Step 2: Select primary bench queue family
+    if (dedicatedTransferFamily != UINT32_MAX) {
+        g_app.benchQueueFamily = dedicatedTransferFamily;
+        Log("[INFO] Using dedicated transfer queue family " + std::to_string(dedicatedTransferFamily) + 
+            " (" + std::to_string(queueFamilies[dedicatedTransferFamily].queueCount) + " queues) - direct DMA engine access");
+    } else if (graphicsTransferFamily != UINT32_MAX) {
+        g_app.benchQueueFamily = graphicsTransferFamily;
+        Log("[INFO] Using graphics+transfer queue family " + std::to_string(graphicsTransferFamily) +
+            " (no dedicated transfer family with timestamps available)");
+    } else {
+        // Last resort: any family with transfer
+        for (uint32_t i = 0; i < queueFamilyCount; i++) {
+            if (queueFamilies[i].queueFlags & VK_QUEUE_TRANSFER_BIT) {
+                g_app.benchQueueFamily = i;
+                Log("[WARNING] Using queue family " + std::to_string(i) + " without timestamp support");
+                break;
             }
         }
     }
-    if (!g_app.hasDualQueues) {
-        Log("[INFO] Single queue mode (bidirectional will use interleaved copies)");
-        // Clean up any partial second queue resources
-        g_app.benchFence2.Reset();
-        g_app.benchList2.Reset();
-        g_app.benchAllocator2.Reset();
-        g_app.benchQueue2.Reset();
-        if (g_app.benchFenceEvent2) { CloseHandle(g_app.benchFenceEvent2); g_app.benchFenceEvent2 = nullptr; }
+    
+    if (g_app.benchQueueFamily == UINT32_MAX) {
+        Log("[ERROR] No suitable queue family found on benchmark device");
+        return false;
     }
-
+    
+    // Create logical device for benchmarking
+    // Request 2 queues for bidirectional overlap (separate DMA engines)
+    uint32_t maxQueues = queueFamilies[g_app.benchQueueFamily].queueCount;
+    uint32_t requestedQueues = (maxQueues >= 2) ? 2 : 1;
+    float queuePriorities[2] = { 1.0f, 1.0f };
+    VkDeviceQueueCreateInfo queueInfo = {};
+    queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queueInfo.queueFamilyIndex = g_app.benchQueueFamily;
+    queueInfo.queueCount = requestedQueues;
+    queueInfo.pQueuePriorities = queuePriorities;
+    
+    // Enable host query reset if available (Vulkan 1.2 feature)
+    VkPhysicalDeviceHostQueryResetFeatures hostQueryResetFeatures = {};
+    hostQueryResetFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES;
+    hostQueryResetFeatures.hostQueryReset = VK_TRUE;
+    
+    VkDeviceCreateInfo deviceInfo = {};
+    deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    deviceInfo.pNext = &hostQueryResetFeatures;
+    deviceInfo.queueCreateInfoCount = 1;
+    deviceInfo.pQueueCreateInfos = &queueInfo;
+    // No extensions needed for benchmark device (no swapchain)
+    
+    VkResult result = vkCreateDevice(g_app.benchPhysicalDevice, &deviceInfo, nullptr, &g_app.benchDevice);
+    if (result != VK_SUCCESS) {
+        // Retry without host query reset
+        deviceInfo.pNext = nullptr;
+        VK_CHECK_RETURN(vkCreateDevice(g_app.benchPhysicalDevice, &deviceInfo, nullptr, &g_app.benchDevice), false);
+    }
+    
+    vkGetDeviceQueue(g_app.benchDevice, g_app.benchQueueFamily, 0, &g_app.benchQueue);
+    
+    // Get second queue for bidirectional transfers
+    g_app.hasDualQueues = false;
+    if (requestedQueues >= 2) {
+        vkGetDeviceQueue(g_app.benchDevice, g_app.benchQueueFamily, 1, &g_app.benchQueue2);
+        g_app.hasDualQueues = true;
+        if (dedicatedTransferFamily != UINT32_MAX && g_app.benchQueueFamily == dedicatedTransferFamily) {
+            Log("[INFO] Dual DMA copy engines available for bidirectional overlap");
+        } else {
+            Log("[INFO] Dual queues available (graphics family - overlap may be limited)");
+        }
+    }
+    
+    // Create command pool
+    VkCommandPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = g_app.benchQueueFamily;
+    VK_CHECK_RETURN(vkCreateCommandPool(g_app.benchDevice, &poolInfo, nullptr, &g_app.benchCommandPool), false);
+    
+    // Allocate command buffer
+    VkCommandBufferAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = g_app.benchCommandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VK_CHECK_RETURN(vkAllocateCommandBuffers(g_app.benchDevice, &allocInfo, &g_app.benchCommandBuffer), false);
+    
+    // Create fence for synchronization
+    VkFenceCreateInfo fenceInfo = {};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    // Start unsignaled so first wait works correctly
+    VK_CHECK_RETURN(vkCreateFence(g_app.benchDevice, &fenceInfo, nullptr, &g_app.benchFence), false);
+    
+    // Create second command pool, command buffer, and fence for bidirectional test
+    if (g_app.hasDualQueues) {
+        VK_CHECK_RETURN(vkCreateCommandPool(g_app.benchDevice, &poolInfo, nullptr, &g_app.benchCommandPool2), false);
+        allocInfo.commandPool = g_app.benchCommandPool2;
+        VK_CHECK_RETURN(vkAllocateCommandBuffers(g_app.benchDevice, &allocInfo, &g_app.benchCommandBuffer2), false);
+        VK_CHECK_RETURN(vkCreateFence(g_app.benchDevice, &fenceInfo, nullptr, &g_app.benchFence2), false);
+    }
+    
+    g_app.benchFenceValue = 1;
+    g_app.fenceTimeoutCount = 0;
+    
     return true;
 }
 
 void CleanupBenchmarkDevice() {
-    // Clean up second queue resources
-    if (g_app.benchFenceEvent2) { CloseHandle(g_app.benchFenceEvent2); g_app.benchFenceEvent2 = nullptr; }
-    g_app.benchFence2.Reset();
-    g_app.benchList2.Reset();
-    g_app.benchAllocator2.Reset();
-    g_app.benchQueue2.Reset();
+    if (g_app.benchDevice != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(g_app.benchDevice);
+        
+        if (g_app.benchFence2 != VK_NULL_HANDLE) {
+            vkDestroyFence(g_app.benchDevice, g_app.benchFence2, nullptr);
+            g_app.benchFence2 = VK_NULL_HANDLE;
+        }
+        if (g_app.benchCommandPool2 != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(g_app.benchDevice, g_app.benchCommandPool2, nullptr);
+            g_app.benchCommandPool2 = VK_NULL_HANDLE;
+        }
+        g_app.benchCommandBuffer2 = VK_NULL_HANDLE;
+        
+        if (g_app.benchFence != VK_NULL_HANDLE) {
+            vkDestroyFence(g_app.benchDevice, g_app.benchFence, nullptr);
+            g_app.benchFence = VK_NULL_HANDLE;
+        }
+        if (g_app.benchCommandPool != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(g_app.benchDevice, g_app.benchCommandPool, nullptr);
+            g_app.benchCommandPool = VK_NULL_HANDLE;
+        }
+        g_app.benchCommandBuffer = VK_NULL_HANDLE;
+        
+        vkDestroyDevice(g_app.benchDevice, nullptr);
+        g_app.benchDevice = VK_NULL_HANDLE;
+    }
+    g_app.benchPhysicalDevice = VK_NULL_HANDLE;
+    g_app.benchQueue2 = VK_NULL_HANDLE;
     g_app.hasDualQueues = false;
-    g_app.benchFenceValue2 = 1;
-    
-    // Clean up primary queue resources
-    if (g_app.benchFenceEvent) { CloseHandle(g_app.benchFenceEvent); g_app.benchFenceEvent = nullptr; }
-    g_app.benchFence.Reset();
-    g_app.benchList.Reset();
-    g_app.benchAllocator.Reset();
-    g_app.benchQueue.Reset();
-    g_app.benchDevice.Reset();
     g_app.benchFenceValue = 1;
-    g_app.benchQueueType = D3D12_COMMAND_LIST_TYPE_DIRECT;
 }
 
 // ============================================================================
 //                         BENCHMARK ENGINE
 // ============================================================================
+// All benchmark operations run on the dedicated transfer/copy queue.
+// Buffer types map to D3D12 equivalents:
+//   Upload      → HOST_VISIBLE + HOST_COHERENT  (D3D12: HEAP_TYPE_UPLOAD)
+//   DeviceLocal → DEVICE_LOCAL                   (D3D12: HEAP_TYPE_DEFAULT)
+//   Readback    → HOST_VISIBLE + HOST_CACHED     (D3D12: HEAP_TYPE_READBACK)
+// EXCLUSIVE sharing mode is correct: both queues share the same family.
+// ============================================================================
 
-ComPtr<ID3D12Resource> CreateBuffer(D3D12_HEAP_TYPE heapType, size_t size, D3D12_RESOURCE_STATES state) {
-    D3D12_HEAP_PROPERTIES heapProps = {};
-    heapProps.Type = heapType;
-
-    D3D12_RESOURCE_DESC desc = {};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = size;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-    ComPtr<ID3D12Resource> resource;
-    HRESULT hr = g_app.benchDevice->CreateCommittedResource(
-        &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource));
-
-    if (FAILED(hr)) {
-        Log("[ERROR] CreateCommittedResource failed: HRESULT = 0x" + std::to_string(hr) + 
-            " (Size: " + FormatSize(size) + ")");
-        return nullptr;
+VkBufferAllocation CreateBuffer(VkBufferType type, VkDeviceSize size) {
+    VkBufferAllocation alloc = {};
+    alloc.size = size;
+    
+    VkBufferCreateInfo bufferInfo = {};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    
+    VkMemoryPropertyFlags memFlags = 0;
+    
+    switch (type) {
+        case VkBufferType::Upload:
+            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            memFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            break;
+        case VkBufferType::DeviceLocal:
+            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            memFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            break;
+        case VkBufferType::Readback:
+            bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            memFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+            break;
     }
-
-    return resource;
+    
+    VkResult result = vkCreateBuffer(g_app.benchDevice, &bufferInfo, nullptr, &alloc.buffer);
+    if (result != VK_SUCCESS) {
+        Log("[ERROR] vkCreateBuffer failed: " + std::to_string((int)result) + 
+            " (Size: " + FormatSize(size) + ")");
+        alloc.buffer = VK_NULL_HANDLE;
+        return alloc;
+    }
+    
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(g_app.benchDevice, alloc.buffer, &memReqs);
+    
+    uint32_t memTypeIndex = FindMemoryType(g_app.benchPhysicalDevice, memReqs.memoryTypeBits, memFlags);
+    
+    // Fallback: For readback, try HOST_VISIBLE without HOST_CACHED
+    if (memTypeIndex == UINT32_MAX && type == VkBufferType::Readback) {
+        memFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        memTypeIndex = FindMemoryType(g_app.benchPhysicalDevice, memReqs.memoryTypeBits, memFlags);
+    }
+    
+    if (memTypeIndex == UINT32_MAX) {
+        Log("[ERROR] Failed to find suitable memory type for buffer");
+        vkDestroyBuffer(g_app.benchDevice, alloc.buffer, nullptr);
+        alloc.buffer = VK_NULL_HANDLE;
+        return alloc;
+    }
+    
+    VkMemoryAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = memTypeIndex;
+    
+    result = vkAllocateMemory(g_app.benchDevice, &allocInfo, nullptr, &alloc.memory);
+    if (result != VK_SUCCESS) {
+        Log("[ERROR] vkAllocateMemory failed: " + std::to_string((int)result) + 
+            " (Size: " + FormatSize(size) + ")");
+        vkDestroyBuffer(g_app.benchDevice, alloc.buffer, nullptr);
+        alloc.buffer = VK_NULL_HANDLE;
+        return alloc;
+    }
+    
+    vkBindBufferMemory(g_app.benchDevice, alloc.buffer, alloc.memory, 0);
+    
+    return alloc;
 }
 
 // Enhanced fence wait with retry logic and global timeout checking
 FenceWaitResult WaitForBenchFenceEx() {
-    // Check for cancellation first (both benchmark and VRAM test)
+    // Check for cancellation first
     if (g_app.cancelRequested || g_app.vramTestCancelRequested) {
         return FenceWaitResult::Cancelled;
     }
     
-    // Check global timeout (only if not in VRAM test mode, which has its own timing)
+    // Check global timeout
     if (!g_app.vramTestRunning && IsGlobalTimeoutExceeded()) {
         Log("[ERROR] Global benchmark timeout exceeded (5 minutes)");
         return FenceWaitResult::Timeout;
     }
     
-    g_app.benchQueue->Signal(g_app.benchFence.Get(), g_app.benchFenceValue);
-
-    if (g_app.benchFence->GetCompletedValue() < g_app.benchFenceValue) {
-        HRESULT hr = g_app.benchFence->SetEventOnCompletion(g_app.benchFenceValue, g_app.benchFenceEvent);
-        if (FAILED(hr)) {
-            Log("[ERROR] SetEventOnCompletion failed: " + std::to_string(hr));
-            return FenceWaitResult::Error;
-        }
-
-        DWORD waitResult = WaitForSingleObject(g_app.benchFenceEvent, Constants::FENCE_WAIT_TIMEOUT_MS);
-        if (waitResult == WAIT_TIMEOUT) {
-            g_app.fenceTimeoutCount++;
-            Log("[WARNING] Benchmark fence wait timed out after " + 
-                std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" + 
-                std::to_string(g_app.fenceTimeoutCount.load()) + ")");
-            
-            if (g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) {
-                Log("[ERROR] Max fence timeouts exceeded - possible GPU hang. Aborting benchmark.");
-                g_app.benchmarkAborted = true;
-                return FenceWaitResult::Timeout;
-            }
-            
-            // Try to continue but warn
-            return FenceWaitResult::Timeout;
-        } else if (waitResult != WAIT_OBJECT_0) {
-            Log("[ERROR] WaitForSingleObject failed: " + std::to_string(GetLastError()));
-            return FenceWaitResult::Error;
-        }
+    // Wait for fence
+    uint64_t timeout = static_cast<uint64_t>(Constants::FENCE_WAIT_TIMEOUT_MS) * 1000000ULL; // ms -> ns
+    VkResult result = vkWaitForFences(g_app.benchDevice, 1, &g_app.benchFence, VK_TRUE, timeout);
+    
+    if (result == VK_TIMEOUT) {
+        g_app.fenceTimeoutCount++;
+        Log("[WARNING] Benchmark fence wait timed out after " + 
+            std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" + 
+            std::to_string(g_app.fenceTimeoutCount.load()) + ")");
         
-        // Success - reset timeout counter
-        g_app.fenceTimeoutCount = 0;
+        if (g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) {
+            Log("[ERROR] Max fence timeouts exceeded - possible GPU hang. Aborting benchmark.");
+            g_app.benchmarkAborted = true;
+            return FenceWaitResult::Timeout;
+        }
+        return FenceWaitResult::Timeout;
+    } else if (result != VK_SUCCESS) {
+        Log("[ERROR] vkWaitForFences failed: " + std::to_string((int)result));
+        return FenceWaitResult::Error;
     }
-
+    
+    // Reset fence for next use
+    vkResetFences(g_app.benchDevice, 1, &g_app.benchFence);
+    
+    // Success - reset timeout counter
+    g_app.fenceTimeoutCount = 0;
     g_app.benchFenceValue++;
     return FenceWaitResult::Success;
 }
 
-// Legacy wrapper for compatibility
-void WaitForBenchFence() {
-    WaitForBenchFenceEx();
+// Submit bench command buffer and wait
+FenceWaitResult SubmitAndWait() {
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &g_app.benchCommandBuffer;
+    
+    VkResult result = vkQueueSubmit(g_app.benchQueue, 1, &submitInfo, g_app.benchFence);
+    if (result != VK_SUCCESS) {
+        Log("[ERROR] vkQueueSubmit failed: " + std::to_string((int)result));
+        return FenceWaitResult::Error;
+    }
+    
+    return WaitForBenchFenceEx();
 }
 
-// Check if we should abort the current test/benchmark
+// Legacy wrapper
+void WaitForBenchFence() {
+    // For legacy compatibility - assumes command buffer already submitted
+    // This is used after explicit SubmitAndWait patterns
+}
+
 bool ShouldAbortBenchmark() {
     return g_app.cancelRequested || g_app.benchmarkAborted || IsGlobalTimeoutExceeded();
 }
 
+// Helper: Begin recording benchmark command buffer
+void BeginBenchCommandBuffer() {
+    vkResetCommandBuffer(g_app.benchCommandBuffer, 0);
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(g_app.benchCommandBuffer, &beginInfo);
+}
+
+// Helper: End recording and submit benchmark command buffer
+FenceWaitResult EndAndSubmitBenchCommandBuffer() {
+    vkEndCommandBuffer(g_app.benchCommandBuffer);
+    return SubmitAndWait();
+}
+
 // Bandwidth test with configurable measurement method
 // 
-// useCpuTiming = false (GPU timestamps): 
-//   - Accurate for integrated GPUs (shared memory, no ReBAR issue)
-//   - Accurate for GPU->CPU transfers on any GPU
-//   - INACCURATE for CPU->GPU on discrete GPUs with ReBAR (reports inflated speeds)
+// Runs on the dedicated transfer/copy queue (D3D12 equivalent: COPY queue).
 //
-// useCpuTiming = true (Round-trip method):
-//   - Uploads data, then downloads from SAME buffer to create data dependency
-//   - Forces actual bus transfer to complete before measurement ends
-//   - Required for accurate CPU->GPU measurement on discrete GPUs with ReBAR
-//   - Uses measured download speed to calculate true upload speed
+// useCpuTiming = false (GPU timestamps):
+//   Wraps copy commands with GPU timestamp queries on the transfer queue.
+//   Accurate for: GPU→CPU on all GPUs, CPU→GPU on integrated GPUs.
+//   D3D12 equivalent: EndQuery(TIMESTAMP) before/after CopyResource on COPY queue.
 //
-// measuredDownloadGB: If > 0 and useCpuTiming is true, uses this to calculate true upload:
-//   upload_time = round_trip_time - (size / measured_download_speed)
-//   upload_speed = size / upload_time
+// useCpuTiming = true (CPU round-trip method):
+//   Uploads data, then reads back from the SAME buffer to create a data dependency.
+//   The readback forces the upload to fully complete before the fence signals.
+//   Required for CPU→GPU on discrete GPUs where ReBAR/BAR mapping can cause
+//   GPU timestamps to report completion before data actually crosses the PCIe bus.
+//   Uses measured download speed to isolate upload time:
+//     upload_time = round_trip_time - (data_size / measured_download_speed)
+//   D3D12 equivalent: identical logic with CopyResource on COPY queue.
 //
-BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, size_t size, int copies, int batches, bool useCpuTiming = false, double measuredDownloadGB = 0.0) {
+BenchmarkResult RunBandwidthTest(const std::string& name, VkBufferAllocation& src, VkBufferAllocation& dst, size_t size, int copies, int batches, bool useCpuTiming = false, double measuredDownloadGB = 0.0) {
     g_app.currentTest = name;
     BenchmarkResult result;
     result.testName = name;
     result.unit = "GB/s";
 
-    // Validate inputs
     if (!src || !dst) {
         Log("[ERROR] Invalid source or destination buffer in bandwidth test");
         return result;
@@ -2141,84 +2632,70 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
     bandwidths.reserve(batches);
     int failedBatches = 0;
     
-    // Warm-up pass to stabilize GPU clocks and fill any caches
+    // Warm-up pass
     {
-        g_app.benchAllocator->Reset();
-        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+        BeginBenchCommandBuffer();
         for (int j = 0; j < copies; ++j) {
-            g_app.benchList->CopyResource(dst.Get(), src.Get());
+            VkBufferCopy copyRegion = {};
+            copyRegion.size = size;
+            vkCmdCopyBuffer(g_app.benchCommandBuffer, src.buffer, dst.buffer, 1, &copyRegion);
         }
-        g_app.benchList->Close();
-        ID3D12CommandList* lists[] = { g_app.benchList.Get() };
-        g_app.benchQueue->ExecuteCommandLists(1, lists);
-        WaitForBenchFenceEx();
+        EndAndSubmitBenchCommandBuffer();
     }
 
     if (useCpuTiming) {
         // Round-trip timing mode for accurate CPU->GPU measurement
-        // With ReBAR, GPU timestamps for uploads are unreliable because the GPU can
-        // access system memory directly through the BAR mapping without actual DMA.
-        // 
-        // Solution: Upload to VRAM, then immediately download from the SAME buffer.
-        // The download creates a data dependency - it MUST wait for upload to complete.
-        // Total time = upload + download, so upload = total - (known download speed)
-        // Or we can just report the upload portion based on the round-trip.
-        
-        // Create a readback buffer same size as destination for round-trip verification
-        auto roundtripReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST);
+        auto roundtripReadback = CreateBuffer(VkBufferType::Readback, size);
         if (!roundtripReadback) {
             Log("[WARNING] Could not create round-trip readback buffer - falling back to GPU timestamps");
-            useCpuTiming = false;  // Fall through to GPU timestamp mode
+            useCpuTiming = false;
         } else {
             for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
                 if (i % 8 == 0) {
                     std::this_thread::sleep_for(std::chrono::microseconds(100));
                 }
                 
-                g_app.benchAllocator->Reset();
-                g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+                BeginBenchCommandBuffer();
                 
-                // Upload: CPU -> GPU (UPLOAD heap -> DEFAULT heap)
+                // Upload: CPU -> GPU
                 for (int j = 0; j < copies; ++j) {
-                    g_app.benchList->CopyResource(dst.Get(), src.Get());
+                    VkBufferCopy copyRegion = {};
+                    copyRegion.size = size;
+                    vkCmdCopyBuffer(g_app.benchCommandBuffer, src.buffer, dst.buffer, 1, &copyRegion);
                 }
                 
-                // Barrier: buffer was implicitly promoted to COPY_DEST by the upload
-                // copies. Explicit transition to COPY_SOURCE required for readback.
-                {
-                    D3D12_RESOURCE_BARRIER barrier = {};
-                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                    barrier.Transition.pResource = dst.Get();
-                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                    g_app.benchList->ResourceBarrier(1, &barrier);
-                }
+                // Memory barrier to ensure upload completes before readback
+                VkMemoryBarrier memBarrier = {};
+                memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                memBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                memBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                vkCmdPipelineBarrier(g_app.benchCommandBuffer,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0, 1, &memBarrier, 0, nullptr, 0, nullptr);
                 
-                // Download: GPU -> CPU (DEFAULT heap -> READBACK heap)
-                // This MUST wait for upload to complete - data dependency!
+                // Download: GPU -> CPU (creates data dependency)
                 for (int j = 0; j < copies; ++j) {
-                    g_app.benchList->CopyResource(roundtripReadback.Get(), dst.Get());
+                    VkBufferCopy copyRegion = {};
+                    copyRegion.size = size;
+                    vkCmdCopyBuffer(g_app.benchCommandBuffer, dst.buffer, roundtripReadback.buffer, 1, &copyRegion);
                 }
                 
-                g_app.benchList->Close();
+                vkEndCommandBuffer(g_app.benchCommandBuffer);
 
-                ID3D12CommandList* lists[] = { g_app.benchList.Get() };
-                
-                // Start CPU timer just before submitting work
+                // Start CPU timer
                 auto startTime = std::chrono::high_resolution_clock::now();
                 
-                g_app.benchQueue->ExecuteCommandLists(1, lists);
+                VkSubmitInfo submitInfo = {};
+                submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submitInfo.commandBufferCount = 1;
+                submitInfo.pCommandBuffers = &g_app.benchCommandBuffer;
+                vkQueueSubmit(g_app.benchQueue, 1, &submitInfo, g_app.benchFence);
                 
-                // Wait for GPU completion
                 FenceWaitResult fenceResult = WaitForBenchFenceEx();
                 
-                // Stop CPU timer after fence signals
                 auto endTime = std::chrono::high_resolution_clock::now();
                 
-                if (fenceResult == FenceWaitResult::Cancelled) {
-                    break;
-                }
+                if (fenceResult == FenceWaitResult::Cancelled) break;
                 if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
                     Log("[ERROR] Critical fence error - aborting bandwidth test");
                     break;
@@ -2232,22 +2709,11 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
                     bool usedImprovedMethod = false;
                     
                     if (measuredDownloadGB > 0.0) {
-                        // Improved method: use measured download speed to derive true upload
-                        // round_trip_time = upload_time + download_time
-                        // upload_time = round_trip_time - download_time
-                        // download_time = size / measured_download_speed
                         double downloadTime = sizeGB / measuredDownloadGB;
                         double uploadTime = totalSeconds - downloadTime;
                         
-                        // Sanity check: uploadTime must be positive and reasonable
-                        // If uploadTime is too small, the result will be impossibly high
-                        // In that case, fall back to symmetric assumption
-                        if (uploadTime > (totalSeconds * 0.1)) {  // Upload should be at least 10% of total time
+                        if (uploadTime > (totalSeconds * 0.1)) {
                             double calculatedUpload = sizeGB / uploadTime;
-                            
-                            // Additional sanity check: result shouldn't exceed 2x download speed
-                            // (for most real-world scenarios, upload <= download)
-                            // Allow up to 3x to account for measurement variance
                             if (calculatedUpload <= measuredDownloadGB * 3.0) {
                                 uploadBw = calculatedUpload;
                                 usedImprovedMethod = true;
@@ -2256,10 +2722,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
                     }
                     
                     if (!usedImprovedMethod) {
-                        // Fallback: assume symmetric bandwidth (divide by 2)
-                        // This is appropriate for bandwidth-limited links like Thunderbolt/USB4
-                        // where upload and download are naturally symmetric
-                        double totalBytes = static_cast<double>(size) * copies * 2;  // up + down
+                        double totalBytes = static_cast<double>(size) * copies * 2;
                         double roundtripBw = (totalBytes / (1024.0 * 1024.0 * 1024.0)) / totalSeconds;
                         uploadBw = roundtripBw / 2.0;
                     }
@@ -2271,73 +2734,108 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
 
                 g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
             }
+            roundtripReadback.Destroy(g_app.benchDevice);
         }
     }
     
     if (!useCpuTiming) {
-        // GPU timestamp mode - accurate for GPU->CPU and bidirectional where GPU is the bottleneck
-        
-        D3D12_QUERY_HEAP_DESC qhd = {};
-        qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-        qhd.Count = 2;
-        ComPtr<ID3D12QueryHeap> queryHeap;
-        if (FAILED(g_app.benchDevice->CreateQueryHeap(&qhd, IID_PPV_ARGS(&queryHeap)))) {
-            Log("[ERROR] Failed to create timestamp query heap in bandwidth test");
-            return result;
-        }
-
-        auto queryReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, sizeof(UINT64) * 2, D3D12_RESOURCE_STATE_COPY_DEST);
-        if (!queryReadback) {
-            Log("[ERROR] Failed to create query readback buffer - aborting test");
-            return result;
-        }
-
-        UINT64 timestampFreq = 0;
-        HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-        if (FAILED(freqResult) || timestampFreq == 0) {
-            Log("[ERROR] Failed to get valid timestamp frequency (freq=" + std::to_string(timestampFreq) + ")");
-            return result;
-        }
-
-        for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
-            if (i % 8 == 0) {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
-            }
-            
-            g_app.benchAllocator->Reset();
-            g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-
-            g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
-            
-            for (int j = 0; j < copies; ++j) {
-                g_app.benchList->CopyResource(dst.Get(), src.Get());
-            }
-            
-            g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
-
-            g_app.benchList->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, queryReadback.Get(), 0);
-            g_app.benchList->Close();
-
-            ID3D12CommandList* lists[] = { g_app.benchList.Get() };
-            g_app.benchQueue->ExecuteCommandLists(1, lists);
-            
-            FenceWaitResult fenceResult = WaitForBenchFenceEx();
-            if (fenceResult == FenceWaitResult::Cancelled) {
-                break;
-            }
-            if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
-                Log("[ERROR] Critical fence error - aborting bandwidth test");
-                break;
-            }
-
-            UINT64* timestamps = nullptr;
-            D3D12_RANGE readRange = { 0, sizeof(UINT64) * 2 };
-            if (SUCCEEDED(queryReadback->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
-                UINT64 delta = timestamps[1] - timestamps[0];
-                queryReadback->Unmap(0, nullptr);
+        // GPU timestamp mode
+        if (g_app.benchTimestampPeriod == 0) {
+            Log("[WARNING] GPU timestamps not supported - falling back to CPU timing");
+            // Fall back to simple CPU timing without round-trip
+            for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
+                if (i % 8 == 0) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
                 
-                if (delta > 0 && timestampFreq > 0) {
-                    double seconds = static_cast<double>(delta) / static_cast<double>(timestampFreq);
+                BeginBenchCommandBuffer();
+                for (int j = 0; j < copies; ++j) {
+                    VkBufferCopy copyRegion = {};
+                    copyRegion.size = size;
+                    vkCmdCopyBuffer(g_app.benchCommandBuffer, src.buffer, dst.buffer, 1, &copyRegion);
+                }
+                vkEndCommandBuffer(g_app.benchCommandBuffer);
+
+                auto startTime = std::chrono::high_resolution_clock::now();
+                
+                VkSubmitInfo submitInfo = {};
+                submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submitInfo.commandBufferCount = 1;
+                submitInfo.pCommandBuffers = &g_app.benchCommandBuffer;
+                vkQueueSubmit(g_app.benchQueue, 1, &submitInfo, g_app.benchFence);
+                
+                FenceWaitResult fenceResult = WaitForBenchFenceEx();
+                auto endTime = std::chrono::high_resolution_clock::now();
+                
+                if (fenceResult == FenceWaitResult::Cancelled) break;
+                if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) break;
+
+                double seconds = std::chrono::duration<double>(endTime - startTime).count();
+                if (seconds > 0) {
+                    double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                    bandwidths.push_back(bw);
+                } else {
+                    failedBatches++;
+                }
+                g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
+            }
+        } else {
+            // Create timestamp query pool
+            VkQueryPoolCreateInfo queryPoolInfo = {};
+            queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            queryPoolInfo.queryCount = 2;
+            
+            VkQueryPool queryPool = VK_NULL_HANDLE;
+            if (vkCreateQueryPool(g_app.benchDevice, &queryPoolInfo, nullptr, &queryPool) != VK_SUCCESS) {
+                Log("[ERROR] Failed to create timestamp query pool in bandwidth test");
+                return result;
+            }
+
+            for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
+                if (i % 8 == 0) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                }
+                
+                BeginBenchCommandBuffer();
+                
+                vkCmdResetQueryPool(g_app.benchCommandBuffer, queryPool, 0, 2);
+                // TOP_OF_PIPE is correct here: this is the first command in a fresh
+                // command buffer, so there's no prior work to wait for.
+                // D3D12 equivalent: EndQuery(TIMESTAMP) as first command in list.
+                vkCmdWriteTimestamp(g_app.benchCommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0);
+                
+                for (int j = 0; j < copies; ++j) {
+                    VkBufferCopy copyRegion = {};
+                    copyRegion.size = size;
+                    vkCmdCopyBuffer(g_app.benchCommandBuffer, src.buffer, dst.buffer, 1, &copyRegion);
+                }
+                
+                vkCmdWriteTimestamp(g_app.benchCommandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, 1);
+                
+                vkEndCommandBuffer(g_app.benchCommandBuffer);
+
+                VkSubmitInfo submitInfo = {};
+                submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submitInfo.commandBufferCount = 1;
+                submitInfo.pCommandBuffers = &g_app.benchCommandBuffer;
+                vkQueueSubmit(g_app.benchQueue, 1, &submitInfo, g_app.benchFence);
+                
+                FenceWaitResult fenceResult = WaitForBenchFenceEx();
+                if (fenceResult == FenceWaitResult::Cancelled) break;
+                if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
+                    Log("[ERROR] Critical fence error - aborting bandwidth test");
+                    break;
+                }
+
+                uint64_t timestamps[2] = {};
+                VkResult qr = vkGetQueryPoolResults(g_app.benchDevice, queryPool, 0, 2,
+                    sizeof(timestamps), timestamps, sizeof(uint64_t),
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                
+                if (qr == VK_SUCCESS && timestamps[1] > timestamps[0]) {
+                    uint64_t delta = timestamps[1] - timestamps[0];
+                    double seconds = static_cast<double>(delta) * static_cast<double>(g_app.benchTimestampPeriod) / 1e9;
                     if (seconds > 0) {
                         double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
                         bandwidths.push_back(bw);
@@ -2347,16 +2845,14 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
                 } else {
                     failedBatches++;
                 }
-            } else {
-                Log("[ERROR] Failed to map query readback buffer in bandwidth test");
-                failedBatches++;
-            }
 
-            g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
+                g_app.progress = static_cast<float>(i + 1) / static_cast<float>(batches);
+            }
+            
+            vkDestroyQueryPool(g_app.benchDevice, queryPool, nullptr);
         }
     }
 
-    // Calculate results only if we have valid samples
     if (!bandwidths.empty()) {
         std::sort(bandwidths.begin(), bandwidths.end());
         result.minValue = bandwidths.front();
@@ -2371,14 +2867,14 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
         Log("[WARNING] No valid samples collected for " + name);
     }
 
-    // Explicit resource cleanup (ComPtr auto-releases, but this ensures immediate cleanup
-    // and prevents accumulation during multiple runs)
-    // Note: src and dst are passed in from caller, don't reset those
-    
     return result;
 }
 
-BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, int iterations) {
+// Transfer latency test - measures per-copy overhead on the transfer/copy queue.
+// Uses GPU timestamps with BOTTOM_OF_PIPE for both start and end to prevent
+// overlapping measurements. Each copy is individually timed within batches of 64.
+// D3D12 equivalent: EndQuery(TIMESTAMP) before/after each CopyResource on COPY queue.
+BenchmarkResult RunLatencyTest(const std::string& name, VkBufferAllocation& src, VkBufferAllocation& dst, int iterations) {
     g_app.currentTest = name;
     BenchmarkResult result;
     result.testName = name;
@@ -2391,89 +2887,75 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
         return result;
     }
 
-    // ────────────────────────────────────────────────────────────────
-    // Setup timestamp resources (create once per test)
-    // ────────────────────────────────────────────────────────────────
-    constexpr int QueriesPerBatch = 64;  // Adjust based on how many fit comfortably
-    int batches = (iterations + QueriesPerBatch - 1) / QueriesPerBatch;
+    constexpr int QueriesPerBatch = 64;
+    int batchCount = (iterations + QueriesPerBatch - 1) / QueriesPerBatch;
 
-    D3D12_QUERY_HEAP_DESC qhd = {};
-    qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    qhd.Count = QueriesPerBatch * 2;  // start + end per operation
-    ComPtr<ID3D12QueryHeap> queryHeap;
-    if (FAILED(g_app.benchDevice->CreateQueryHeap(&qhd, IID_PPV_ARGS(&queryHeap)))) {
-        Log("[ERROR] Failed to create timestamp query heap");
+    if (g_app.benchTimestampPeriod == 0) {
+        Log("[WARNING] GPU timestamps not supported - latency test requires timestamps");
         return result;
     }
 
-    // Large enough readback buffer for all timestamps in one go
-    size_t readbackSize = sizeof(UINT64) * QueriesPerBatch * 2;
-    auto readbackBuffer = CreateBuffer(D3D12_HEAP_TYPE_READBACK, readbackSize, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!readbackBuffer) {
-        Log("[ERROR] Failed to create readback buffer - aborting latency test");
-        return result;
-    }
-
-    UINT64 timestampFreq = 0;
-    HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-    if (FAILED(freqResult) || timestampFreq == 0) {
-        Log("[ERROR] Failed to get valid timestamp frequency");
+    VkQueryPoolCreateInfo queryPoolInfo = {};
+    queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryPoolInfo.queryCount = QueriesPerBatch * 2;
+    
+    VkQueryPool queryPool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(g_app.benchDevice, &queryPoolInfo, nullptr, &queryPool) != VK_SUCCESS) {
+        Log("[ERROR] Failed to create timestamp query pool");
         return result;
     }
 
     std::vector<double> latencies;
     latencies.reserve(iterations);
 
-    for (int b = 0; b < batches && !ShouldAbortBenchmark(); ++b) {
-        // Small sleep to reduce CPU spin
+    for (int b = 0; b < batchCount && !ShouldAbortBenchmark(); ++b) {
         if (b % 4 == 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         
-        int opsThisBatch = std::min(QueriesPerBatch, iterations - (int)latencies.size());
+        int opsThisBatch = std::min(QueriesPerBatch, iterations - static_cast<int>(latencies.size()));
 
-        g_app.benchAllocator->Reset();
-        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-
-        // Start timestamps for all operations in this batch
-        for (int i = 0; i < opsThisBatch; ++i) {
-            UINT queryIndex = i * 2;
-            g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryIndex);
-            g_app.benchList->CopyResource(dst.Get(), src.Get());  // The small copy we're measuring
-            g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryIndex + 1);
-        }
-
-        // Resolve all queries to readback buffer
-        g_app.benchList->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, opsThisBatch * 2, readbackBuffer.Get(), 0);
-        g_app.benchList->Close();
-
-        ID3D12CommandList* lists[] = { g_app.benchList.Get() };
-        g_app.benchQueue->ExecuteCommandLists(1, lists);
+        BeginBenchCommandBuffer();
         
-        FenceWaitResult fenceResult = WaitForBenchFenceEx();
-        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
-            break;
+        vkCmdResetQueryPool(g_app.benchCommandBuffer, queryPool, 0, opsThisBatch * 2);
+
+        for (int i = 0; i < opsThisBatch; ++i) {
+            uint32_t queryIndex = i * 2;
+            // BOTTOM_OF_PIPE for both timestamps = serialized measurement.
+            // D3D12 equivalent: EndQuery(TIMESTAMP) which also serializes.
+            vkCmdWriteTimestamp(g_app.benchCommandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, queryIndex);
+            
+            VkBufferCopy copyRegion = {};
+            copyRegion.size = src.size;
+            vkCmdCopyBuffer(g_app.benchCommandBuffer, src.buffer, dst.buffer, 1, &copyRegion);
+            
+            vkCmdWriteTimestamp(g_app.benchCommandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, queryIndex + 1);
         }
 
-        // Map and extract deltas
-        UINT64* timestamps = nullptr;
-        D3D12_RANGE readRange = { 0, readbackSize };
-        if (SUCCEEDED(readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
+        FenceWaitResult fenceResult = EndAndSubmitBenchCommandBuffer();
+        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) break;
+
+        // Read timestamps
+        std::vector<uint64_t> timestamps(opsThisBatch * 2);
+        VkResult qr = vkGetQueryPoolResults(g_app.benchDevice, queryPool, 0, opsThisBatch * 2,
+            timestamps.size() * sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        
+        if (qr == VK_SUCCESS) {
             for (int i = 0; i < opsThisBatch; ++i) {
-                UINT64 tStart = timestamps[i * 2 + 0];
-                UINT64 tEnd = timestamps[i * 2 + 1];
-                if (tEnd > tStart && timestampFreq > 0) {
-                    double deltaSec = static_cast<double>(tEnd - tStart) / static_cast<double>(timestampFreq);
+                uint64_t tStart = timestamps[i * 2 + 0];
+                uint64_t tEnd = timestamps[i * 2 + 1];
+                if (tEnd > tStart) {
+                    double deltaSec = static_cast<double>(tEnd - tStart) * static_cast<double>(g_app.benchTimestampPeriod) / 1e9;
                     double us = deltaSec * 1'000'000.0;
                     latencies.push_back(us);
                 }
             }
-            readbackBuffer->Unmap(0, nullptr);
         } else {
-            Log("[ERROR] Failed to map readback buffer");
+            Log("[ERROR] Failed to read query results");
         }
 
-        // Progress update (smooth over iterations)
         g_app.progress = static_cast<float>(latencies.size()) / static_cast<float>(iterations);
     }
 
@@ -2487,13 +2969,13 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
         Log("[WARNING] No valid latency samples collected for " + name);
     }
 
-    // Explicit resource cleanup
-    queryHeap.Reset();
-    readbackBuffer.Reset();
-
+    vkDestroyQueryPool(g_app.benchDevice, queryPool, nullptr);
     return result;
 }
 
+// Command latency test - measures minimum dispatch overhead on the transfer/copy queue.
+// Back-to-back timestamp pairs with no work between them.
+// D3D12 equivalent: consecutive EndQuery(TIMESTAMP) pairs on COPY queue.
 BenchmarkResult RunCommandLatencyTest(int iterations) {
     g_app.currentTest = "Command Latency";
     BenchmarkResult result;
@@ -2502,79 +2984,61 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
 
     if (iterations <= 0) return result;
 
+    if (g_app.benchTimestampPeriod == 0) {
+        Log("[WARNING] GPU timestamps not supported - command latency test requires timestamps");
+        return result;
+    }
+
     constexpr int QueriesPerBatch = 64;
-    int batches = (iterations + QueriesPerBatch - 1) / QueriesPerBatch;
+    int batchCount = (iterations + QueriesPerBatch - 1) / QueriesPerBatch;
 
-    D3D12_QUERY_HEAP_DESC qhd = {};
-    qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
-    qhd.Count = QueriesPerBatch * 2;
-    ComPtr<ID3D12QueryHeap> queryHeap;
-    if (FAILED(g_app.benchDevice->CreateQueryHeap(&qhd, IID_PPV_ARGS(&queryHeap)))) {
-        Log("[ERROR] Failed to create timestamp query heap for command latency");
-        return result;
-    }
-
-    size_t readbackSize = sizeof(UINT64) * QueriesPerBatch * 2;
-    auto readbackBuffer = CreateBuffer(D3D12_HEAP_TYPE_READBACK, readbackSize, D3D12_RESOURCE_STATE_COPY_DEST);
-    if (!readbackBuffer) {
-        Log("[ERROR] Failed to create readback buffer - aborting command latency test");
-        return result;
-    }
-
-    UINT64 timestampFreq = 0;
-    HRESULT freqResult = g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
-    if (FAILED(freqResult) || timestampFreq == 0) {
-        Log("[ERROR] Failed to get valid timestamp frequency");
+    VkQueryPoolCreateInfo queryPoolInfo = {};
+    queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryPoolInfo.queryCount = QueriesPerBatch * 2;
+    
+    VkQueryPool queryPool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(g_app.benchDevice, &queryPoolInfo, nullptr, &queryPool) != VK_SUCCESS) {
+        Log("[ERROR] Failed to create timestamp query pool for command latency");
         return result;
     }
 
     std::vector<double> latencies;
     latencies.reserve(iterations);
 
-    for (int b = 0; b < batches && !ShouldAbortBenchmark(); ++b) {
-        // Small sleep to reduce CPU spin
+    for (int b = 0; b < batchCount && !ShouldAbortBenchmark(); ++b) {
         if (b % 4 == 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         
         int opsThisBatch = std::min(QueriesPerBatch, iterations - static_cast<int>(latencies.size()));
 
-        g_app.benchAllocator->Reset();
-        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-
-        // Just measure timestamp pair - no actual work
-        for (int i = 0; i < opsThisBatch; ++i) {
-            UINT queryIndex = i * 2;
-            g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryIndex);
-            g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryIndex + 1);
-        }
-
-        g_app.benchList->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, opsThisBatch * 2, readbackBuffer.Get(), 0);
-        g_app.benchList->Close();
-
-        ID3D12CommandList* lists[] = { g_app.benchList.Get() };
-        g_app.benchQueue->ExecuteCommandLists(1, lists);
+        BeginBenchCommandBuffer();
         
-        FenceWaitResult fenceResult = WaitForBenchFenceEx();
-        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
-            break;
+        vkCmdResetQueryPool(g_app.benchCommandBuffer, queryPool, 0, opsThisBatch * 2);
+
+        for (int i = 0; i < opsThisBatch; ++i) {
+            uint32_t queryIndex = i * 2;
+            vkCmdWriteTimestamp(g_app.benchCommandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, queryIndex);
+            vkCmdWriteTimestamp(g_app.benchCommandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queryPool, queryIndex + 1);
         }
 
-        UINT64* timestamps = nullptr;
-        D3D12_RANGE readRange = { 0, readbackSize };
-        if (SUCCEEDED(readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
+        FenceWaitResult fenceResult = EndAndSubmitBenchCommandBuffer();
+        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) break;
+
+        std::vector<uint64_t> timestamps(opsThisBatch * 2);
+        VkResult qr = vkGetQueryPoolResults(g_app.benchDevice, queryPool, 0, opsThisBatch * 2,
+            timestamps.size() * sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        
+        if (qr == VK_SUCCESS) {
             for (int i = 0; i < opsThisBatch; ++i) {
-                UINT64 tStart = timestamps[i * 2 + 0];
-                UINT64 tEnd = timestamps[i * 2 + 1];
-                if (timestampFreq > 0) {
-                    double deltaSec = static_cast<double>(tEnd - tStart) / static_cast<double>(timestampFreq);
-                    double us = deltaSec * 1'000'000.0;
-                    latencies.push_back(us);
-                }
+                uint64_t tStart = timestamps[i * 2 + 0];
+                uint64_t tEnd = timestamps[i * 2 + 1];
+                double deltaSec = static_cast<double>(tEnd - tStart) * static_cast<double>(g_app.benchTimestampPeriod) / 1e9;
+                double us = deltaSec * 1'000'000.0;
+                latencies.push_back(us);
             }
-            readbackBuffer->Unmap(0, nullptr);
-        } else {
-            Log("[ERROR] Failed to map readback buffer in command latency");
         }
 
         g_app.progress = static_cast<float>(latencies.size()) / static_cast<float>(iterations);
@@ -2590,120 +3054,149 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
         Log("[WARNING] No valid command latency samples collected");
     }
 
-    // Explicit resource cleanup
-    queryHeap.Reset();
-    readbackBuffer.Reset();
-
+    vkDestroyQueryPool(g_app.benchDevice, queryPool, nullptr);
     return result;
 }
 
+// Bidirectional bandwidth test - measures full-duplex PCIe throughput.
+// Uses dual transfer/copy queues to submit uploads and downloads simultaneously,
+// allowing the GPU's separate upload and download DMA engines to operate in parallel.
+// CPU wall-clock timing measures total elapsed time; both directions counted.
+// Falls back to single-queue interleaved copies if dual queues unavailable.
+// D3D12 equivalent: 2 × COPY queues with simultaneous ExecuteCommandLists.
 BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
     g_app.currentTest = "Bidirectional " + FormatSize(size);
     BenchmarkResult result;
     result.testName = g_app.currentTest;
     result.unit = "GB/s";
 
-    auto cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
-    auto gpuDefault = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, size, D3D12_RESOURCE_STATE_COMMON);
-    auto gpuSrc = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, size, D3D12_RESOURCE_STATE_COMMON);
-    auto cpuReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto cpuUpload = CreateBuffer(VkBufferType::Upload, size);
+    auto gpuDefault = CreateBuffer(VkBufferType::DeviceLocal, size);
+    auto gpuSrc = CreateBuffer(VkBufferType::DeviceLocal, size);
+    auto cpuReadback = CreateBuffer(VkBufferType::Readback, size);
 
     if (!cpuUpload || !gpuDefault || !gpuSrc || !cpuReadback) {
         Log("[ERROR] Failed to create resources for bidirectional test - likely out of VRAM");
+        cpuUpload.Destroy(g_app.benchDevice);
+        gpuDefault.Destroy(g_app.benchDevice);
+        gpuSrc.Destroy(g_app.benchDevice);
+        cpuReadback.Destroy(g_app.benchDevice);
         return result;
     }
 
     std::vector<double> bandwidths;
     bandwidths.reserve(batches);
+    
+    // Warm-up pass - uses same queue topology as the actual test
+    if (g_app.hasDualQueues) {
+        VkBufferCopy copyRegion = {};
+        copyRegion.size = size;
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        
+        // Warm-up: upload on queue 1
+        vkResetCommandBuffer(g_app.benchCommandBuffer, 0);
+        vkBeginCommandBuffer(g_app.benchCommandBuffer, &beginInfo);
+        for (int j = 0; j < copies; ++j)
+            vkCmdCopyBuffer(g_app.benchCommandBuffer, cpuUpload.buffer, gpuDefault.buffer, 1, &copyRegion);
+        vkEndCommandBuffer(g_app.benchCommandBuffer);
+        
+        // Warm-up: download on queue 2
+        vkResetCommandBuffer(g_app.benchCommandBuffer2, 0);
+        vkBeginCommandBuffer(g_app.benchCommandBuffer2, &beginInfo);
+        for (int j = 0; j < copies; ++j)
+            vkCmdCopyBuffer(g_app.benchCommandBuffer2, gpuSrc.buffer, cpuReadback.buffer, 1, &copyRegion);
+        vkEndCommandBuffer(g_app.benchCommandBuffer2);
+        
+        VkSubmitInfo si1 = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si1.commandBufferCount = 1;
+        si1.pCommandBuffers = &g_app.benchCommandBuffer;
+        VkSubmitInfo si2 = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        si2.commandBufferCount = 1;
+        si2.pCommandBuffers = &g_app.benchCommandBuffer2;
+        
+        vkQueueSubmit(g_app.benchQueue, 1, &si1, g_app.benchFence);
+        vkQueueSubmit(g_app.benchQueue2, 1, &si2, g_app.benchFence2);
+        VkFence warmupFences[2] = { g_app.benchFence, g_app.benchFence2 };
+        vkWaitForFences(g_app.benchDevice, 2, warmupFences, VK_TRUE, UINT64_MAX);
+        vkResetFences(g_app.benchDevice, 2, warmupFences);
+    } else {
+        BeginBenchCommandBuffer();
+        VkBufferCopy copyRegion = {};
+        copyRegion.size = size;
+        for (int j = 0; j < copies; ++j) {
+            vkCmdCopyBuffer(g_app.benchCommandBuffer, cpuUpload.buffer, gpuDefault.buffer, 1, &copyRegion);
+            vkCmdCopyBuffer(g_app.benchCommandBuffer, gpuSrc.buffer, cpuReadback.buffer, 1, &copyRegion);
+        }
+        EndAndSubmitBenchCommandBuffer();
+    }
 
     if (g_app.hasDualQueues) {
         // ---- DUAL QUEUE PATH: true simultaneous upload + download ----
         // Queue 1 handles upload, Queue 2 handles download.
-        // Vulkan equivalent: 2 × dedicated transfer queues.
-        
-        // Warm-up pass using both queues
-        {
-            g_app.benchAllocator->Reset();
-            g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-            for (int j = 0; j < copies; ++j)
-                g_app.benchList->CopyResource(gpuDefault.Get(), cpuUpload.Get());
-            g_app.benchList->Close();
-            
-            g_app.benchAllocator2->Reset();
-            g_app.benchList2->Reset(g_app.benchAllocator2.Get(), nullptr);
-            for (int j = 0; j < copies; ++j)
-                g_app.benchList2->CopyResource(cpuReadback.Get(), gpuSrc.Get());
-            g_app.benchList2->Close();
-            
-            ID3D12CommandList* lists1[] = { g_app.benchList.Get() };
-            ID3D12CommandList* lists2[] = { g_app.benchList2.Get() };
-            g_app.benchQueue->ExecuteCommandLists(1, lists1);
-            g_app.benchQueue2->ExecuteCommandLists(1, lists2);
-            
-            // Signal and wait for both
-            g_app.benchQueue->Signal(g_app.benchFence.Get(), g_app.benchFenceValue);
-            g_app.benchQueue2->Signal(g_app.benchFence2.Get(), g_app.benchFenceValue2);
-            g_app.benchFence->SetEventOnCompletion(g_app.benchFenceValue, g_app.benchFenceEvent);
-            g_app.benchFence2->SetEventOnCompletion(g_app.benchFenceValue2, g_app.benchFenceEvent2);
-            HANDLE warmupEvents[2] = { g_app.benchFenceEvent, g_app.benchFenceEvent2 };
-            WaitForMultipleObjects(2, warmupEvents, TRUE, INFINITE);
-            g_app.benchFenceValue++;
-            g_app.benchFenceValue2++;
-        }
+        // D3D12 backport: 2 × COPY queues, one for upload, one for download.
         
         for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
             if (i % 8 == 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
             
-            // Record upload commands into command list 1
-            g_app.benchAllocator->Reset();
-            g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-            for (int j = 0; j < copies; ++j) {
-                g_app.benchList->CopyResource(gpuDefault.Get(), cpuUpload.Get());
-            }
-            g_app.benchList->Close();
+            VkBufferCopy copyRegion = {};
+            copyRegion.size = size;
             
-            // Record download commands into command list 2
-            g_app.benchAllocator2->Reset();
-            g_app.benchList2->Reset(g_app.benchAllocator2.Get(), nullptr);
+            // Record upload commands into command buffer 1
+            vkResetCommandBuffer(g_app.benchCommandBuffer, 0);
+            VkCommandBufferBeginInfo beginInfo = {};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(g_app.benchCommandBuffer, &beginInfo);
             for (int j = 0; j < copies; ++j) {
-                g_app.benchList2->CopyResource(cpuReadback.Get(), gpuSrc.Get());
+                vkCmdCopyBuffer(g_app.benchCommandBuffer, cpuUpload.buffer, gpuDefault.buffer, 1, &copyRegion);
             }
-            g_app.benchList2->Close();
+            vkEndCommandBuffer(g_app.benchCommandBuffer);
             
-            ID3D12CommandList* lists1[] = { g_app.benchList.Get() };
-            ID3D12CommandList* lists2[] = { g_app.benchList2.Get() };
+            // Record download commands into command buffer 2
+            vkResetCommandBuffer(g_app.benchCommandBuffer2, 0);
+            vkBeginCommandBuffer(g_app.benchCommandBuffer2, &beginInfo);
+            for (int j = 0; j < copies; ++j) {
+                vkCmdCopyBuffer(g_app.benchCommandBuffer2, gpuSrc.buffer, cpuReadback.buffer, 1, &copyRegion);
+            }
+            vkEndCommandBuffer(g_app.benchCommandBuffer2);
             
             // Submit both simultaneously to separate queues
+            VkSubmitInfo submitInfo1 = {};
+            submitInfo1.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo1.commandBufferCount = 1;
+            submitInfo1.pCommandBuffers = &g_app.benchCommandBuffer;
+            
+            VkSubmitInfo submitInfo2 = {};
+            submitInfo2.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo2.commandBufferCount = 1;
+            submitInfo2.pCommandBuffers = &g_app.benchCommandBuffer2;
+            
             auto startTime = std::chrono::high_resolution_clock::now();
             
-            g_app.benchQueue->ExecuteCommandLists(1, lists1);
-            g_app.benchQueue2->ExecuteCommandLists(1, lists2);
-            
-            // Signal both fences
-            g_app.benchQueue->Signal(g_app.benchFence.Get(), g_app.benchFenceValue);
-            g_app.benchQueue2->Signal(g_app.benchFence2.Get(), g_app.benchFenceValue2);
+            vkQueueSubmit(g_app.benchQueue, 1, &submitInfo1, g_app.benchFence);
+            vkQueueSubmit(g_app.benchQueue2, 1, &submitInfo2, g_app.benchFence2);
             
             // Wait for both to complete
-            g_app.benchFence->SetEventOnCompletion(g_app.benchFenceValue, g_app.benchFenceEvent);
-            g_app.benchFence2->SetEventOnCompletion(g_app.benchFenceValue2, g_app.benchFenceEvent2);
-            HANDLE events[2] = { g_app.benchFenceEvent, g_app.benchFenceEvent2 };
-            DWORD waitResult = WaitForMultipleObjects(2, events, TRUE, Constants::FENCE_WAIT_TIMEOUT_MS);
+            VkFence fences[2] = { g_app.benchFence, g_app.benchFence2 };
+            uint64_t timeout = static_cast<uint64_t>(Constants::FENCE_WAIT_TIMEOUT_MS) * 1000000ULL;
+            VkResult waitResult = vkWaitForFences(g_app.benchDevice, 2, fences, VK_TRUE, timeout);
             
             auto endTime = std::chrono::high_resolution_clock::now();
             
-            g_app.benchFenceValue++;
-            g_app.benchFenceValue2++;
+            vkResetFences(g_app.benchDevice, 2, fences);
             
-            if (waitResult == WAIT_TIMEOUT) {
+            if (waitResult == VK_TIMEOUT) {
                 g_app.fenceTimeoutCount++;
                 if (g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) {
                     g_app.benchmarkAborted = true;
                     break;
                 }
                 continue;
-            } else if (waitResult != WAIT_OBJECT_0) {
+            } else if (waitResult != VK_SUCCESS) {
                 break;
             }
             
@@ -2719,48 +3212,32 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
         }
     } else {
         // ---- SINGLE QUEUE FALLBACK: interleaved copies ----
-        
-        // Warm-up pass
-        {
-            g_app.benchAllocator->Reset();
-            g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-            for (int j = 0; j < copies; ++j) {
-                g_app.benchList->CopyResource(gpuDefault.Get(), cpuUpload.Get());
-                g_app.benchList->CopyResource(cpuReadback.Get(), gpuSrc.Get());
-            }
-            g_app.benchList->Close();
-            ID3D12CommandList* lists[] = { g_app.benchList.Get() };
-            g_app.benchQueue->ExecuteCommandLists(1, lists);
-            WaitForBenchFenceEx();
-        }
-        
         for (int i = 0; i < batches && !ShouldAbortBenchmark(); ++i) {
             if (i % 8 == 0) {
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
             }
             
-            g_app.benchAllocator->Reset();
-            g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-
+            BeginBenchCommandBuffer();
+            VkBufferCopy copyRegion = {};
+            copyRegion.size = size;
             for (int j = 0; j < copies; ++j) {
-                g_app.benchList->CopyResource(gpuDefault.Get(), cpuUpload.Get());
-                g_app.benchList->CopyResource(cpuReadback.Get(), gpuSrc.Get());
+                vkCmdCopyBuffer(g_app.benchCommandBuffer, cpuUpload.buffer, gpuDefault.buffer, 1, &copyRegion);
+                vkCmdCopyBuffer(g_app.benchCommandBuffer, gpuSrc.buffer, cpuReadback.buffer, 1, &copyRegion);
             }
-            g_app.benchList->Close();
+            vkEndCommandBuffer(g_app.benchCommandBuffer);
 
-            ID3D12CommandList* lists[] = { g_app.benchList.Get() };
-            
             auto startTime = std::chrono::high_resolution_clock::now();
             
-            g_app.benchQueue->ExecuteCommandLists(1, lists);
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &g_app.benchCommandBuffer;
+            vkQueueSubmit(g_app.benchQueue, 1, &submitInfo, g_app.benchFence);
             
             FenceWaitResult fenceResult = WaitForBenchFenceEx();
-            
             auto endTime = std::chrono::high_resolution_clock::now();
             
-            if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
-                break;
-            }
+            if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) break;
 
             double seconds = std::chrono::duration<double>(endTime - startTime).count();
             if (seconds > 0) {
@@ -2782,11 +3259,10 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
         Log("[WARNING] No valid bidirectional samples collected");
     }
 
-    // Explicit resource cleanup
-    cpuUpload.Reset();
-    gpuDefault.Reset();
-    gpuSrc.Reset();
-    cpuReadback.Reset();
+    cpuUpload.Destroy(g_app.benchDevice);
+    gpuDefault.Destroy(g_app.benchDevice);
+    gpuSrc.Destroy(g_app.benchDevice);
+    cpuReadback.Destroy(g_app.benchDevice);
 
     return result;
 }
@@ -2836,7 +3312,7 @@ std::vector<BenchmarkResult> AggregateResults(const std::vector<BenchmarkResult>
 // ============================================================================
 // VRAM SCANNING / TESTING
 // ============================================================================
-// This provides a vendor-agnostic way to detect VRAM errors using D3D12.
+// This provides a vendor-agnostic way to detect VRAM errors using Vulkan.
 // It's NOT a replacement for vendor tools like NVIDIA MATS, but can help
 // identify obvious VRAM issues before RMA or troubleshooting.
 
@@ -2966,50 +3442,46 @@ std::string FormatErrorAddress(size_t offset) {
     return oss.str();
 }
 
-// Run a single pattern test on a VRAM region
+
 bool RunVRAMPatternTest(VRAMTestPattern pattern, size_t regionSize, size_t regionOffset,
-                        ComPtr<ID3D12Resource> uploadBuffer, ComPtr<ID3D12Resource> gpuBuffer,
-                        ComPtr<ID3D12Resource> readbackBuffer, std::vector<VRAMError>& errors,
+                        VkBufferAllocation& uploadBuffer, VkBufferAllocation& gpuBuffer,
+                        VkBufferAllocation& readbackBuffer, std::vector<VRAMError>& errors,
                         size_t& totalErrors, int iteration = 0) {
     
     if (g_app.vramTestCancelRequested) return false;
     
-    // Ensure region size is aligned to 4 bytes (dword)
-    regionSize = regionSize & ~3ULL;  // Round down to multiple of 4
-    if (regionSize == 0) return true;  // Nothing to test
+    // Ensure region size is aligned to 4 bytes
+    regionSize = regionSize & ~3ULL;
+    if (regionSize == 0) return true;
     
     size_t dwordCount = regionSize / sizeof(uint32_t);
     
     // Map upload buffer and write pattern
     void* mappedData = nullptr;
-    D3D12_RANGE readRange = { 0, 0 };  // We're writing, not reading
-    if (FAILED(uploadBuffer->Map(0, &readRange, &mappedData))) {
+    VkResult mapResult = vkMapMemory(g_app.benchDevice, uploadBuffer.memory, 0, regionSize, 0, &mappedData);
+    if (mapResult != VK_SUCCESS) {
         Log("[ERROR] Failed to map upload buffer for VRAM test");
         return false;
     }
     
-    // Check cancellation before long operation
     if (g_app.vramTestCancelRequested) {
-        uploadBuffer->Unmap(0, nullptr);
+        vkUnmapMemory(g_app.benchDevice, uploadBuffer.memory);
         return false;
     }
     
     uint32_t* uploadData = static_cast<uint32_t*>(mappedData);
     GenerateTestPattern(pattern, uploadData, dwordCount, iteration);
     
-    D3D12_RANGE writeRange = { 0, regionSize };
-    uploadBuffer->Unmap(0, &writeRange);
+    // Flush (if not host coherent, but our Upload type uses HOST_COHERENT)
+    vkUnmapMemory(g_app.benchDevice, uploadBuffer.memory);
     
     // Copy pattern to GPU
-    g_app.benchAllocator->Reset();
-    g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
-    g_app.benchList->CopyResource(gpuBuffer.Get(), uploadBuffer.Get());
-    g_app.benchList->Close();
+    BeginBenchCommandBuffer();
+    VkBufferCopy copyRegion = {};
+    copyRegion.size = regionSize;
+    vkCmdCopyBuffer(g_app.benchCommandBuffer, uploadBuffer.buffer, gpuBuffer.buffer, 1, &copyRegion);
     
-    ID3D12CommandList* lists[] = { g_app.benchList.Get() };
-    g_app.benchQueue->ExecuteCommandLists(1, lists);
-    
-    FenceWaitResult result = WaitForBenchFenceEx();
+    FenceWaitResult result = EndAndSubmitBenchCommandBuffer();
     if (result != FenceWaitResult::Success) {
         Log("[ERROR] GPU fence wait failed during VRAM write");
         return false;
@@ -3017,30 +3489,40 @@ bool RunVRAMPatternTest(VRAMTestPattern pattern, size_t regionSize, size_t regio
     
     if (g_app.vramTestCancelRequested) return false;
     
-    // Copy back for verification (no transition barrier needed - buffer decays
-    // to COMMON between command list executions, and the fence wait above ensures
-    // the write completed before this new command list begins)
-    g_app.benchAllocator->Reset();
-    g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+    // Memory barrier and copy back
+    BeginBenchCommandBuffer();
     
-    g_app.benchList->CopyResource(readbackBuffer.Get(), gpuBuffer.Get());
+    VkMemoryBarrier memBarrier = {};
+    memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    memBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    memBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(g_app.benchCommandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &memBarrier, 0, nullptr, 0, nullptr);
     
-    g_app.benchList->Close();
-    g_app.benchQueue->ExecuteCommandLists(1, lists);
+    vkCmdCopyBuffer(g_app.benchCommandBuffer, gpuBuffer.buffer, readbackBuffer.buffer, 1, &copyRegion);
     
-    result = WaitForBenchFenceEx();
+    result = EndAndSubmitBenchCommandBuffer();
     if (result != FenceWaitResult::Success) {
         Log("[ERROR] GPU fence wait failed during VRAM read");
         return false;
     }
     
     // Map readback buffer and compare
-    D3D12_RANGE readbackRange = { 0, regionSize };
     void* readbackData = nullptr;
-    if (FAILED(readbackBuffer->Map(0, &readbackRange, &readbackData))) {
+    mapResult = vkMapMemory(g_app.benchDevice, readbackBuffer.memory, 0, regionSize, 0, &readbackData);
+    if (mapResult != VK_SUCCESS) {
         Log("[ERROR] Failed to map readback buffer for VRAM test");
         return false;
     }
+    
+    // Invalidate memory range for readback (if HOST_CACHED but not HOST_COHERENT)
+    VkMappedMemoryRange memRange = {};
+    memRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    memRange.memory = readbackBuffer.memory;
+    memRange.offset = 0;
+    memRange.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(g_app.benchDevice, 1, &memRange);
     
     // Regenerate expected pattern for comparison
     std::vector<uint32_t> expectedData(dwordCount);
@@ -3050,7 +3532,7 @@ bool RunVRAMPatternTest(VRAMTestPattern pattern, size_t regionSize, size_t regio
     const uint32_t* actualData = static_cast<const uint32_t*>(readbackData);
     CompareBuffers(expectedData.data(), actualData, dwordCount, pattern, errors, regionOffset, totalErrors);
     
-    readbackBuffer->Unmap(0, nullptr);
+    vkUnmapMemory(g_app.benchDevice, readbackBuffer.memory);
     
     return true;
 }
@@ -3062,21 +3544,18 @@ void VRAMTestThreadFunc() {
     Log("=== VRAM Scan Started ===");
     Log("GPU: " + g_app.gpuList[g_app.config.selectedGPU].name);
     Log("");
-    Log("DISCLAIMER: This is a basic VRAM integrity test using D3D12.");
+    Log("DISCLAIMER: This is a basic VRAM integrity test using Vulkan.");
     Log("It can detect obvious errors but is NOT a replacement for");
     Log("vendor-specific tools like NVIDIA MATS or AMD memory diagnostics.");
     Log("For chip-level diagnosis, use manufacturer tools.");
     Log("");
     
-    g_app.vramTestResult = {};  // Reset results
+    g_app.vramTestResult = {};
     g_app.vramTestProgress = 0.0f;
     
-    // Reset fence timeout counter for fresh start
     g_app.fenceTimeoutCount = 0;
     g_app.benchmarkAborted = false;
     
-    // Always reinitialize benchmark device for clean state
-    // (previous benchmarks may have left it in inconsistent state)
     CleanupBenchmarkDevice();
     if (!InitBenchmarkDevice(g_app.config.selectedGPU)) {
         Log("[ERROR] Failed to initialize benchmark device for VRAM test");
@@ -3085,12 +3564,8 @@ void VRAMTestThreadFunc() {
         return;
     }
     
-    // Calculate test size
-    // Default: 80% of VRAM (safe margin for driver/system use)
-    // Full scan: Try to find maximum allocatable, starting at 90%
     const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
     
-    // Calculate target test size based on percentage
     double targetPercent = g_app.vramTestFullScan ? 0.90 : Constants::VRAM_SAFETY_MARGIN;
     size_t targetTestSize = static_cast<size_t>(gpu.dedicatedVRAM * targetPercent);
     
@@ -3103,15 +3578,13 @@ void VRAMTestThreadFunc() {
     }
     Log("");
     
-    // Explanation for partial VRAM testing
     Log("NOTE: GPU drivers and OS reserve some VRAM for:");
     Log("  - Command buffers and page tables");
     Log("  - Desktop compositor (Windows DWM)");
-    Log("  - D3D12 runtime scratch space");
-    Log("We test as much as can be allocated via D3D12.");
+    Log("  - Vulkan runtime scratch space");
+    Log("We test as much as can be allocated via Vulkan.");
     Log("");
     
-    // Define test patterns
     std::vector<VRAMTestPattern> patterns = {
         VRAMTestPattern::AllZeros,
         VRAMTestPattern::AllOnes,
@@ -3121,21 +3594,16 @@ void VRAMTestThreadFunc() {
         VRAMTestPattern::Random
     };
     
-    // Marching patterns iterations
-    const int MARCH_ITERATIONS = 4;  // Reduced from 8 for speed in multi-chunk mode
+    const int MARCH_ITERATIONS = 4;
     
-    // Use manageable chunk sizes - large contiguous allocations often fail
-    // We'll cycle through multiple allocations to cover more physical VRAM
-    const size_t PREFERRED_CHUNK_SIZE = 512 * 1024 * 1024;  // 512 MB
-    const size_t MIN_CHUNK_SIZE = 128 * 1024 * 1024;        // 128 MB minimum
+    const size_t PREFERRED_CHUNK_SIZE = 512 * 1024 * 1024;
+    const size_t MIN_CHUNK_SIZE = 128 * 1024 * 1024;
     
-    // First, find the largest chunk size that works
     size_t chunkSize = PREFERRED_CHUNK_SIZE;
     
     Log("Finding optimal chunk size...");
     
     {
-        ComPtr<ID3D12Resource> testUpload, testGpu, testReadback;
         while (chunkSize >= MIN_CHUNK_SIZE) {
             if (g_app.vramTestCancelRequested) {
                 g_app.vramTestResult.cancelled = true;
@@ -3143,18 +3611,21 @@ void VRAMTestThreadFunc() {
                 return;
             }
             
-            testUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, chunkSize, D3D12_RESOURCE_STATE_GENERIC_READ);
-            testGpu = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, chunkSize, D3D12_RESOURCE_STATE_COMMON);
-            testReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, chunkSize, D3D12_RESOURCE_STATE_COPY_DEST);
+            auto testUpload = CreateBuffer(VkBufferType::Upload, chunkSize);
+            auto testGpu = CreateBuffer(VkBufferType::DeviceLocal, chunkSize);
+            auto testReadback = CreateBuffer(VkBufferType::Readback, chunkSize);
             
             if (testUpload && testGpu && testReadback) {
                 Log("Using " + FormatSize(chunkSize) + " chunk size");
+                testUpload.Destroy(g_app.benchDevice);
+                testGpu.Destroy(g_app.benchDevice);
+                testReadback.Destroy(g_app.benchDevice);
                 break;
             }
             
-            testUpload.Reset();
-            testGpu.Reset();
-            testReadback.Reset();
+            testUpload.Destroy(g_app.benchDevice);
+            testGpu.Destroy(g_app.benchDevice);
+            testReadback.Destroy(g_app.benchDevice);
             chunkSize /= 2;
         }
         
@@ -3165,12 +3636,10 @@ void VRAMTestThreadFunc() {
             g_app.vramTestRunning = false;
             return;
         }
-        // Release test buffers - we'll allocate fresh ones in the loop
     }
     
-    // Calculate number of chunks to test
     size_t numChunks = (targetTestSize + chunkSize - 1) / chunkSize;
-    size_t patternsPerChunk = patterns.size() + 2;  // Basic patterns + marching ones + marching zeros
+    size_t patternsPerChunk = patterns.size() + 2;
     size_t totalSteps = numChunks * patternsPerChunk;
     size_t completedSteps = 0;
     
@@ -3190,8 +3659,6 @@ void VRAMTestThreadFunc() {
     bool hadCriticalFailure = false;
     size_t totalBytesTested = 0;
     
-    // ========== MULTI-CHUNK TESTING LOOP ==========
-    // Allocate fresh buffers for each chunk to potentially hit different physical VRAM regions
     for (size_t chunkNum = 0; chunkNum < numChunks && !g_app.vramTestCancelRequested && !hadCriticalFailure; ++chunkNum) {
         size_t chunkOffset = chunkNum * chunkSize;
         size_t thisChunkSize = std::min(chunkSize, targetTestSize - chunkOffset);
@@ -3199,20 +3666,21 @@ void VRAMTestThreadFunc() {
         Log("=== Chunk " + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + 
             " (" + FormatSize(thisChunkSize) + " at logical offset " + FormatSize(chunkOffset) + ") ===");
         
-        // Allocate fresh buffers for this chunk
-        ComPtr<ID3D12Resource> uploadBuffer = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, thisChunkSize, D3D12_RESOURCE_STATE_GENERIC_READ);
-        ComPtr<ID3D12Resource> gpuBuffer = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, thisChunkSize, D3D12_RESOURCE_STATE_COMMON);
-        ComPtr<ID3D12Resource> readbackBuffer = CreateBuffer(D3D12_HEAP_TYPE_READBACK, thisChunkSize, D3D12_RESOURCE_STATE_COPY_DEST);
+        auto uploadBuffer = CreateBuffer(VkBufferType::Upload, thisChunkSize);
+        auto gpuBuffer = CreateBuffer(VkBufferType::DeviceLocal, thisChunkSize);
+        auto readbackBuffer = CreateBuffer(VkBufferType::Readback, thisChunkSize);
         
         if (!uploadBuffer || !gpuBuffer || !readbackBuffer) {
             Log("[WARNING] Failed to allocate buffers for chunk " + std::to_string(chunkNum + 1) + " - stopping");
+            uploadBuffer.Destroy(g_app.benchDevice);
+            gpuBuffer.Destroy(g_app.benchDevice);
+            readbackBuffer.Destroy(g_app.benchDevice);
             break;
         }
         
         size_t chunkErrors = 0;
         bool chunkFailed = false;
         
-        // Run basic patterns on this chunk
         for (const auto& pattern : patterns) {
             if (g_app.vramTestCancelRequested || chunkFailed) break;
             
@@ -3235,7 +3703,7 @@ void VRAMTestThreadFunc() {
             chunkErrors += patternErrors;
         }
         
-        // Run marching ones (condensed - 4 iterations per chunk)
+        // Run marching patterns
         if (!g_app.vramTestCancelRequested && !chunkFailed) {
             g_app.vramTestCurrentPattern = "Marching [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
             g_app.fenceTimeoutCount = 0;
@@ -3263,12 +3731,10 @@ void VRAMTestThreadFunc() {
             }
         }
         
-        // Release buffers to free VRAM for next chunk allocation
-        uploadBuffer.Reset();
-        gpuBuffer.Reset();
-        readbackBuffer.Reset();
+        uploadBuffer.Destroy(g_app.benchDevice);
+        gpuBuffer.Destroy(g_app.benchDevice);
+        readbackBuffer.Destroy(g_app.benchDevice);
         
-        // Record chunk results
         if (!chunkFailed) {
             totalBytesTested += thisChunkSize;
         }
@@ -3282,17 +3748,14 @@ void VRAMTestThreadFunc() {
             hadCriticalFailure = true;
         }
         
-        // Update progress
         completedSteps += patternsPerChunk;
         g_app.vramTestProgress = static_cast<float>(completedSteps) / static_cast<float>(totalSteps);
         
-        // Brief pause between chunks to let GPU settle
         if (chunkNum < numChunks - 1 && !g_app.vramTestCancelRequested) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
     
-    // Store pattern results summary
     double coveragePercent = (static_cast<double>(totalBytesTested) / gpu.dedicatedVRAM) * 100.0;
     snprintf(percentBuf, sizeof(percentBuf), "%.1f%%", coveragePercent);
     g_app.vramTestResult.patternResults.push_back(
@@ -3301,7 +3764,6 @@ void VRAMTestThreadFunc() {
     auto endTime = std::chrono::steady_clock::now();
     double duration = std::chrono::duration<double>(endTime - startTime).count();
     
-    // Generate summary
     g_app.vramTestResult.completed = !g_app.vramTestCancelRequested;
     g_app.vramTestResult.cancelled = g_app.vramTestCancelRequested;
     g_app.vramTestResult.totalBytesTested = totalBytesTested;
@@ -3325,7 +3787,6 @@ void VRAMTestThreadFunc() {
         Log("Result: FAIL - " + std::to_string(totalErrors) + " total errors detected!");
         g_app.vramTestResult.summary = "FAIL - " + std::to_string(totalErrors) + " errors in " + FormatSize(totalBytesTested);
         
-        // Log error clusters
         Log("");
         Log("Error Regions:");
         for (const auto& err : g_app.vramTestResult.errors) {
@@ -3345,7 +3806,6 @@ void VRAMTestThreadFunc() {
     
     Log("");
     
-    // Cleanup benchmark device to leave in clean state for next benchmark
     CleanupBenchmarkDevice();
     
     g_app.vramTestRunning = false;
@@ -3362,7 +3822,6 @@ void BenchmarkThreadFunc() {
     Log("=== Benchmark Started ===");
     Log("GPU: " + g_app.gpuList[g_app.config.selectedGPU].name);
     
-    // Log GPU type and measurement method
     bool isIntegratedGPU = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
     if (isIntegratedGPU) {
         Log("GPU Type: Integrated (using GPU timestamps for upload measurement)");
@@ -3370,12 +3829,10 @@ void BenchmarkThreadFunc() {
         Log("GPU Type: Discrete (using round-trip method for accurate upload measurement)");
     }
     
-    // Detect and log system memory info (helps diagnose RAM-related bottlenecks)
     g_app.systemMemory = DetectSystemMemory();
     if (g_app.systemMemory.detected) {
         Log(FormatSystemMemoryInfo(g_app.systemMemory));
         
-        // Warn if RAM speed seems low relative to capability
         if (g_app.systemMemory.configuredSpeedMT > 0 && 
             g_app.systemMemory.speedMT > 0 &&
             g_app.systemMemory.configuredSpeedMT < g_app.systemMemory.speedMT * 0.85) {
@@ -3384,7 +3841,6 @@ void BenchmarkThreadFunc() {
                 " MT/s) - XMP/EXPO may not be enabled");
         }
         
-        // Warn about single-channel config
         if (g_app.systemMemory.channels == 1) {
             Log("[WARNING] Single-channel RAM detected - this may bottleneck PCIe bandwidth");
         }
@@ -3392,7 +3848,6 @@ void BenchmarkThreadFunc() {
         Log("[INFO] System memory detection: " + g_app.systemMemory.errorMessage);
     }
     
-    // Validate and potentially cap bandwidth size based on VRAM
     size_t originalSize = g_app.config.bandwidthSize;
     g_app.config.bandwidthSize = ValidateBandwidthSize(originalSize, g_app.config.selectedGPU);
     
@@ -3414,31 +3869,30 @@ void BenchmarkThreadFunc() {
     }
     
     // Log measurement methodology for reproducibility
-    // These details map to Vulkan equivalents:
-    //   DIRECT queue → dedicated transfer queue family (driver routes to DMA)
-    //   EndQuery(TIMESTAMP) → vkCmdWriteTimestamp(BOTTOM_OF_PIPE)
-    //   CPU round-trip → identical logic
-    std::string bidirMethod = g_app.hasDualQueues ? "dual queues" : "single queue interleaved";
+    // These details map directly to D3D12 equivalents for backporting:
+    //   Transfer queue → D3D12_COMMAND_LIST_TYPE_COPY
+    //   GPU timestamps  → EndQuery(TIMESTAMP) on COPY queue
+    //   CPU round-trip  → identical logic on COPY queue
     if (isIntegratedGPU) {
-        Log("[METHOD] Upload: GPU timestamps, Download: GPU timestamps, Bidirectional: " + bidirMethod);
+        Log("[METHOD] Upload: GPU timestamps, Download: GPU timestamps, Bidirectional: " +
+            std::string(g_app.hasDualQueues ? "dual copy queues" : "single queue interleaved"));
     } else {
-        Log("[METHOD] Upload: CPU round-trip, Download: GPU timestamps, Bidirectional: " + bidirMethod);
+        Log("[METHOD] Upload: CPU round-trip, Download: GPU timestamps, Bidirectional: " +
+            std::string(g_app.hasDualQueues ? "dual copy queues" : "single queue interleaved"));
     }
 
     std::vector<BenchmarkResult> allResults;
     int successfulRuns = 0;
 
-    // Calculate total tests
     int testsPerRun = 2;  // Upload + Download
     if (g_app.config.runBidirectional) testsPerRun++;
-    if (g_app.config.runLatency) testsPerRun += 3;  // Upload latency, Download latency, Command latency
+    if (g_app.config.runLatency) testsPerRun += 3;
     g_app.totalTests = testsPerRun * g_app.config.numRuns;
 
     double avgUpload = 0, avgDownload = 0;
-    double maxUpload = 0, maxDownload = 0;  // Track best (max) values for individual mode
+    double maxUpload = 0, maxDownload = 0;
     int uploadCount = 0, downloadCount = 0;
     
-    // Suffix for individual run recording
     auto getRunSuffix = [](int run, bool useAverage) -> std::string {
         return useAverage ? "" : " Run " + std::to_string(run);
     };
@@ -3450,25 +3904,21 @@ void BenchmarkThreadFunc() {
         bool runHadCriticalFailure = false;
         std::string runSuffix = getRunSuffix(run, g_app.config.averageRuns);
         
-        // Determine measurement method based on GPU type:
-        // - Integrated GPUs: Use GPU timestamps (accurate, no ReBAR issue since they share system RAM)
-        // - Discrete GPUs: Use round-trip method (needed to defeat ReBAR measurement artifacts)
         bool isIntegrated = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
-        bool useRoundTrip = !isIntegrated;  // Round-trip for discrete, timestamps for integrated
+        bool useRoundTrip = !isIntegrated;
         
-        // ============================================================
-        // DOWNLOAD TEST FIRST (GPU to CPU)
-        // We need this measurement to accurately calculate upload speed
-        // ============================================================
+        // DOWNLOAD TEST FIRST
         double currentDownloadSpeed = 0.0;
         
-        auto gpuSrc = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COMMON);
-        auto cpuReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COPY_DEST);
+        auto gpuSrc = CreateBuffer(VkBufferType::DeviceLocal, g_app.config.bandwidthSize);
+        auto cpuReadback = CreateBuffer(VkBufferType::Readback, g_app.config.bandwidthSize);
         
         if (!gpuSrc || !cpuReadback) {
             Log("[CRITICAL] Failed to allocate download buffers - skipping download test");
             g_app.completedTests++;
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
+            gpuSrc.Destroy(g_app.benchDevice);
+            cpuReadback.Destroy(g_app.benchDevice);
         } else {
             auto resDownload = RunBandwidthTest("GPU->CPU " + FormatSize(g_app.config.bandwidthSize) + runSuffix,
                 gpuSrc, cpuReadback,
@@ -3481,11 +3931,14 @@ void BenchmarkThreadFunc() {
                 avgDownload += resDownload.avgValue;
                 maxDownload = std::max(maxDownload, resDownload.maxValue);
                 downloadCount++;
-                currentDownloadSpeed = resDownload.avgValue;  // Store for upload calculation
+                currentDownloadSpeed = resDownload.avgValue;
                 Log("  GPU->CPU: " + std::to_string(resDownload.avgValue).substr(0, 5) + " GB/s");
             } else {
                 Log("[WARNING] Download test produced no valid samples");
             }
+            
+            gpuSrc.Destroy(g_app.benchDevice);
+            cpuReadback.Destroy(g_app.benchDevice);
             
             g_app.completedTests++;
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
@@ -3493,25 +3946,23 @@ void BenchmarkThreadFunc() {
         
         if (ShouldAbortBenchmark()) break;
         
-        // ============================================================
-        // UPLOAD TEST (CPU to GPU)
-        // Uses measured download speed for accurate calculation
-        // ============================================================
-        auto cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_GENERIC_READ);
+        // UPLOAD TEST
+        auto cpuUpload = CreateBuffer(VkBufferType::Upload, g_app.config.bandwidthSize);
         if (!cpuUpload) {
             Log("[CRITICAL] Failed to allocate upload buffer - aborting run");
             runHadCriticalFailure = true;
         }
         
-        auto gpuDefault = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.bandwidthSize, D3D12_RESOURCE_STATE_COMMON);
+        auto gpuDefault = CreateBuffer(VkBufferType::DeviceLocal, g_app.config.bandwidthSize);
         if (!gpuDefault) {
             Log("[CRITICAL] Failed to allocate GPU default buffer - aborting run");
             runHadCriticalFailure = true;
         }
         
         if (runHadCriticalFailure) {
-            // Skip the rest of this run if we can't allocate critical buffers
-            g_app.completedTests += (testsPerRun - 1);  // Already counted download
+            cpuUpload.Destroy(g_app.benchDevice);
+            gpuDefault.Destroy(g_app.benchDevice);
+            g_app.completedTests += (testsPerRun - 1);
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
             continue;
         }
@@ -3521,8 +3972,8 @@ void BenchmarkThreadFunc() {
             g_app.config.bandwidthSize,
             g_app.config.copiesPerBatch,
             g_app.config.bandwidthBatches,
-            useRoundTrip,           // Round-trip for discrete GPUs (ReBAR fix), timestamps for integrated
-            currentDownloadSpeed);  // Pass measured download speed for accurate upload calculation
+            useRoundTrip,
+            currentDownloadSpeed);
         
         if (!resUpload.samples.empty()) {
             allResults.push_back(resUpload);
@@ -3533,6 +3984,9 @@ void BenchmarkThreadFunc() {
         } else {
             Log("[WARNING] Upload test produced no valid samples");
         }
+        
+        cpuUpload.Destroy(g_app.benchDevice);
+        gpuDefault.Destroy(g_app.benchDevice);
         
         g_app.completedTests++;
         g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
@@ -3553,14 +4007,18 @@ void BenchmarkThreadFunc() {
 
         // Latency tests
         if (g_app.config.runLatency) {
-            auto latCpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, g_app.config.latencySize, D3D12_RESOURCE_STATE_GENERIC_READ);
-            auto latGpuDefault = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.latencySize, D3D12_RESOURCE_STATE_COMMON);
-            auto latGpuSrc = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, g_app.config.latencySize, D3D12_RESOURCE_STATE_COMMON);
-            auto latCpuReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, g_app.config.latencySize, D3D12_RESOURCE_STATE_COPY_DEST);
+            auto latCpuUpload = CreateBuffer(VkBufferType::Upload, g_app.config.latencySize);
+            auto latGpuDefault = CreateBuffer(VkBufferType::DeviceLocal, g_app.config.latencySize);
+            auto latGpuSrc = CreateBuffer(VkBufferType::DeviceLocal, g_app.config.latencySize);
+            auto latCpuReadback = CreateBuffer(VkBufferType::Readback, g_app.config.latencySize);
 
             if (!latCpuUpload || !latGpuDefault || !latGpuSrc || !latCpuReadback) {
                 Log("[CRITICAL] Failed to allocate latency buffers - skipping latency tests");
-                g_app.completedTests += 3;  // Skip all 3 latency tests
+                latCpuUpload.Destroy(g_app.benchDevice);
+                latGpuDefault.Destroy(g_app.benchDevice);
+                latGpuSrc.Destroy(g_app.benchDevice);
+                latCpuReadback.Destroy(g_app.benchDevice);
+                g_app.completedTests += 3;
                 g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
                 continue;
             }
@@ -3571,9 +4029,14 @@ void BenchmarkThreadFunc() {
             RunLatencyTest("Warm-up Download", latGpuSrc, latCpuReadback, Constants::LATENCY_WARMUP_ITERATIONS);
             RunCommandLatencyTest(Constants::LATENCY_WARMUP_ITERATIONS);
 
-            if (ShouldAbortBenchmark()) break;
+            if (ShouldAbortBenchmark()) {
+                latCpuUpload.Destroy(g_app.benchDevice);
+                latGpuDefault.Destroy(g_app.benchDevice);
+                latGpuSrc.Destroy(g_app.benchDevice);
+                latCpuReadback.Destroy(g_app.benchDevice);
+                break;
+            }
 
-            // Real measurements
             auto resUpLat = RunLatencyTest("CPU->GPU Latency" + runSuffix, latCpuUpload, latGpuDefault, g_app.config.latencyIters);
             if (!resUpLat.samples.empty()) {
                 allResults.push_back(resUpLat);
@@ -3581,7 +4044,13 @@ void BenchmarkThreadFunc() {
             }
             g_app.completedTests++;
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-            if (ShouldAbortBenchmark()) break;
+            if (ShouldAbortBenchmark()) {
+                latCpuUpload.Destroy(g_app.benchDevice);
+                latGpuDefault.Destroy(g_app.benchDevice);
+                latGpuSrc.Destroy(g_app.benchDevice);
+                latCpuReadback.Destroy(g_app.benchDevice);
+                break;
+            }
 
             auto resDownLat = RunLatencyTest("GPU->CPU Latency" + runSuffix, latGpuSrc, latCpuReadback, g_app.config.latencyIters);
             if (!resDownLat.samples.empty()) {
@@ -3590,7 +4059,13 @@ void BenchmarkThreadFunc() {
             }
             g_app.completedTests++;
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
-            if (ShouldAbortBenchmark()) break;
+            if (ShouldAbortBenchmark()) {
+                latCpuUpload.Destroy(g_app.benchDevice);
+                latGpuDefault.Destroy(g_app.benchDevice);
+                latGpuSrc.Destroy(g_app.benchDevice);
+                latCpuReadback.Destroy(g_app.benchDevice);
+                break;
+            }
 
             auto resCmdLat = RunCommandLatencyTest(g_app.config.latencyIters);
             if (!resCmdLat.samples.empty()) {
@@ -3600,6 +4075,12 @@ void BenchmarkThreadFunc() {
             }
             g_app.completedTests++;
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
+            
+            latCpuUpload.Destroy(g_app.benchDevice);
+            latGpuDefault.Destroy(g_app.benchDevice);
+            latGpuSrc.Destroy(g_app.benchDevice);
+            latCpuReadback.Destroy(g_app.benchDevice);
+            
             if (ShouldAbortBenchmark()) break;
         }
         
@@ -5194,7 +5675,7 @@ void RenderGUI() {
             
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.7f, 0.7f, 1.0f));
             ImGui::TextWrapped(
-                "DISCLAIMER: This is a basic VRAM integrity test using D3D12. "
+                "DISCLAIMER: This is a basic VRAM integrity test using Vulkan. "
                 "Error addresses shown are logical offsets in the test buffer, "
                 "not physical VRAM addresses. For chip-level diagnosis and precise "
                 "fault location, use vendor-specific tools such as:"
@@ -5260,13 +5741,13 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v3.0 GUI Edition");
+        ImGui::Text("GPU-PCIe-Test v3.0 GUI Edition (Vulkan)");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
         ImGui::Text("Measures data transfer speeds between CPU and GPU.");
-        ImGui::Text("Graphics API: Direct3D 12");
-        ImGui::Text("Test Path: DIRECT queue (driver-routed DMA)");
+        ImGui::Text("Graphics API: Vulkan");
+        ImGui::Text("Test Path: Dedicated copy/transfer queue (DMA engine)");
         ImGui::Spacing();
         ImGui::Text("Features:");
         ImGui::BulletText("Upload/Download bandwidth tests");
@@ -5307,121 +5788,199 @@ void RenderGUI() {
 // ============================================================================
 
 void WaitForGPU() {
-    // Flush the queue by signaling a new value and waiting for it
-    g_app.currentFenceValue++;
-    g_app.commandQueue->Signal(g_app.fence.Get(), g_app.currentFenceValue);
-
-    if (g_app.fence->GetCompletedValue() < g_app.currentFenceValue) {
-        g_app.fence->SetEventOnCompletion(g_app.currentFenceValue, g_app.fenceEvent);
-        WaitForSingleObject(g_app.fenceEvent, INFINITE);
+    if (g_app.device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(g_app.device);
     }
 }
 
 void Render() {
-    UINT frameIdx = g_app.frameIndex;
+    uint32_t frameIdx = g_app.frameIndex;
 
-    // Wait for previous frame on this backbuffer
-    if (g_app.fence->GetCompletedValue() < g_app.fenceValues[frameIdx]) {
-        g_app.fence->SetEventOnCompletion(g_app.fenceValues[frameIdx], g_app.fenceEvent);
-        WaitForSingleObject(g_app.fenceEvent, INFINITE);
+    // Wait for this frame's fence
+    vkWaitForFences(g_app.device, 1, &g_app.inFlightFences[frameIdx], VK_TRUE, UINT64_MAX);
+
+    // Acquire next image
+    VkResult acquireResult = vkAcquireNextImageKHR(g_app.device, g_app.swapChain, UINT64_MAX,
+        g_app.imageAvailableSemaphores[frameIdx], VK_NULL_HANDLE, &g_app.imageIndex);
+    
+    if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
+        // Swapchain needs recreation
+        return;
     }
 
-    // Reset allocator and command list
-    g_app.commandAllocators[frameIdx]->Reset();
-    g_app.commandList->Reset(g_app.commandAllocators[frameIdx].Get(), nullptr);
+    vkResetFences(g_app.device, 1, &g_app.inFlightFences[frameIdx]);
 
-    // Transition to render target
-    D3D12_RESOURCE_BARRIER barrier = {};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = g_app.renderTargets[frameIdx].Get();
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    g_app.commandList->ResourceBarrier(1, &barrier);
+    // Record command buffer
+    VkCommandBuffer cmd = g_app.commandBuffers[frameIdx];
+    vkResetCommandBuffer(cmd, 0);
 
-    // Set viewport and scissor rect to match window size
-    D3D12_VIEWPORT viewport = {};
-    viewport.Width = (float)g_app.windowWidth;
-    viewport.Height = (float)g_app.windowHeight;
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    g_app.commandList->RSSetViewports(1, &viewport);
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
 
-    D3D12_RECT scissor = {};
-    scissor.right = g_app.windowWidth;
-    scissor.bottom = g_app.windowHeight;
-    g_app.commandList->RSSetScissorRects(1, &scissor);
+    // Begin render pass
+    VkClearValue clearColor = {};
+    clearColor.color = {{0.1f, 0.1f, 0.12f, 1.0f}};
 
-    // Clear
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_app.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    rtvHandle.ptr += frameIdx * g_app.rtvDescriptorSize;
-    float clearColor[] = { 0.1f, 0.1f, 0.12f, 1.0f };
-    g_app.commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-    g_app.commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+    VkRenderPassBeginInfo rpInfo = {};
+    rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpInfo.renderPass = g_app.renderPass;
+    rpInfo.framebuffer = g_app.swapChainFramebuffers[g_app.imageIndex];
+    rpInfo.renderArea.offset = {0, 0};
+    rpInfo.renderArea.extent = g_app.swapChainExtent;
+    rpInfo.clearValueCount = 1;
+    rpInfo.pClearValues = &clearColor;
+    vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Set viewport and scissor
+    VkViewport viewport = {};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = (float)g_app.swapChainExtent.width;
+    viewport.height = (float)g_app.swapChainExtent.height;
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+    VkRect2D scissor = {};
+    scissor.offset = {0, 0};
+    scissor.extent = g_app.swapChainExtent;
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
 
     // Render ImGui
-    ID3D12DescriptorHeap* heaps[] = { g_app.srvHeap.Get() };
-    g_app.commandList->SetDescriptorHeaps(1, heaps);
-    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), g_app.commandList.Get());
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
 
-    // Transition to present
-    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    g_app.commandList->ResourceBarrier(1, &barrier);
+    vkCmdEndRenderPass(cmd);
+    vkEndCommandBuffer(cmd);
 
-    g_app.commandList->Close();
+    // Submit
+    VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = &g_app.imageAvailableSemaphores[frameIdx];
+    submitInfo.pWaitDstStageMask = &waitStage;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &g_app.renderFinishedSemaphores[frameIdx];
 
-    // Execute
-    ID3D12CommandList* lists[] = { g_app.commandList.Get() };
-    g_app.commandQueue->ExecuteCommandLists(1, lists);
+    vkQueueSubmit(g_app.graphicsQueue, 1, &submitInfo, g_app.inFlightFences[frameIdx]);
 
     // Present
-    g_app.swapChain->Present(1, 0);
+    VkPresentInfoKHR presentInfo = {};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = &g_app.renderFinishedSemaphores[frameIdx];
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = &g_app.swapChain;
+    presentInfo.pImageIndices = &g_app.imageIndex;
 
-    // Signal fence with new value
-    g_app.currentFenceValue++;
-    g_app.commandQueue->Signal(g_app.fence.Get(), g_app.currentFenceValue);
-    g_app.fenceValues[frameIdx] = g_app.currentFenceValue;
+    VkResult presentResult = vkQueuePresentKHR(g_app.graphicsQueue, &presentInfo);
+    
+    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
+        // Will handle on next frame
+    }
 
-    g_app.frameIndex = g_app.swapChain->GetCurrentBackBufferIndex();
+    g_app.frameIndex = (g_app.frameIndex + 1) % Constants::NUM_FRAMES_IN_FLIGHT;
 }
 
 void ResizeSwapChain(int width, int height) {
     if (width <= 0 || height <= 0) return;
-    if (!g_app.swapChain) return;
+    if (g_app.device == VK_NULL_HANDLE) return;
 
     WaitForGPU();
 
-    // Release render targets
-    for (UINT i = 0; i < Constants::NUM_FRAMES_IN_FLIGHT; i++) {
-        g_app.renderTargets[i].Reset();
+    // Cleanup old swapchain resources
+    for (auto fb : g_app.swapChainFramebuffers) {
+        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(g_app.device, fb, nullptr);
+    }
+    g_app.swapChainFramebuffers.clear();
+
+    for (auto iv : g_app.swapChainImageViews) {
+        if (iv != VK_NULL_HANDLE) vkDestroyImageView(g_app.device, iv, nullptr);
+    }
+    g_app.swapChainImageViews.clear();
+
+    // Save old swapchain for reuse
+    VkSwapchainKHR oldSwapChain = g_app.swapChain;
+
+    // Get updated capabilities
+    VkSurfaceCapabilitiesKHR capabilities;
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_app.renderPhysicalDevice, g_app.surface, &capabilities);
+
+    VkExtent2D extent;
+    if (capabilities.currentExtent.width != UINT32_MAX) {
+        extent = capabilities.currentExtent;
+    } else {
+        extent.width = std::clamp((uint32_t)width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
+        extent.height = std::clamp((uint32_t)height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
+    }
+    g_app.swapChainExtent = extent;
+
+    uint32_t imageCount = std::max(capabilities.minImageCount, (uint32_t)Constants::NUM_FRAMES_IN_FLIGHT);
+    if (capabilities.maxImageCount > 0 && imageCount > capabilities.maxImageCount) {
+        imageCount = capabilities.maxImageCount;
     }
 
-    // Resize buffers with error checking
-    HRESULT hr = g_app.swapChain->ResizeBuffers(
-        Constants::NUM_FRAMES_IN_FLIGHT,
-        width, height,
-        DXGI_FORMAT_R8G8B8A8_UNORM,
-        0
-    );
+    // Create new swapchain
+    VkSwapchainCreateInfoKHR createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+    createInfo.surface = g_app.surface;
+    createInfo.minImageCount = imageCount;
+    createInfo.imageFormat = g_app.swapChainFormat;
+    createInfo.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    createInfo.imageExtent = extent;
+    createInfo.imageArrayLayers = 1;
+    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    createInfo.preTransform = capabilities.currentTransform;
+    createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    createInfo.clipped = VK_TRUE;
+    createInfo.oldSwapchain = oldSwapChain;
 
-    if (FAILED(hr)) {
-        Log("[ERROR] ResizeBuffers failed: HRESULT 0x" + std::to_string(static_cast<unsigned>(hr)));
+    VkResult result = vkCreateSwapchainKHR(g_app.device, &createInfo, nullptr, &g_app.swapChain);
+    
+    // Destroy old swapchain
+    if (oldSwapChain != VK_NULL_HANDLE) {
+        vkDestroySwapchainKHR(g_app.device, oldSwapChain, nullptr);
+    }
+    
+    if (result != VK_SUCCESS) {
+        Log("[ERROR] Failed to recreate swapchain: " + std::to_string((int)result));
         return;
     }
 
-    g_app.frameIndex = g_app.swapChain->GetCurrentBackBufferIndex();
+    // Get new swapchain images
+    uint32_t swapImageCount;
+    vkGetSwapchainImagesKHR(g_app.device, g_app.swapChain, &swapImageCount, nullptr);
+    g_app.swapChainImages.resize(swapImageCount);
+    vkGetSwapchainImagesKHR(g_app.device, g_app.swapChain, &swapImageCount, g_app.swapChainImages.data());
 
-    // Recreate RTVs
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_app.rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    for (UINT i = 0; i < Constants::NUM_FRAMES_IN_FLIGHT; i++) {
-        g_app.swapChain->GetBuffer(i, IID_PPV_ARGS(&g_app.renderTargets[i]));
-        g_app.device->CreateRenderTargetView(g_app.renderTargets[i].Get(), nullptr, rtvHandle);
-        rtvHandle.ptr += g_app.rtvDescriptorSize;
-        g_app.fenceValues[i] = 0;
+    // Recreate image views
+    g_app.swapChainImageViews.resize(swapImageCount);
+    for (uint32_t i = 0; i < swapImageCount; i++) {
+        VkImageViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = g_app.swapChainImages[i];
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = g_app.swapChainFormat;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+        vkCreateImageView(g_app.device, &viewInfo, nullptr, &g_app.swapChainImageViews[i]);
     }
+
+    // Recreate framebuffers
+    CreateFramebuffers();
 
     g_app.windowWidth = width;
     g_app.windowHeight = height;
+    g_app.frameIndex = 0;
 }
 
 // ============================================================================
@@ -5493,7 +6052,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.0 GUI",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.0 GUI (Vulkan)",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,
@@ -5509,19 +6068,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ShowWindow(g_app.hwnd, nCmdShow);
     UpdateWindow(g_app.hwnd);
 
-    // Initialize D3D12
-    if (!InitD3D12()) {
-        MessageBoxA(nullptr, "Failed to initialize D3D12", "Error", MB_OK | MB_ICONERROR);
+    // Initialize Vulkan
+    if (!InitVulkan()) {
+        MessageBoxA(nullptr, "Failed to initialize Vulkan. Please ensure Vulkan drivers are installed.", "Error", MB_OK | MB_ICONERROR);
         return 1;
     }
 
     // Enumerate GPUs
     EnumerateGPUs();
     
-    // Detect system memory early (needed for iGPU comparison and config display)
+    // Detect system memory early
     g_app.systemMemory = DetectSystemMemory();
 
-    // Prepare GPU combo (build once, not per frame)
+    // Prepare GPU combo
     g_app.gpuComboNames.clear();
     g_app.gpuComboPointers.clear();
     for (const auto& gpu : g_app.gpuList) {
@@ -5531,7 +6090,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 " (" + FormatMemory(gpu.dedicatedVRAM) +
                 (gpu.isIntegrated ? " iGPU" : "") + ")";
         } else {
-            label = gpu.name;  // "No GPU Found" message
+            label = gpu.name;
         }
         g_app.gpuComboNames.push_back(std::move(label));
         g_app.gpuComboPointers.push_back(g_app.gpuComboNames.back().c_str());
@@ -5549,7 +6108,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Initialize Win32 backend first to get DPI
     ImGui_ImplWin32_Init(g_app.hwnd);
 
-    // Get DPI scale and apply font scaling
+    // Get DPI scale
     float dpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(g_app.hwnd);
     io.FontGlobalScale = Constants::BASE_FONT_SCALE * dpiScale;
 
@@ -5566,16 +6125,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     style.Colors[ImGuiCol_TitleBg] = ImVec4(0.1f, 0.1f, 0.12f, 1.0f);
     style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.2f, 0.2f, 0.25f, 1.0f);
 
-    // Initialize DX12 backend
-    ImGui_ImplDX12_InitInfo init_info = {};
-    init_info.Device = g_app.device.Get();
-    init_info.CommandQueue = g_app.commandQueue.Get();
-    init_info.NumFramesInFlight = Constants::NUM_FRAMES_IN_FLIGHT;
-    init_info.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-    init_info.SrvDescriptorHeap = g_app.srvHeap.Get();
-    init_info.LegacySingleSrvCpuDescriptor = g_app.srvHeap->GetCPUDescriptorHandleForHeapStart();
-    init_info.LegacySingleSrvGpuDescriptor = g_app.srvHeap->GetGPUDescriptorHandleForHeapStart();
-    ImGui_ImplDX12_Init(&init_info);
+    // Initialize Vulkan ImGui backend
+    ImGui_ImplVulkan_InitInfo initInfo = {};
+    initInfo.Instance = g_app.instance;
+    initInfo.PhysicalDevice = g_app.renderPhysicalDevice;
+    initInfo.Device = g_app.device;
+    initInfo.QueueFamily = g_app.graphicsQueueFamily;
+    initInfo.Queue = g_app.graphicsQueue;
+    initInfo.DescriptorPool = g_app.imguiDescriptorPool;
+    initInfo.MinImageCount = Constants::NUM_FRAMES_IN_FLIGHT;
+    initInfo.ImageCount = static_cast<uint32_t>(g_app.swapChainImages.size());
+    initInfo.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+    initInfo.RenderPass = g_app.renderPass;
+    initInfo.Subpass = 0;
+    ImGui_ImplVulkan_Init(&initInfo);
 
     // Main loop
     MSG msg = {};
@@ -5586,7 +6149,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             continue;
         }
 
-        // Handle deferred resize (only after drag ends)
+        // Handle deferred resize
         if (g_app.pendingResize && !g_app.isResizing) {
             g_app.pendingResize = false;
             if (g_app.pendingWidth > 0 && g_app.pendingHeight > 0) {
@@ -5599,7 +6162,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
 
         // Start ImGui frame
-        ImGui_ImplDX12_NewFrame();
+        ImGui_ImplVulkan_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
@@ -5618,7 +6181,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     // Cleanup - request cancellation and wait for benchmark thread
     g_app.cancelRequested = true;
     if (g_app.benchmarkThread.joinable()) {
-        // Give the thread a moment to notice cancellation (max 5 seconds)
         bool threadStopped = false;
         for (int i = 0; i < 50 && g_app.benchmarkThreadRunning; ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -5628,8 +6190,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (threadStopped) {
             g_app.benchmarkThread.join();
         } else {
-            // Thread is hung - detach to allow clean exit
-            // (This leaks the thread but prevents app hang on exit)
             g_app.benchmarkThread.detach();
         }
     }
@@ -5652,12 +6212,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     
     WaitForGPU();
 
-    ImGui_ImplDX12_Shutdown();
+    // ImGui cleanup
+    ImGui_ImplVulkan_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImPlot::DestroyContext();
     ImGui::DestroyContext();
 
-    if (g_app.fenceEvent) CloseHandle(g_app.fenceEvent);
+    // Vulkan cleanup
+    for (int i = 0; i < Constants::NUM_FRAMES_IN_FLIGHT; i++) {
+        if (g_app.imageAvailableSemaphores[i] != VK_NULL_HANDLE) vkDestroySemaphore(g_app.device, g_app.imageAvailableSemaphores[i], nullptr);
+        if (g_app.renderFinishedSemaphores[i] != VK_NULL_HANDLE) vkDestroySemaphore(g_app.device, g_app.renderFinishedSemaphores[i], nullptr);
+        if (g_app.inFlightFences[i] != VK_NULL_HANDLE) vkDestroyFence(g_app.device, g_app.inFlightFences[i], nullptr);
+    }
+    
+    if (g_app.commandPool != VK_NULL_HANDLE) vkDestroyCommandPool(g_app.device, g_app.commandPool, nullptr);
+    if (g_app.imguiDescriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(g_app.device, g_app.imguiDescriptorPool, nullptr);
+    
+    for (auto fb : g_app.swapChainFramebuffers) {
+        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(g_app.device, fb, nullptr);
+    }
+    for (auto iv : g_app.swapChainImageViews) {
+        if (iv != VK_NULL_HANDLE) vkDestroyImageView(g_app.device, iv, nullptr);
+    }
+    
+    if (g_app.renderPass != VK_NULL_HANDLE) vkDestroyRenderPass(g_app.device, g_app.renderPass, nullptr);
+    if (g_app.swapChain != VK_NULL_HANDLE) vkDestroySwapchainKHR(g_app.device, g_app.swapChain, nullptr);
+    if (g_app.device != VK_NULL_HANDLE) vkDestroyDevice(g_app.device, nullptr);
+    if (g_app.surface != VK_NULL_HANDLE) vkDestroySurfaceKHR(g_app.instance, g_app.surface, nullptr);
+    if (g_app.instance != VK_NULL_HANDLE) vkDestroyInstance(g_app.instance, nullptr);
 
     DestroyWindow(g_app.hwnd);
     UnregisterClassW(L"GPUPCIeTestGUI", hInstance);
