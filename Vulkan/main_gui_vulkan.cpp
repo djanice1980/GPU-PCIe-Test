@@ -506,7 +506,7 @@ void Log(const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_app.logMutex);
     g_app.logLines.push_back(msg);
     // Keep last 500 lines
-    if (g_app.logLines.size() > 500) {
+    if (g_app.logLines.size() > 500u) {
         g_app.logLines.erase(g_app.logLines.begin());
     }
 }
@@ -741,16 +741,16 @@ SystemMemoryInfo DetectSystemMemory() {
         info.configuredSpeedMT = maxConfiguredSpeed * 2;
     }
     
-    info.totalSticks = stickCount;
+    info.totalSticks = static_cast<uint32_t>(stickCount);
     info.totalCapacityGB = totalCapacity / (1024 * 1024 * 1024);
     info.type = detectedType;
     info.formFactor = detectedFormFactor;
     
     // Estimate channels from unique bank labels or stick count
     // This is approximate - some systems report banks differently
-    if (uniqueBanks.size() >= 4) {
+    if (uniqueBanks.size() >= 4u) {
         info.channels = 4;  // Quad channel
-    } else if (uniqueBanks.size() >= 2 || stickCount >= 2) {
+    } else if (uniqueBanks.size() >= 2u || stickCount >= 2) {
         info.channels = 2;  // Dual channel (typical)
     } else {
         info.channels = 1;  // Single channel
@@ -3392,7 +3392,7 @@ void CompareBuffers(const uint32_t* expected, const uint32_t* actual, size_t cou
                    VRAMTestPattern pattern, std::vector<VRAMError>& errors,
                    size_t baseOffset, size_t& totalErrorCount) {
     
-    const size_t CLUSTER_THRESHOLD = 256;  // Merge errors within this range
+    const size_t CLUSTER_THRESHOLD = 256u;  // Merge errors within this range
     VRAMError currentCluster;
     bool inCluster = false;
     
@@ -3596,8 +3596,8 @@ void VRAMTestThreadFunc() {
     
     const int MARCH_ITERATIONS = 4;
     
-    const size_t PREFERRED_CHUNK_SIZE = 512 * 1024 * 1024;
-    const size_t MIN_CHUNK_SIZE = 128 * 1024 * 1024;
+    const size_t PREFERRED_CHUNK_SIZE = 512ull * 1024 * 1024;
+    const size_t MIN_CHUNK_SIZE = 128ull * 1024 * 1024;
     
     size_t chunkSize = PREFERRED_CHUNK_SIZE;
     
