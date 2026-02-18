@@ -2,15 +2,13 @@
 
 ## Project Overview
 Windows GPU/PCIe bandwidth, latency, and VRAM integrity benchmarking tool.
-C++17 with D3D12 (primary), Vulkan (alternative), and CUDA (reference) backends.
+C++17 with D3D12 (primary) and Vulkan (alternative) backends.
 GUI built with Dear ImGui (docking branch) + ImPlot.
 
 ## Build
 - Requires MSVC via Visual Studio 2019+ Developer Command Prompt
 - `build_gui.bat` - Main GUI build (auto-downloads ImGui/ImPlot from GitHub)
 - `Vulkan/build_vulkan.bat` - Vulkan GUI variant (needs VULKAN_SDK env var)
-- `Single EXE (Windows Only)/build.bat` - Console combined D3D12+Vulkan
-- `Original Multi EXE Build/build_final.bat` - Legacy 3-exe architecture
 - Compiler flags: `/O2 /MD /EHsc /std:c++17 /DUNICODE /D_UNICODE`
 - Links: d3d12.lib dxgi.lib setupapi.lib cfgmgr32.lib wbemuuid.lib ole32.lib oleaut32.lib
 
@@ -38,6 +36,5 @@ GUI built with Dear ImGui (docking branch) + ImPlot.
 
 ## Directories
 - `Vulkan/` - Vulkan GUI variant
-- `Single EXE (Windows Only)/` - Console combined build
-- `Original Multi EXE Build/` - Legacy launcher + separate D3D12/Vulkan exes
-- `NVIDIA_CUDA Only/` - Linux CUDA reference (bash build, not Windows)
+- `Legacy/Single EXE (Windows Only)/` - Console combined build (no longer developed)
+- `Legacy/Original Multi EXE Build/` - Launcher + separate D3D12/Vulkan exes (no longer developed)
