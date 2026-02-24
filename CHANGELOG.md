@@ -2,6 +2,17 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.0.2] - 2025-02-18
+
+### Fixed
+- **build_gui.bat missing linker libraries** - Added setupapi.lib, cfgmgr32.lib, wbemuuid.lib, ole32.lib, oleaut32.lib (was failing to link)
+- **build_gui.bat version banner** - Updated from v2.0 to v3.0
+
+### Changed
+- **`/W4 /WX` clean compilation** - Build script now enforces warning-free builds
+- **Magic numbers extracted to Constants namespace** - MAX_LOG_LINES, VRAM_CHUNK_PREFERRED, VRAM_CHUNK_MINIMUM, MAX_BANDWIDTH_BUFFER, EGPU_MAX_TREE_DEPTH, BENCHMARK_SLEEP_US
+- **Documentation updates** - Added portability notes, admin privilege note, updated directory structure
+
 ## [3.0] - 2025-02-04
 
 ### Added

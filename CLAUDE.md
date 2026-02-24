@@ -34,6 +34,11 @@ GUI built with Dear ImGui (docking branch) + ImPlot.
 - Unicode throughout: WideToUtf8(), Utf8ToWide() helpers
 - Versioned releases in commit messages (e.g., "v3.0.1: description")
 
+## Portability
+- Windows-specific APIs: SetupAPI (PCIe link), cfgmgr32 (device tree), WMI (system RAM)
+- Cross-platform would require abstracting HW detection behind a platform layer
+- D3D12 is Windows-only; Vulkan variant is closer to portable but still uses Win32 for HW detection
+
 ## Directories
 - `Vulkan/` - Vulkan GUI variant
 - `Legacy/Single EXE (Windows Only)/` - Console combined build (no longer developed)
