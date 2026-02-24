@@ -1757,7 +1757,7 @@ void EnumerateGPUs() {
         
         // Check GPU name for common integrated GPU indicators
         std::string nameLower = info.name;
-        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
+        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), [](char c) { return static_cast<char>(::tolower(static_cast<unsigned char>(c))); });
         if (nameLower.find("graphics") != std::string::npos && 
             (nameLower.find("intel") != std::string::npos || 
              nameLower.find("radeon(tm)") != std::string::npos ||

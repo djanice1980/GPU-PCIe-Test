@@ -21,29 +21,29 @@ if "%1"=="--clean" (
     if exist imgui rmdir /s /q imgui
 )
 
-REM Create imgui directory and download if needed
+REM Pin ImGui to v1.91.8-docking (must match ImPlot v0.16 compatibility)
 if not exist imgui (
-    echo [1/4] Downloading ImGui docking branch...
+    echo [1/4] Downloading ImGui v1.91.8-docking...
     mkdir imgui
-    
+
     echo      Downloading core files...
-    curl -sL -o imgui/imgui.h "https://raw.githubusercontent.com/ocornut/imgui/docking/imgui.h"
-    curl -sL -o imgui/imgui.cpp "https://raw.githubusercontent.com/ocornut/imgui/docking/imgui.cpp"
-    curl -sL -o imgui/imgui_draw.cpp "https://raw.githubusercontent.com/ocornut/imgui/docking/imgui_draw.cpp"
-    curl -sL -o imgui/imgui_tables.cpp "https://raw.githubusercontent.com/ocornut/imgui/docking/imgui_tables.cpp"
-    curl -sL -o imgui/imgui_widgets.cpp "https://raw.githubusercontent.com/ocornut/imgui/docking/imgui_widgets.cpp"
-    curl -sL -o imgui/imgui_internal.h "https://raw.githubusercontent.com/ocornut/imgui/docking/imgui_internal.h"
-    curl -sL -o imgui/imstb_rectpack.h "https://raw.githubusercontent.com/ocornut/imgui/docking/imstb_rectpack.h"
-    curl -sL -o imgui/imstb_textedit.h "https://raw.githubusercontent.com/ocornut/imgui/docking/imstb_textedit.h"
-    curl -sL -o imgui/imstb_truetype.h "https://raw.githubusercontent.com/ocornut/imgui/docking/imstb_truetype.h"
-    curl -sL -o imgui/imconfig.h "https://raw.githubusercontent.com/ocornut/imgui/docking/imconfig.h"
-    
+    curl -sL -o imgui/imgui.h "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imgui.h"
+    curl -sL -o imgui/imgui.cpp "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imgui.cpp"
+    curl -sL -o imgui/imgui_draw.cpp "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imgui_draw.cpp"
+    curl -sL -o imgui/imgui_tables.cpp "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imgui_tables.cpp"
+    curl -sL -o imgui/imgui_widgets.cpp "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imgui_widgets.cpp"
+    curl -sL -o imgui/imgui_internal.h "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imgui_internal.h"
+    curl -sL -o imgui/imstb_rectpack.h "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imstb_rectpack.h"
+    curl -sL -o imgui/imstb_textedit.h "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imstb_textedit.h"
+    curl -sL -o imgui/imstb_truetype.h "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imstb_truetype.h"
+    curl -sL -o imgui/imconfig.h "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/imconfig.h"
+
     echo      Downloading backends...
-    curl -sL -o imgui/imgui_impl_win32.h "https://raw.githubusercontent.com/ocornut/imgui/docking/backends/imgui_impl_win32.h"
-    curl -sL -o imgui/imgui_impl_win32.cpp "https://raw.githubusercontent.com/ocornut/imgui/docking/backends/imgui_impl_win32.cpp"
-    curl -sL -o imgui/imgui_impl_dx12.h "https://raw.githubusercontent.com/ocornut/imgui/docking/backends/imgui_impl_dx12.h"
-    curl -sL -o imgui/imgui_impl_dx12.cpp "https://raw.githubusercontent.com/ocornut/imgui/docking/backends/imgui_impl_dx12.cpp"
-    
+    curl -sL -o imgui/imgui_impl_win32.h "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/backends/imgui_impl_win32.h"
+    curl -sL -o imgui/imgui_impl_win32.cpp "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/backends/imgui_impl_win32.cpp"
+    curl -sL -o imgui/imgui_impl_dx12.h "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/backends/imgui_impl_dx12.h"
+    curl -sL -o imgui/imgui_impl_dx12.cpp "https://raw.githubusercontent.com/ocornut/imgui/v1.91.8-docking/backends/imgui_impl_dx12.cpp"
+
     echo      [OK] ImGui downloaded
 ) else (
     echo [1/4] ImGui already present
