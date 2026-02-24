@@ -49,15 +49,15 @@ if not exist imgui (
     echo [1/4] ImGui already present
 )
 
-REM Download ImPlot - use master branch for compatibility with docking ImGui
+REM Download ImPlot v0.16 - pinned version compatible with our API usage
 if not exist imgui\implot.h (
-    echo [2/4] Downloading ImPlot master branch...
-    
-    curl -sL -o imgui/implot.h "https://raw.githubusercontent.com/epezent/implot/master/implot.h"
-    curl -sL -o imgui/implot.cpp "https://raw.githubusercontent.com/epezent/implot/master/implot.cpp"
-    curl -sL -o imgui/implot_internal.h "https://raw.githubusercontent.com/epezent/implot/master/implot_internal.h"
-    curl -sL -o imgui/implot_items.cpp "https://raw.githubusercontent.com/epezent/implot/master/implot_items.cpp"
-    
+    echo [2/4] Downloading ImPlot v0.16...
+
+    curl -sL -o imgui/implot.h "https://raw.githubusercontent.com/epezent/implot/v0.16/implot.h"
+    curl -sL -o imgui/implot.cpp "https://raw.githubusercontent.com/epezent/implot/v0.16/implot.cpp"
+    curl -sL -o imgui/implot_internal.h "https://raw.githubusercontent.com/epezent/implot/v0.16/implot_internal.h"
+    curl -sL -o imgui/implot_items.cpp "https://raw.githubusercontent.com/epezent/implot/v0.16/implot_items.cpp"
+
     echo      [OK] ImPlot downloaded
 ) else (
     echo [2/4] ImPlot already present
