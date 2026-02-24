@@ -186,6 +186,22 @@ namespace Constants {
     constexpr double EGPU_BANDWIDTH_THRESHOLD = 5.0;
     constexpr double TB3_MAX_BANDWIDTH = 3.5;
     constexpr double TB4_MAX_BANDWIDTH = 4.5;
+
+    // Log and UI limits
+    constexpr int MAX_LOG_LINES = 500;
+
+    // VRAM scanning chunk sizes
+    constexpr size_t VRAM_CHUNK_PREFERRED = 512ull * 1024 * 1024;  // 512 MB per chunk
+    constexpr size_t VRAM_CHUNK_MINIMUM = 128ull * 1024 * 1024;    // 128 MB minimum viable
+
+    // Maximum bandwidth test buffer (2 GB)
+    constexpr size_t MAX_BANDWIDTH_BUFFER = 2ull * 1024 * 1024 * 1024;
+
+    // eGPU device tree traversal depth
+    constexpr int EGPU_MAX_TREE_DEPTH = 15;
+
+    // Inter-batch sleep to avoid starving other work (microseconds)
+    constexpr int BENCHMARK_SLEEP_US = 50;
 }
 
 // ============================================================================
@@ -400,6 +416,9 @@ struct AppContext {
     VkDescriptorPool           imguiDescriptorPool = VK_NULL_HANDLE;
     uint32_t                   frameIndex = 0;
     uint32_t                   imageIndex = 0;
+#ifdef ENABLE_VULKAN_VALIDATION
+    VkDebugUtilsMessengerEXT   debugMessenger = VK_NULL_HANDLE;
+#endif
 
     // Vulkan Benchmark Device (separate device for benchmarking)
     VkPhysicalDevice           benchPhysicalDevice = VK_NULL_HANDLE;
@@ -505,8 +524,8 @@ static AppContext g_app;
 void Log(const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_app.logMutex);
     g_app.logLines.push_back(msg);
-    // Keep last 500 lines
-    if (g_app.logLines.size() > 500u) {
+    // Keep last N lines
+    if (g_app.logLines.size() > static_cast<size_t>(Constants::MAX_LOG_LINES)) {
         g_app.logLines.erase(g_app.logLines.begin());
     }
 }
@@ -1379,7 +1398,11 @@ std::string GetUSBControllerName(uint32_t vendorId, uint32_t deviceId) {
     return "USB Controller";
 }
 
-// Detect if a GPU is connected via Thunderbolt/USB4/USB by walking the device tree
+// Detect if a GPU is connected via Thunderbolt/USB4/USB by walking the device tree.
+// NOTE: Detection relies on Windows device naming conventions and hardcoded vendor/device IDs.
+// New Thunderbolt/USB generations may require adding new controller IDs to the lookup tables.
+// The bandwidth heuristic in ClassifyByBandwidth() serves as a fallback when string matching
+// doesn't identify the connection type.
 void DetectExternalConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPUInfo& outInfo) {
     outInfo.isThunderbolt = false;
     outInfo.isUSB4 = false;
@@ -1435,7 +1458,7 @@ void DetectExternalConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPUInf
     // Walk up the device tree looking for Thunderbolt/USB4/USB3 controllers
     DEVINST parentDevInst = gpuDevInst;
     int depth = 0;
-    const int maxDepth = 15;  // Go a bit further up for USB chains
+    const int maxDepth = Constants::EGPU_MAX_TREE_DEPTH;
     
     while (depth < maxDepth) {
         DEVINST nextParent;
@@ -1891,7 +1914,7 @@ size_t GetSafeMaxBandwidthSize(int gpuIndex) {
     size_t safeMax = static_cast<size_t>(availableVRAM * Constants::VRAM_SAFETY_MARGIN / 4);
     
     safeMax = std::max(safeMax, Constants::MIN_BANDWIDTH_SIZE);
-    safeMax = std::min(safeMax, 2ull * 1024 * 1024 * 1024);  // 2GB max
+    safeMax = std::min(safeMax, Constants::MAX_BANDWIDTH_BUFFER);
     
     return safeMax;
 }
@@ -2109,6 +2132,62 @@ void CleanupSwapChain() {
     }
 }
 
+// ============================================================================
+// VULKAN VALIDATION LAYERS (compile-time opt-in)
+// Enable with /DENABLE_VULKAN_VALIDATION compiler flag.
+// Requires Vulkan SDK with VK_LAYER_KHRONOS_validation installed.
+// ============================================================================
+#ifdef ENABLE_VULKAN_VALIDATION
+static VKAPI_ATTR VkBool32 VKAPI_CALL VulkanDebugCallback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
+    VkDebugUtilsMessageTypeFlagsEXT /*messageType*/,
+    const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
+    void* /*pUserData*/)
+{
+    const char* prefix = "[VULKAN]";
+    if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+        prefix = "[VULKAN ERROR]";
+    else if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
+        prefix = "[VULKAN WARN]";
+
+    Log(std::string(prefix) + " " + pCallbackData->pMessage);
+    return VK_FALSE;
+}
+
+static void SetupDebugMessenger(VkInstance instance, VkDebugUtilsMessengerEXT* pMessenger) {
+    auto createFunc = (PFN_vkCreateDebugUtilsMessengerEXT)
+        vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT");
+    if (!createFunc) {
+        Log("[VULKAN] Debug messenger extension not available");
+        return;
+    }
+
+    VkDebugUtilsMessengerCreateInfoEXT createInfo = {};
+    createInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+    createInfo.messageSeverity =
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    createInfo.messageType =
+        VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    createInfo.pfnUserCallback = VulkanDebugCallback;
+
+    if (createFunc(instance, &createInfo, nullptr, pMessenger) != VK_SUCCESS) {
+        Log("[VULKAN] Failed to set up debug messenger");
+    } else {
+        Log("[VULKAN] Validation layers enabled");
+    }
+}
+
+static void DestroyDebugMessenger(VkInstance instance, VkDebugUtilsMessengerEXT messenger) {
+    if (messenger == VK_NULL_HANDLE) return;
+    auto destroyFunc = (PFN_vkDestroyDebugUtilsMessengerEXT)
+        vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT");
+    if (destroyFunc) destroyFunc(instance, messenger, nullptr);
+}
+#endif // ENABLE_VULKAN_VALIDATION
+
 bool InitVulkan() {
     // Create Vulkan Instance
     VkApplicationInfo appInfo = {};
@@ -2119,6 +2198,22 @@ bool InitVulkan() {
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
 
+#ifdef ENABLE_VULKAN_VALIDATION
+    const char* instanceExtensions[] = {
+        VK_KHR_SURFACE_EXTENSION_NAME,
+        VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
+        VK_EXT_DEBUG_UTILS_EXTENSION_NAME
+    };
+    const char* validationLayers[] = { "VK_LAYER_KHRONOS_validation" };
+
+    VkInstanceCreateInfo instanceInfo = {};
+    instanceInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    instanceInfo.pApplicationInfo = &appInfo;
+    instanceInfo.enabledExtensionCount = 3;
+    instanceInfo.ppEnabledExtensionNames = instanceExtensions;
+    instanceInfo.enabledLayerCount = 1;
+    instanceInfo.ppEnabledLayerNames = validationLayers;
+#else
     const char* instanceExtensions[] = {
         VK_KHR_SURFACE_EXTENSION_NAME,
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME
@@ -2129,8 +2224,13 @@ bool InitVulkan() {
     instanceInfo.pApplicationInfo = &appInfo;
     instanceInfo.enabledExtensionCount = 2;
     instanceInfo.ppEnabledExtensionNames = instanceExtensions;
+#endif
 
     VK_CHECK_RETURN(vkCreateInstance(&instanceInfo, nullptr, &g_app.instance), false);
+
+#ifdef ENABLE_VULKAN_VALIDATION
+    SetupDebugMessenger(g_app.instance, &g_app.debugMessenger);
+#endif
 
     // Create Win32 Surface
     VkWin32SurfaceCreateInfoKHR surfaceInfo = {};
@@ -2911,7 +3011,7 @@ BenchmarkResult RunLatencyTest(const std::string& name, VkBufferAllocation& src,
 
     for (int b = 0; b < batchCount && !ShouldAbortBenchmark(); ++b) {
         if (b % 4 == 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            std::this_thread::sleep_for(std::chrono::microseconds(Constants::BENCHMARK_SLEEP_US));
         }
         
         int opsThisBatch = std::min(QueriesPerBatch, iterations - static_cast<int>(latencies.size()));
@@ -3008,7 +3108,7 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
 
     for (int b = 0; b < batchCount && !ShouldAbortBenchmark(); ++b) {
         if (b % 4 == 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            std::this_thread::sleep_for(std::chrono::microseconds(Constants::BENCHMARK_SLEEP_US));
         }
         
         int opsThisBatch = std::min(QueriesPerBatch, iterations - static_cast<int>(latencies.size()));
@@ -3596,8 +3696,8 @@ void VRAMTestThreadFunc() {
     
     const int MARCH_ITERATIONS = 4;
     
-    const size_t PREFERRED_CHUNK_SIZE = 512ull * 1024 * 1024;
-    const size_t MIN_CHUNK_SIZE = 128ull * 1024 * 1024;
+    const size_t PREFERRED_CHUNK_SIZE = Constants::VRAM_CHUNK_PREFERRED;
+    const size_t MIN_CHUNK_SIZE = Constants::VRAM_CHUNK_MINIMUM;
     
     size_t chunkSize = PREFERRED_CHUNK_SIZE;
     
@@ -6239,6 +6339,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (g_app.swapChain != VK_NULL_HANDLE) vkDestroySwapchainKHR(g_app.device, g_app.swapChain, nullptr);
     if (g_app.device != VK_NULL_HANDLE) vkDestroyDevice(g_app.device, nullptr);
     if (g_app.surface != VK_NULL_HANDLE) vkDestroySurfaceKHR(g_app.instance, g_app.surface, nullptr);
+#ifdef ENABLE_VULKAN_VALIDATION
+    DestroyDebugMessenger(g_app.instance, g_app.debugMessenger);
+#endif
     if (g_app.instance != VK_NULL_HANDLE) vkDestroyInstance(g_app.instance, nullptr);
 
     DestroyWindow(g_app.hwnd);

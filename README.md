@@ -114,11 +114,15 @@ Queries PCIe link status registers via DXGI and applies heuristics for:
 - USB4 (similar to TB but different enumeration patterns)
 - OCuLink (x4/x8 with PCIe-level bandwidth)
 
+## Notes
+
+- **Admin privileges** - Running as administrator may improve WMI detection of system RAM speed/channels on some systems.
+
 ## Limitations
 
 - **D3D12 abstraction** - Cannot directly address physical VRAM; relies on driver allocation patterns
 - **No stress testing** - Tests static memory, not thermal/power stress conditions
-- **Windows only** - Uses DirectX 12 and Windows-specific APIs
+- **Windows only** - Uses DirectX 12 and Windows-specific APIs (SetupAPI, WMI, cfgmgr32). A future cross-platform version would require abstracting hardware detection (PCIe link, eGPU, system RAM) behind a platform layer.
 - **No multi-GPU** - Tests one GPU at a time
 
 ## Version History
