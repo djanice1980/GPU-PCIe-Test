@@ -131,6 +131,7 @@
 #include <optional>
 #include <cassert>
 #include <cstdio>
+#include <cinttypes>
 #include <cstring>
 #include <climits>
 
@@ -548,33 +549,6 @@ static std::string ExecCommand(const std::string& cmd) {
     return result;
 }
 
-// Check if a directory exists
-static bool DirectoryExists(const std::string& path) {
-    struct stat st;
-    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-// Check if a file exists
-static bool FileExists(const std::string& path) {
-    struct stat st;
-    return stat(path.c_str(), &st) == 0;
-}
-
-// List entries in a directory
-static std::vector<std::string> ListDirectory(const std::string& path) {
-    std::vector<std::string> entries;
-    DIR* dir = opendir(path.c_str());
-    if (!dir) return entries;
-    struct dirent* entry;
-    while ((entry = readdir(dir)) != nullptr) {
-        std::string name = entry->d_name;
-        if (name != "." && name != "..") {
-            entries.push_back(name);
-        }
-    }
-    closedir(dir);
-    return entries;
-}
 
 // ============================================================================
 // SYSTEM MEMORY DETECTION (Linux: /proc/meminfo + dmidecode)
@@ -2047,7 +2021,7 @@ size_t GetSafeMaxBandwidthSize(int gpuIndex) {
     size_t safeMax = static_cast<size_t>(availableVRAM * Constants::VRAM_SAFETY_MARGIN / 4);
     
     safeMax = std::max(safeMax, Constants::MIN_BANDWIDTH_SIZE);
-    safeMax = std::min(safeMax, 2ull * 1024 * 1024 * 1024);  // 2GB max
+    safeMax = std::min(safeMax, static_cast<size_t>(2ull * 1024 * 1024 * 1024));  // 2GB max
     
     return safeMax;
 }
@@ -4692,12 +4666,12 @@ void RenderGUI() {
             // Format: "64GB DDR5 @ 6000 MT/s"
             char ramBuf[128];
             if (g_app.systemMemory.configuredSpeedMT > 0) {
-                snprintf(ramBuf, sizeof(ramBuf), "  %lluGB %s @ %u MT/s",
+                snprintf(ramBuf, sizeof(ramBuf), "  %" PRIu64 "GB %s @ %u MT/s",
                         g_app.systemMemory.totalCapacityGB,
                         g_app.systemMemory.type.c_str(),
                         g_app.systemMemory.configuredSpeedMT);
             } else {
-                snprintf(ramBuf, sizeof(ramBuf), "  %lluGB %s",
+                snprintf(ramBuf, sizeof(ramBuf), "  %" PRIu64 "GB %s",
                         g_app.systemMemory.totalCapacityGB,
                         g_app.systemMemory.type.c_str());
             }
