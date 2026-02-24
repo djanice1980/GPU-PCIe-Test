@@ -2,6 +2,18 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.0.3] - 2025-02-24
+
+### Added
+- **Linux Vulkan port** - Full Linux version using Vulkan + GLFW in `Linux/` directory
+  - CMake build system with FetchContent for ImGui/ImPlot (pinned versions)
+  - PCIe link detection via sysfs (`/sys/bus/pci/devices/`)
+  - Thunderbolt/USB4/eGPU detection via sysfs thunderbolt subsystem
+  - System RAM detection via `/proc/meminfo` + `dmidecode`
+  - GLFW windowing (supports X11 and Wayland)
+  - Convenience build script (`build_linux.sh`) with dependency checking
+  - Full feature parity with Windows Vulkan variant
+
 ## [3.0.2] - 2025-02-18
 
 ### Fixed

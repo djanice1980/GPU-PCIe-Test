@@ -1,10 +1,11 @@
 # GPU-PCIe-Test
 
-A Windows tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Measures real-world data transfer speeds between CPU and GPU memory.
+A tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Measures real-world data transfer speeds between CPU and GPU memory.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
-![Platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)
 ![DirectX](https://img.shields.io/badge/DirectX-12-green.svg)
+![Vulkan](https://img.shields.io/badge/Vulkan-1.1-red.svg)
 
 ## Features
 
@@ -39,13 +40,19 @@ A Windows tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Mea
 
 ## Requirements
 
+### Windows
 - Windows 10/11 (64-bit)
 - DirectX 12 compatible GPU
 - Visual Studio 2019+ (for building)
 
+### Linux
+- Vulkan-capable GPU with drivers installed
+- CMake 3.16+, g++, libglfw3-dev, libvulkan-dev
+- X11 or Wayland display server
+
 ## Building
 
-### Quick Build (Recommended)
+### Windows - Quick Build (Recommended)
 
 1. Clone the repository:
    ```cmd
@@ -65,7 +72,7 @@ A Windows tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Mea
    GPU-PCIe-Test.exe
    ```
 
-### Manual Build
+### Windows - Manual Build
 
 If you prefer manual compilation:
 
@@ -74,6 +81,17 @@ cl /EHsc /O2 /DUNICODE /D_UNICODE main_gui.cpp imgui*.cpp implot*.cpp ^
    /link d3d12.lib dxgi.lib d3dcompiler.lib user32.lib gdi32.lib ^
    /out:GPU-PCIe-Test.exe
 ```
+
+### Linux Build
+
+```bash
+cd Linux
+chmod +x build_linux.sh
+./build_linux.sh
+./build/gpu-pcie-test-vulkan
+```
+
+See [Linux/Linux_README.md](Linux/Linux_README.md) for detailed instructions and distro-specific package names.
 
 ## Usage
 
@@ -114,15 +132,11 @@ Queries PCIe link status registers via DXGI and applies heuristics for:
 - USB4 (similar to TB but different enumeration patterns)
 - OCuLink (x4/x8 with PCIe-level bandwidth)
 
-## Notes
-
-- **Admin privileges** - Running as administrator may improve WMI detection of system RAM speed/channels on some systems.
-
 ## Limitations
 
 - **D3D12 abstraction** - Cannot directly address physical VRAM; relies on driver allocation patterns
 - **No stress testing** - Tests static memory, not thermal/power stress conditions
-- **Windows only** - Uses DirectX 12 and Windows-specific APIs (SetupAPI, WMI, cfgmgr32). A future cross-platform version would require abstracting hardware detection (PCIe link, eGPU, system RAM) behind a platform layer.
+- **D3D12 variant is Windows only** - The Vulkan variant runs on both Windows and Linux
 - **No multi-GPU** - Tests one GPU at a time
 
 ## Version History
