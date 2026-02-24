@@ -1,5 +1,19 @@
 # Changelog — GPU-PCIe-Test
 
+## v3.0.2 — Code Quality & Validation Layers (February 2025)
+
+### Changed
+- **Magic numbers extracted to Constants namespace** — MAX_LOG_LINES, VRAM_CHUNK_PREFERRED,
+  VRAM_CHUNK_MINIMUM, MAX_BANDWIDTH_BUFFER, EGPU_MAX_TREE_DEPTH, BENCHMARK_SLEEP_US
+- **Documentation updates** — Added portability notes, validation layers section
+
+### Added
+- **Compile-time Vulkan validation layer support** — Build with `/DENABLE_VULKAN_VALIDATION`
+  to enable `VK_LAYER_KHRONOS_validation` and debug messenger logging. Disabled by default
+  in release builds.
+
+---
+
 ## v3.0.1 — Unified Benchmark Methodology (February 2025)
 
 Cross-API benchmark alignment update. D3D12 and Vulkan versions now use

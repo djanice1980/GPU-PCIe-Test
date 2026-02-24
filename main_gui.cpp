@@ -172,6 +172,22 @@ namespace Constants {
     constexpr double EGPU_BANDWIDTH_THRESHOLD = 5.0;  // GB/s - below this suggests external connection
     constexpr double TB3_MAX_BANDWIDTH = 3.5;         // Thunderbolt 3 typical max
     constexpr double TB4_MAX_BANDWIDTH = 4.5;         // Thunderbolt 4 typical max
+
+    // Log and UI limits
+    constexpr int MAX_LOG_LINES = 500;
+
+    // VRAM scanning chunk sizes
+    constexpr size_t VRAM_CHUNK_PREFERRED = 512ull * 1024 * 1024;  // 512 MB per chunk
+    constexpr size_t VRAM_CHUNK_MINIMUM = 128ull * 1024 * 1024;    // 128 MB minimum viable
+
+    // Maximum bandwidth test buffer (2 GB)
+    constexpr size_t MAX_BANDWIDTH_BUFFER = 2ull * 1024 * 1024 * 1024;
+
+    // eGPU device tree traversal depth
+    constexpr int EGPU_MAX_TREE_DEPTH = 15;
+
+    // Inter-batch sleep to avoid starving other work (microseconds)
+    constexpr int BENCHMARK_SLEEP_US = 50;
 }
 
 // ============================================================================
@@ -488,8 +504,8 @@ static AppContext g_app;
 void Log(const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_app.logMutex);
     g_app.logLines.push_back(msg);
-    // Keep last 500 lines
-    if (g_app.logLines.size() > 500) {
+    // Keep last N lines
+    if (g_app.logLines.size() > static_cast<size_t>(Constants::MAX_LOG_LINES)) {
         g_app.logLines.erase(g_app.logLines.begin());
     }
 }
@@ -1362,7 +1378,11 @@ std::string GetUSBControllerName(uint32_t vendorId, uint32_t deviceId) {
     return "USB Controller";
 }
 
-// Detect if a GPU is connected via Thunderbolt/USB4/USB by walking the device tree
+// Detect if a GPU is connected via Thunderbolt/USB4/USB by walking the device tree.
+// NOTE: Detection relies on Windows device naming conventions and hardcoded vendor/device IDs.
+// New Thunderbolt/USB generations may require adding new controller IDs to the lookup tables.
+// The bandwidth heuristic in ClassifyByBandwidth() serves as a fallback when string matching
+// doesn't identify the connection type.
 void DetectExternalConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPUInfo& outInfo) {
     outInfo.isThunderbolt = false;
     outInfo.isUSB4 = false;
@@ -1418,7 +1438,7 @@ void DetectExternalConnection(uint32_t gpuVendorId, uint32_t gpuDeviceId, GPUInf
     // Walk up the device tree looking for Thunderbolt/USB4/USB3 controllers
     DEVINST parentDevInst = gpuDevInst;
     int depth = 0;
-    const int maxDepth = 15;  // Go a bit further up for USB chains
+    const int maxDepth = Constants::EGPU_MAX_TREE_DEPTH;
     
     while (depth < maxDepth) {
         DEVINST nextParent;
@@ -1810,7 +1830,7 @@ size_t GetSafeMaxBandwidthSize(int gpuIndex) {
     
     // Clamp to reasonable bounds
     safeMax = std::max(safeMax, Constants::MIN_BANDWIDTH_SIZE);
-    safeMax = std::min(safeMax, 2ull * 1024 * 1024 * 1024);  // 2GB max
+    safeMax = std::min(safeMax, Constants::MAX_BANDWIDTH_BUFFER);
     
     return safeMax;
 }
@@ -2427,7 +2447,7 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
     for (int b = 0; b < batches && !ShouldAbortBenchmark(); ++b) {
         // Small sleep to reduce CPU spin
         if (b % 4 == 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            std::this_thread::sleep_for(std::chrono::microseconds(Constants::BENCHMARK_SLEEP_US));
         }
         
         int opsThisBatch = std::min(QueriesPerBatch, iterations - (int)latencies.size());
@@ -2534,7 +2554,7 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
     for (int b = 0; b < batches && !ShouldAbortBenchmark(); ++b) {
         // Small sleep to reduce CPU spin
         if (b % 4 == 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            std::this_thread::sleep_for(std::chrono::microseconds(Constants::BENCHMARK_SLEEP_US));
         }
         
         int opsThisBatch = std::min(QueriesPerBatch, iterations - static_cast<int>(latencies.size()));
@@ -3126,8 +3146,8 @@ void VRAMTestThreadFunc() {
     
     // Use manageable chunk sizes - large contiguous allocations often fail
     // We'll cycle through multiple allocations to cover more physical VRAM
-    const size_t PREFERRED_CHUNK_SIZE = 512 * 1024 * 1024;  // 512 MB
-    const size_t MIN_CHUNK_SIZE = 128 * 1024 * 1024;        // 128 MB minimum
+    const size_t PREFERRED_CHUNK_SIZE = Constants::VRAM_CHUNK_PREFERRED;
+    const size_t MIN_CHUNK_SIZE = Constants::VRAM_CHUNK_MINIMUM;
     
     // First, find the largest chunk size that works
     size_t chunkSize = PREFERRED_CHUNK_SIZE;
@@ -5385,6 +5405,9 @@ void Render() {
     g_app.frameIndex = g_app.swapChain->GetCurrentBackBufferIndex();
 }
 
+// Note: Unlike the Vulkan version which explicitly clamps to surface capabilities,
+// DXGI's ResizeBuffers validates dimensions internally and returns an error HRESULT
+// if they exceed the surface's supported range. The FAILED(hr) check below handles this.
 void ResizeSwapChain(int width, int height) {
     if (width <= 0 || height <= 0) return;
     if (!g_app.swapChain) return;

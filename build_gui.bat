@@ -2,7 +2,7 @@
 setlocal
 
 echo ==================================================
-echo   GPU-PCIe-Test v2.0 GUI - Build Script
+echo   GPU-PCIe-Test v3.0 GUI - Build Script
 echo ==================================================
 echo.
 
@@ -83,7 +83,7 @@ echo      [OK] All files present
 REM Compile
 echo [4/4] Compiling...
 
-cl /nologo /EHsc /std:c++17 /O2 /MD /I. /DUNICODE /D_UNICODE main_gui.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/imgui_impl_win32.cpp imgui/imgui_impl_dx12.cpp imgui/implot.cpp imgui/implot_items.cpp d3d12.lib dxgi.lib user32.lib gdi32.lib /Fe:GPU-PCIe-Test_GUI.exe /link /SUBSYSTEM:WINDOWS
+cl /nologo /W4 /WX /EHsc /std:c++17 /O2 /MD /I. /DUNICODE /D_UNICODE main_gui.cpp imgui/imgui.cpp imgui/imgui_draw.cpp imgui/imgui_tables.cpp imgui/imgui_widgets.cpp imgui/imgui_impl_win32.cpp imgui/imgui_impl_dx12.cpp imgui/implot.cpp imgui/implot_items.cpp d3d12.lib dxgi.lib d3dcompiler.lib setupapi.lib cfgmgr32.lib wbemuuid.lib ole32.lib oleaut32.lib user32.lib gdi32.lib /Fe:GPU-PCIe-Test_GUI.exe /link /SUBSYSTEM:WINDOWS
 
 if errorlevel 1 (
     echo.

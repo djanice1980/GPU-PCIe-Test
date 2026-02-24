@@ -57,6 +57,19 @@ Priority order:
 On NVIDIA: family 1 (2 queues, dedicated DMA engines)
 On AMD: family 1 (8 queues on RDNA4, SDMA engines)
 
+## Debug / Validation Layers
+
+For development, you can enable Vulkan validation layers at compile time:
+
+```cmd
+cl ... /DENABLE_VULKAN_VALIDATION main_gui_vulkan.cpp ...
+```
+
+This enables `VK_LAYER_KHRONOS_validation` and sets up a debug messenger that routes
+validation errors/warnings to the application log panel. Requires the Vulkan SDK validation
+layers to be installed. Disabled by default in release builds — no runtime overhead when
+not compiled in.
+
 ## Features
 
 Full feature parity with the D3D12 version:
