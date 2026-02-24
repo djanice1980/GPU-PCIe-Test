@@ -70,6 +70,19 @@ target_include_directories(gpu-pcie-test-vulkan PRIVATE
     ${implot_SOURCE_DIR}
 )
 
+# Suppress warnings in third-party ImGui/ImPlot code (they use memset on structs, etc.)
+set_source_files_properties(
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+    ${implot_SOURCE_DIR}/implot.cpp
+    ${implot_SOURCE_DIR}/implot_items.cpp
+    PROPERTIES COMPILE_FLAGS "-Wno-error -Wno-class-memaccess"
+)
+
 target_link_libraries(gpu-pcie-test-vulkan PRIVATE
     Vulkan::Vulkan
     glfw
