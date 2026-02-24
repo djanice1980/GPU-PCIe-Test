@@ -38,7 +38,7 @@ if ! pkg-config --exists vulkan 2>/dev/null && ! test -f /usr/include/vulkan/vul
     exit 1
 fi
 
-if ! pkg-config --exists glfw3 2>/dev/null; then
+if ! pkg-config --exists glfw3 2>/dev/null && ! test -f /usr/include/GLFW/glfw3.h; then
     echo "[ERROR] GLFW3 not found. Install with:"
     echo "  Ubuntu/Debian: sudo apt install libglfw3-dev"
     echo "  Fedora:        sudo dnf install glfw-devel"
