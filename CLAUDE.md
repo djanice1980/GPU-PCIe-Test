@@ -36,6 +36,51 @@ GUI built with Dear ImGui (docking branch) + ImPlot.
 - VRAM scanning: 512MB chunks, 8 test patterns, fresh alloc per chunk for physical coverage
 - System RAM: Windows via WMI (Win32_PhysicalMemory), Linux via /proc/meminfo + dmidecode
 
+## Design Decisions & Rationale
+
+### Queue Selection: D3D12 DIRECT vs Vulkan Transfer Queues
+- **D3D12 uses DIRECT queues**, not COPY queues. COPY queues were tested but proved unreliable
+  on some driver/hardware combinations, notably eGPUs over Thunderbolt. The DIRECT queue driver
+  internally routes CopyResource calls to the GPU's DMA copy engines anyway.
+- **Vulkan uses dedicated transfer queue families** (VK_QUEUE_TRANSFER_BIT without
+  VK_QUEUE_GRAPHICS_BIT). These map directly to the DMA copy engine hardware.
+- **Consequence**: D3D12 DIRECT queues add driver-level scheduling/optimization that can
+  inflate bidirectional numbers slightly compared to Vulkan's raw transfer queues. This is a
+  known, accepted difference — the alternative (D3D12 COPY queues) caused driver crashes
+  and incorrect results on certain hardware. Small measurement differences between APIs
+  are expected and documented in the source headers.
+
+### Upload Measurement: ReBAR Workaround
+- On discrete GPUs, ReBAR (Resizable BAR) allows the CPU to map the full GPU VRAM address space.
+  This causes GPU timestamps to report upload completion *before* data actually reaches VRAM over
+  the PCIe bus, producing wildly inflated upload speeds.
+- **Fix**: CPU round-trip timing. Measure upload + readback of the same buffer, then subtract the
+  previously measured download time: `upload_speed = data_size / (round_trip - download_time)`.
+- Integrated GPUs don't have this problem (shared memory, no bus transfer), so they use GPU
+  timestamps for both directions.
+
+### GPU Timestamp Calibration
+- **Vulkan**: `timestampPeriod` field in VkPhysicalDeviceProperties — gives nanoseconds per tick.
+  Multiply tick delta by this value to get nanoseconds.
+- **D3D12**: `GetTimestampFrequency()` on the command queue — gives ticks per second.
+  Divide tick delta by this value to get seconds.
+- Both produce equivalent wall-clock GPU timing, just calibrated differently. Cross-API results
+  are comparable for the same hardware.
+
+### Bidirectional Testing: Dual Queues
+- Both APIs create two independent queues for true simultaneous upload + download:
+  - **D3D12**: 2 × DIRECT queues (NVIDIA drivers expose multiple DMA engines behind DIRECT)
+  - **Vulkan**: 2 × dedicated transfer queues from the same family (NVIDIA exposes 2 transfer
+    queues, AMD typically 1 + fallback to single-queue interleave)
+- Falls back to single-queue interleaved copies if a second queue cannot be created.
+
+### Linux Port: Separate File vs #ifdefs
+- Each platform variant is a separate monolithic .cpp file, not a single file with #ifdefs.
+- **Rationale**: At ~6000 lines per variant, #ifdefs would make the code unreadable. Platform
+  differences are pervasive (windowing, hardware detection, system APIs) not isolated to a few
+  functions. The benchmark methodology section is identical across all variants — any algorithm
+  change must be replicated to all three files.
+
 ## Code Style
 - Single monolithic .cpp files per variant (no header splitting)
 - Constants namespace at top of file for tuning parameters

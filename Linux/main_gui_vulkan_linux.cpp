@@ -73,19 +73,24 @@
 //   vkQueueSubmit + vkWaitForFences  ExecuteCommandLists + Signal/Wait fence
 //   Dual transfer queues (bidir)     2 × COPY queues (bidir)
 //
-// D3D12 BACKPORT NOTES
+// D3D12 QUEUE DIVERGENCE NOTES
 // ─────────────────────────────────────────────────────────────────────────────
-// To make D3D12 use the same methodology as this Vulkan version:
-//   1. Change benchQueue from COMMAND_LIST_TYPE_DIRECT to COMMAND_LIST_TYPE_COPY
-//   2. Create a second COPY queue + allocator + command list for bidirectional
-//   3. Bidirectional: submit upload to COPY queue 1, download to COPY queue 2,
-//      wait on both fences. (Currently uses DIRECT queue auto-routing which
-//      gives higher numbers due to internal driver optimization.)
-//   4. All bandwidth/latency tests already use CopyResource which works on COPY
-//      queues - no changes needed to the copy commands themselves.
-//   5. The round-trip upload method is API-agnostic, works identically.
-//   6. Expected result: D3D12 numbers should converge with Vulkan numbers
-//      since both will test through the same DMA copy engine hardware path.
+// D3D12 uses DIRECT queues instead of COPY queues. COPY queues were tested but
+// proved unreliable on some driver/hardware combinations (notably eGPU over
+// Thunderbolt — produced driver crashes and incorrect results). The DIRECT
+// queue driver internally routes CopyResource calls to DMA copy engines, but
+// adds driver-level scheduling/optimization. This can inflate bidirectional
+// numbers slightly compared to Vulkan's raw transfer queues.
+//
+// This is a known, accepted difference between the two API variants:
+//   - Vulkan: raw DMA engine access via dedicated transfer queues
+//   - D3D12:  driver-mediated DMA access via DIRECT queues
+//   - Both measure the same underlying hardware path, but D3D12's driver
+//     layer may auto-optimize copy routing, especially for bidirectional.
+//   - Small measurement differences between APIs are expected.
+//
+// If future driver updates fix COPY queue reliability, D3D12 could be
+// switched to COPY queues to fully converge with Vulkan's methodology.
 //
 // ============================================================================
 // Features:
