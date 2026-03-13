@@ -336,6 +336,23 @@ static const InterfaceSpeed INTERFACE_SPEEDS[] = {
 
 static const int NUM_INTERFACE_SPEEDS = sizeof(INTERFACE_SPEEDS) / sizeof(INTERFACE_SPEEDS[0]);
 
+// Memory bandwidth standards for integrated GPU (APU) comparison
+// Realistic = ~80% of theoretical (memory controller overhead, contention)
+// Theoretical = speed_MT/s * 8 bytes * 2 channels / 1000
+static const InterfaceSpeed MEMORY_STANDARDS[] = {
+    {"DDR4-2400 DC",    30.7,   38.4,  "Dual-channel DDR4-2400"},
+    {"DDR4-3200 DC",    41.0,   51.2,  "Dual-channel DDR4-3200"},
+    {"DDR5-4800 DC",    61.4,   76.8,  "Dual-channel DDR5-4800"},
+    {"DDR5-5600 DC",    71.7,   89.6,  "Dual-channel DDR5-5600"},
+    {"DDR5-6400 DC",    81.9,   102.4, "Dual-channel DDR5-6400"},
+    {"DDR5-8800 DC",    112.6,  140.8, "Dual-channel DDR5-8800"},
+    {"LPDDR5X-7500",    96.0,   120.0, "Dual-channel LPDDR5X-7500"},
+    {"LPDDR5X-8533",    109.2,  136.5, "Dual-channel LPDDR5X-8533"},
+    {"DDR6-12800 DC",   163.8,  204.8, "Dual-channel DDR6-12800 (projected)"},
+    {"DDR6-17600 DC",   225.3,  281.6, "Dual-channel DDR6-17600 (projected)"},
+};
+static const int NUM_MEMORY_STANDARDS = sizeof(MEMORY_STANDARDS) / sizeof(MEMORY_STANDARDS[0]);
+
 // ============================================================================
 // VULKAN BUFFER ALLOCATION HELPER
 // ============================================================================
@@ -573,6 +590,12 @@ std::string GetDDRTypeFromSMBIOS(uint16_t memoryType) {
         case 30: return "LPDDR4";
         case 34: return "DDR5";
         case 35: return "LPDDR5";
+        case 36: return "LPDDR5X";
+        // DDR6/DDR7: JEDEC SMBIOS type codes not yet assigned as of 2025.
+        // When assigned, add them here. Expected in SMBIOS 3.8+.
+        // case ??: return "DDR6";
+        // case ??: return "LPDDR6";
+        // case ??: return "DDR7";
         default: return "Unknown";
     }
 }
@@ -722,12 +745,14 @@ SystemMemoryInfo DetectSystemMemory() {
             }
         }
 
-        // Type (DDR4, DDR5, etc.)
+        // Type (DDR4, DDR5, DDR6, etc.)
         if (field == "Type" && slotHasModule) {
             if (value != "Unknown" && !value.empty()) {
                 detectedType = value;
-                // Check if DDR5 or LPDDR5 for speed interpretation
+                // Check if DDR5/LPDDR5/LPDDR5X/DDR6 or later for speed interpretation
+                // These report speed directly in MT/s, not MHz
                 if (value.find("DDR5") != std::string::npos ||
+                    value.find("DDR6") != std::string::npos ||
                     value.find("LPDDR5") != std::string::npos) {
                     isDDR5orLater = true;
                 }
@@ -765,12 +790,12 @@ SystemMemoryInfo DetectSystemMemory() {
     }
 
     // Determine speed in MT/s
-    // DDR5/LPDDR5: dmidecode reports speed directly in MT/s
+    // DDR5, LPDDR5, LPDDR5X, DDR6 and later: dmidecode reports speed directly in MT/s
     // DDR4 and earlier: dmidecode reports MHz, needs doubling for MT/s
     // Note: Some dmidecode versions report "MT/s" in the unit, some report "MHz"
-    // We detect DDR5 from the Type field rather than relying on the unit string
+    // We detect DDR5+ from the Type field rather than relying on the unit string
     if (isDDR5orLater) {
-        // DDR5/LPDDR5: speed values are already in MT/s
+        // DDR5/LPDDR5/LPDDR5X/DDR6: speed values are already in MT/s
         info.speedMT = maxSpeed;
         info.configuredSpeedMT = maxConfiguredSpeed;
     } else {
@@ -983,11 +1008,12 @@ void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo&
     // AMD APUs use Infinity Fabric, Intel uses ring bus/mesh
     if (gpu.vendor == "AMD") {
         fabricType = "AMD Infinity Fabric";
-        // Estimate DDR generation from bandwidth
-        // DDR4-3200 dual channel: ~51 GB/s theoretical, ~40 GB/s real
-        // DDR5-5600 dual channel: ~89 GB/s theoretical, ~70 GB/s real
-        // DDR5-6400 dual channel: ~102 GB/s theoretical, ~80 GB/s real
-        if (maxBandwidth > 60) {
+        // Estimate DDR generation from bandwidth (dual-channel realistic values)
+        // DDR4-3200: ~41 GB/s    DDR5-5600: ~72 GB/s    DDR5-8800: ~113 GB/s
+        // DDR6-12800: ~164 GB/s  DDR6-17600: ~225 GB/s
+        if (maxBandwidth > 120) {
+            memoryType = "DDR6";
+        } else if (maxBandwidth > 60) {
             memoryType = "DDR5";
         } else if (maxBandwidth > 35) {
             memoryType = "DDR4/DDR5";
@@ -996,14 +1022,22 @@ void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo&
         }
     } else if (gpu.vendor == "Intel") {
         fabricType = "Intel Ring Bus / Mesh";
-        if (maxBandwidth > 50) {
+        if (maxBandwidth > 120) {
+            memoryType = "DDR6";
+        } else if (maxBandwidth > 50) {
             memoryType = "DDR5";
         } else {
             memoryType = "DDR4";
         }
     } else {
         fabricType = "On-die Interconnect";
-        memoryType = "System Memory";
+        if (maxBandwidth > 120) {
+            memoryType = "DDR6";
+        } else if (maxBandwidth > 50) {
+            memoryType = "DDR5";
+        } else {
+            memoryType = "System Memory";
+        }
     }
     
     g_app.detectedInterface = "Integrated GPU (Shared Memory)";
@@ -1029,10 +1063,17 @@ void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo&
                 expectedBandwidth);
         bandwidthSource = buf;
     } else {
-        // Fall back to estimates
+        // Fall back to estimates based on detected/heuristic memory type
+        // DDR6 dual-channel realistic: ~164 GB/s (DDR6-12800 base)
         // DDR5 dual-channel realistic: ~70 GB/s
         // DDR4 dual-channel realistic: ~40 GB/s
-        expectedBandwidth = (memoryType.find("DDR5") != std::string::npos) ? 70.0 : 40.0;
+        if (memoryType.find("DDR6") != std::string::npos) {
+            expectedBandwidth = 164.0;
+        } else if (memoryType.find("DDR5") != std::string::npos) {
+            expectedBandwidth = 70.0;
+        } else {
+            expectedBandwidth = 40.0;
+        }
         bandwidthSource = memoryType + " (estimated)";
     }
     
@@ -5523,20 +5564,35 @@ void RenderGUI() {
         struct BandwidthEntry {
             std::string name;
             double bandwidth;
-            int type;  // 0 = standard, 1 = upload, 2 = download
+            int type;  // 0 = standard, 1 = upload, 2 = download, 3 = memory standard
             std::string description;
         };
-        
+
         std::vector<BandwidthEntry> entries;
-        
-        // Add all interface standards
-        for (int i = 0; i < NUM_INTERFACE_SPEEDS; ++i) {
-            entries.push_back({
-                INTERFACE_SPEEDS[i].name,
-                INTERFACE_SPEEDS[i].bandwidth,
-                0,
-                INTERFACE_SPEEDS[i].description
-            });
+
+        // Choose standards based on GPU type
+        bool isIntegrated = g_app.gpuList[g_app.config.selectedGPU].isIntegrated;
+
+        if (isIntegrated) {
+            // Integrated GPU: show memory bandwidth standards
+            for (int i = 0; i < NUM_MEMORY_STANDARDS; ++i) {
+                entries.push_back({
+                    MEMORY_STANDARDS[i].name,
+                    MEMORY_STANDARDS[i].bandwidth,
+                    3,
+                    MEMORY_STANDARDS[i].description
+                });
+            }
+        } else {
+            // Discrete GPU: show PCIe/TB/USB4 interface standards
+            for (int i = 0; i < NUM_INTERFACE_SPEEDS; ++i) {
+                entries.push_back({
+                    INTERFACE_SPEEDS[i].name,
+                    INTERFACE_SPEEDS[i].bandwidth,
+                    0,
+                    INTERFACE_SPEEDS[i].description
+                });
+            }
         }
         
         // Add user results
@@ -5563,64 +5619,81 @@ void RenderGUI() {
         int numEntries = static_cast<int>(entries.size());
         std::vector<double> bandwidths(numEntries);
         std::vector<double> positions(numEntries);
-        std::vector<double> standardBW, uploadBW, downloadBW;
-        std::vector<double> standardPos, uploadPos, downloadPos;
-        
+        std::vector<double> standardBW, uploadBW, downloadBW, memoryBW;
+        std::vector<double> standardPos, uploadPos, downloadPos, memoryPos;
+
         static std::vector<std::string> labelStorage;
         static std::vector<const char*> labels;
         labelStorage.clear();
         labels.clear();
-        
+
         for (int i = 0; i < numEntries; ++i) {
             positions[i] = static_cast<double>(i);
             bandwidths[i] = entries[i].bandwidth;
             labelStorage.push_back(entries[i].name);
-            
+
             if (entries[i].type == 0) {
                 standardPos.push_back(positions[i]);
                 standardBW.push_back(entries[i].bandwidth);
             } else if (entries[i].type == 1) {
                 uploadPos.push_back(positions[i]);
                 uploadBW.push_back(entries[i].bandwidth);
-            } else {
+            } else if (entries[i].type == 2) {
                 downloadPos.push_back(positions[i]);
                 downloadBW.push_back(entries[i].bandwidth);
+            } else if (entries[i].type == 3) {
+                memoryPos.push_back(positions[i]);
+                memoryBW.push_back(entries[i].bandwidth);
             }
         }
         for (const auto& s : labelStorage) labels.push_back(s.c_str());
         
         // Calculate plot height based on number of entries
         float plotHeight = std::max(350.0f, numEntries * 22.0f + 60.0f);
-        
+
+        // Determine X-axis range based on data
+        double maxBW = 70.0;
+        for (int i = 0; i < numEntries; ++i) {
+            if (entries[i].bandwidth > maxBW) maxBW = entries[i].bandwidth;
+        }
+        maxBW = maxBW * 1.1;  // 10% padding
+
         // Draw the horizontal bar chart
         if (ImPlot::BeginPlot("##InterfaceComparison", ImVec2(-1, plotHeight))) {
             ImPlot::SetupAxes("Bandwidth (GB/s)", "", 0, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
-            ImPlot::SetupAxisLimits(ImAxis_X1, 0, 70, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0, maxBW, ImPlotCond_Always);
             ImPlot::SetupAxisTicks(ImAxis_Y1, positions.data(), numEntries, labels.data());
-            
+
             double barHeight = 0.7;
-            
-            // Plot standard interfaces in gray
+
+            // Plot PCIe/TB interface standards in gray
             if (!standardBW.empty()) {
                 ImPlot::SetNextFillStyle(ImVec4(0.5f, 0.5f, 0.5f, 0.7f));
-                ImPlot::PlotBars("Interface Standards", standardBW.data(), standardPos.data(), 
+                ImPlot::PlotBars("Interface Standards", standardBW.data(), standardPos.data(),
                                   static_cast<int>(standardBW.size()), barHeight, ImPlotBarsFlags_Horizontal);
             }
-            
+
+            // Plot memory bandwidth standards in purple
+            if (!memoryBW.empty()) {
+                ImPlot::SetNextFillStyle(ImVec4(0.6f, 0.4f, 0.8f, 0.7f));
+                ImPlot::PlotBars("Memory Standards", memoryBW.data(), memoryPos.data(),
+                                  static_cast<int>(memoryBW.size()), barHeight, ImPlotBarsFlags_Horizontal);
+            }
+
             // Plot user upload in green
             if (!uploadBW.empty()) {
                 ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.9f, 0.2f, 1.0f));
-                ImPlot::PlotBars("Your CPU->GPU", uploadBW.data(), uploadPos.data(), 
+                ImPlot::PlotBars("Your CPU->GPU", uploadBW.data(), uploadPos.data(),
                                   static_cast<int>(uploadBW.size()), barHeight, ImPlotBarsFlags_Horizontal);
             }
-            
+
             // Plot user download in cyan
             if (!downloadBW.empty()) {
                 ImPlot::SetNextFillStyle(ImVec4(0.2f, 0.7f, 0.9f, 1.0f));
-                ImPlot::PlotBars("Your GPU->CPU", downloadBW.data(), downloadPos.data(), 
+                ImPlot::PlotBars("Your GPU->CPU", downloadBW.data(), downloadPos.data(),
                                   static_cast<int>(downloadBW.size()), barHeight, ImPlotBarsFlags_Horizontal);
             }
-            
+
             ImPlot::EndPlot();
         }
         
