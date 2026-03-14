@@ -207,7 +207,58 @@ namespace Constants {
 
     // Inter-batch sleep to avoid starving other work (microseconds)
     constexpr int BENCHMARK_SLEEP_US = 50;
+
+    // Memory latency compute shader test
+    constexpr size_t MEMORY_LATENCY_BUFFER_SIZE = 32ull * 1024 * 1024;  // 32 MB (> typical GPU L2 cache)
+    constexpr uint32_t MEMORY_LATENCY_NUM_CHASES = 100000;              // Pointer chases per dispatch
+    constexpr int MEMORY_LATENCY_WARMUP_DISPATCHES = 3;                 // Warmup dispatches (stabilize clocks)
+    constexpr int MEMORY_LATENCY_MEASURE_DISPATCHES = 10;               // Measurement dispatches
 }
+
+// Embedded SPIR-V compute shader for GPU memory latency measurement (pointer-chase)
+// Compiled from memory_latency.comp with glslangValidator (Vulkan 1.0 target)
+static const uint32_t g_memoryLatencySPIRV[] = {
+    0x07230203, 0x00010000, 0x0008000b, 0x0000002d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0005000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x00060010, 0x00000004, 0x00000011,
+    0x00000001, 0x00000001, 0x00000001, 0x00030003, 0x00000002, 0x000001c2, 0x00040005, 0x00000004,
+    0x6e69616d, 0x00000000, 0x00030005, 0x00000008, 0x00786469, 0x00040005, 0x00000009, 0x61726150,
+    0x0000736d, 0x00060006, 0x00000009, 0x00000000, 0x436d756e, 0x65736168, 0x00000073, 0x00060006,
+    0x00000009, 0x00000001, 0x72617473, 0x646e4974, 0x00007865, 0x00030005, 0x0000000b, 0x00000000,
+    0x00030005, 0x00000011, 0x00000069, 0x00040005, 0x0000001f, 0x69616843, 0x0000006e, 0x00050006,
+    0x0000001f, 0x00000000, 0x61746164, 0x00000000, 0x00040005, 0x00000021, 0x69616863, 0x0000006e,
+    0x00030047, 0x00000009, 0x00000002, 0x00050048, 0x00000009, 0x00000000, 0x00000023, 0x00000000,
+    0x00050048, 0x00000009, 0x00000001, 0x00000023, 0x00000004, 0x00040047, 0x0000001e, 0x00000006,
+    0x00000004, 0x00030047, 0x0000001f, 0x00000003, 0x00050048, 0x0000001f, 0x00000000, 0x00000023,
+    0x00000000, 0x00040047, 0x00000021, 0x00000021, 0x00000000, 0x00040047, 0x00000021, 0x00000022,
+    0x00000000, 0x00040047, 0x0000002c, 0x0000000b, 0x00000019, 0x00020013, 0x00000002, 0x00030021,
+    0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x00040020, 0x00000007,
+    0x00000007, 0x00000006, 0x0004001e, 0x00000009, 0x00000006, 0x00000006, 0x00040020, 0x0000000a,
+    0x00000009, 0x00000009, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000009, 0x00040015, 0x0000000c,
+    0x00000020, 0x00000001, 0x0004002b, 0x0000000c, 0x0000000d, 0x00000001, 0x00040020, 0x0000000e,
+    0x00000009, 0x00000006, 0x0004002b, 0x00000006, 0x00000012, 0x00000000, 0x0004002b, 0x0000000c,
+    0x00000019, 0x00000000, 0x00020014, 0x0000001c, 0x0003001d, 0x0000001e, 0x00000006, 0x0003001e,
+    0x0000001f, 0x0000001e, 0x00040020, 0x00000020, 0x00000002, 0x0000001f, 0x0004003b, 0x00000020,
+    0x00000021, 0x00000002, 0x00040020, 0x00000023, 0x00000002, 0x00000006, 0x00040017, 0x0000002a,
+    0x00000006, 0x00000003, 0x0004002b, 0x00000006, 0x0000002b, 0x00000001, 0x0006002c, 0x0000002a,
+    0x0000002c, 0x0000002b, 0x0000002b, 0x0000002b, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+    0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x0004003b,
+    0x00000007, 0x00000011, 0x00000007, 0x00050041, 0x0000000e, 0x0000000f, 0x0000000b, 0x0000000d,
+    0x0004003d, 0x00000006, 0x00000010, 0x0000000f, 0x0003003e, 0x00000008, 0x00000010, 0x0003003e,
+    0x00000011, 0x00000012, 0x000200f9, 0x00000013, 0x000200f8, 0x00000013, 0x000400f6, 0x00000015,
+    0x00000016, 0x00000000, 0x000200f9, 0x00000017, 0x000200f8, 0x00000017, 0x0004003d, 0x00000006,
+    0x00000018, 0x00000011, 0x00050041, 0x0000000e, 0x0000001a, 0x0000000b, 0x00000019, 0x0004003d,
+    0x00000006, 0x0000001b, 0x0000001a, 0x000500b0, 0x0000001c, 0x0000001d, 0x00000018, 0x0000001b,
+    0x000400fa, 0x0000001d, 0x00000014, 0x00000015, 0x000200f8, 0x00000014, 0x0004003d, 0x00000006,
+    0x00000022, 0x00000008, 0x00060041, 0x00000023, 0x00000024, 0x00000021, 0x00000019, 0x00000022,
+    0x0004003d, 0x00000006, 0x00000025, 0x00000024, 0x0003003e, 0x00000008, 0x00000025, 0x000200f9,
+    0x00000016, 0x000200f8, 0x00000016, 0x0004003d, 0x00000006, 0x00000026, 0x00000011, 0x00050080,
+    0x00000006, 0x00000027, 0x00000026, 0x0000000d, 0x0003003e, 0x00000011, 0x00000027, 0x000200f9,
+    0x00000013, 0x000200f8, 0x00000015, 0x0004003d, 0x00000006, 0x00000028, 0x00000008, 0x00060041,
+    0x00000023, 0x00000029, 0x00000021, 0x00000019, 0x00000019, 0x0003003e, 0x00000029, 0x00000028,
+    0x000100fd, 0x00010038,
+};
+static const size_t g_memoryLatencySPIRVSize = sizeof(g_memoryLatencySPIRV);
 
 // ============================================================================
 // DATA STRUCTURES
@@ -251,6 +302,9 @@ struct SystemMemoryInfo {
     double theoreticalBandwidth = 0;
     bool detected = false;
     std::string errorMessage;
+    double ratedLatencyNs = 0;         // Estimated chip latency from speed tier (ns)
+    int    estimatedCL = 0;            // Estimated CAS latency
+    bool   latencyEstimated = false;   // True if we found a matching speed tier
 };
 
 // VRAM test pattern types
@@ -325,8 +379,10 @@ struct BenchmarkConfig {
     int    numRuns = Constants::DEFAULT_NUM_RUNS;
     bool   runBidirectional = true;
     bool   runLatency = true;
+    bool   runMemoryLatency = true;  // GPU memory latency via compute shader pointer-chase
     bool   quickMode = false;
     bool   averageRuns = true;
+    bool   debugLogging = false;  // Verbose diagnostic logging for memory latency test etc.
     int    selectedGPU = 0;
 };
 
@@ -374,6 +430,37 @@ static const InterfaceSpeed MEMORY_STANDARDS[] = {
     {"DDR6-17600 DC",   225.3,  281.6, "Dual-channel DDR6-17600 (projected)"},
 };
 static const int NUM_MEMORY_STANDARDS = sizeof(MEMORY_STANDARDS) / sizeof(MEMORY_STANDARDS[0]);
+
+// Typical CAS latency by speed tier for rated chip latency estimation
+// Formula: latency_ns = CL / (speedMT / 2000.0) * 1000.0
+struct MemoryLatencyEntry {
+    uint32_t speedMT;       // Speed in MT/s
+    const char* type;       // "DDR4", "DDR5", "DDR6", etc.
+    int typicalCL;          // Typical CAS latency for this speed tier
+    double latencyNs;       // Pre-calculated chip latency in nanoseconds
+};
+
+static const MemoryLatencyEntry MEMORY_LATENCY_TABLE[] = {
+    { 2400,  "DDR4",    17, 14.17 },
+    { 2666,  "DDR4",    17, 12.76 },
+    { 3200,  "DDR4",    16, 10.00 },
+    { 3600,  "DDR4",    18, 10.00 },
+    { 4800,  "DDR5",    40, 16.67 },
+    { 5200,  "DDR5",    38, 14.62 },
+    { 5600,  "DDR5",    36, 12.86 },
+    { 6000,  "DDR5",    36, 12.00 },
+    { 6400,  "DDR5",    40, 12.50 },
+    { 6800,  "DDR5",    40, 11.76 },
+    { 7200,  "DDR5",    40, 11.11 },
+    { 7500,  "LPDDR5X", 36,  9.60 },
+    { 7600,  "DDR5",    40, 10.53 },
+    { 8000,  "DDR5",    40, 10.00 },
+    { 8533,  "LPDDR5X", 36,  8.44 },
+    { 8800,  "DDR5",    44, 10.00 },
+    { 12800, "DDR6",    52,  8.13 },  // projected
+    { 17600, "DDR6",    60,  6.82 },  // projected
+};
+static const int NUM_MEMORY_LATENCY_ENTRIES = sizeof(MEMORY_LATENCY_TABLE) / sizeof(MEMORY_LATENCY_TABLE[0]);
 
 // ============================================================================
 // VULKAN BUFFER ALLOCATION HELPER
@@ -848,8 +935,54 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
     if (mem.theoreticalBandwidth > 0) {
         oss << " (~" << std::fixed << std::setprecision(1) << mem.theoreticalBandwidth << " GB/s theoretical)";
     }
-    
+
+    if (mem.latencyEstimated) {
+        oss << " | Est. Chip Latency: ~" << std::fixed << std::setprecision(1)
+            << mem.ratedLatencyNs << " ns (~CL" << mem.estimatedCL << " typical for speed tier)";
+    }
+
     return oss.str();
+}
+
+void EstimateRatedLatency(SystemMemoryInfo& mem) {
+    if (mem.speedMT == 0 && mem.configuredSpeedMT == 0) return;
+    uint32_t speed = mem.configuredSpeedMT > 0 ? mem.configuredSpeedMT : mem.speedMT;
+
+    int bestIdx = -1;
+    uint32_t bestDiff = UINT32_MAX;
+    for (int i = 0; i < NUM_MEMORY_LATENCY_ENTRIES; i++) {
+        if (!mem.type.empty() && mem.type.find(MEMORY_LATENCY_TABLE[i].type) == std::string::npos)
+            continue;
+        uint32_t diff = (speed > MEMORY_LATENCY_TABLE[i].speedMT)
+            ? speed - MEMORY_LATENCY_TABLE[i].speedMT
+            : MEMORY_LATENCY_TABLE[i].speedMT - speed;
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            bestIdx = i;
+        }
+    }
+
+    if (bestIdx < 0) {
+        for (int i = 0; i < NUM_MEMORY_LATENCY_ENTRIES; i++) {
+            uint32_t diff = (speed > MEMORY_LATENCY_TABLE[i].speedMT)
+                ? speed - MEMORY_LATENCY_TABLE[i].speedMT
+                : MEMORY_LATENCY_TABLE[i].speedMT - speed;
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIdx = i;
+            }
+        }
+    }
+
+    if (bestIdx >= 0) {
+        mem.estimatedCL = MEMORY_LATENCY_TABLE[bestIdx].typicalCL;
+        if (bestDiff == 0) {
+            mem.ratedLatencyNs = MEMORY_LATENCY_TABLE[bestIdx].latencyNs;
+        } else {
+            mem.ratedLatencyNs = static_cast<double>(mem.estimatedCL) / (speed / 2000.0) * 1000.0;
+        }
+        mem.latencyEstimated = true;
+    }
 }
 
 // ============================================================================
@@ -2439,7 +2572,7 @@ bool InitBenchmarkDevice(int gpuIndex) {
             graphicsTransferFamily = i;
         }
     }
-    
+
     // Step 2: Select primary bench queue family
     if (dedicatedTransferFamily != UINT32_MAX) {
         g_app.benchQueueFamily = dedicatedTransferFamily;
@@ -2475,17 +2608,20 @@ bool InitBenchmarkDevice(int gpuIndex) {
     queueInfo.queueFamilyIndex = g_app.benchQueueFamily;
     queueInfo.queueCount = requestedQueues;
     queueInfo.pQueuePriorities = queuePriorities;
-    
+
+    std::vector<VkDeviceQueueCreateInfo> queueCreateInfos;
+    queueCreateInfos.push_back(queueInfo);
+
     // Enable host query reset if available (Vulkan 1.2 feature)
     VkPhysicalDeviceHostQueryResetFeatures hostQueryResetFeatures = {};
     hostQueryResetFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES;
     hostQueryResetFeatures.hostQueryReset = VK_TRUE;
-    
+
     VkDeviceCreateInfo deviceInfo = {};
     deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     deviceInfo.pNext = &hostQueryResetFeatures;
-    deviceInfo.queueCreateInfoCount = 1;
-    deviceInfo.pQueueCreateInfos = &queueInfo;
+    deviceInfo.queueCreateInfoCount = static_cast<uint32_t>(queueCreateInfos.size());
+    deviceInfo.pQueueCreateInfos = queueCreateInfos.data();
     // No extensions needed for benchmark device (no swapchain)
     
     VkResult result = vkCreateDevice(g_app.benchPhysicalDevice, &deviceInfo, nullptr, &g_app.benchDevice);
@@ -2537,10 +2673,10 @@ bool InitBenchmarkDevice(int gpuIndex) {
         VK_CHECK_RETURN(vkAllocateCommandBuffers(g_app.benchDevice, &allocInfo, &g_app.benchCommandBuffer2), false);
         VK_CHECK_RETURN(vkCreateFence(g_app.benchDevice, &fenceInfo, nullptr, &g_app.benchFence2), false);
     }
-    
+
     g_app.benchFenceValue = 1;
     g_app.fenceTimeoutCount = 0;
-    
+
     return true;
 }
 
@@ -2557,7 +2693,7 @@ void CleanupBenchmarkDevice() {
             g_app.benchCommandPool2 = VK_NULL_HANDLE;
         }
         g_app.benchCommandBuffer2 = VK_NULL_HANDLE;
-        
+
         if (g_app.benchFence != VK_NULL_HANDLE) {
             vkDestroyFence(g_app.benchDevice, g_app.benchFence, nullptr);
             g_app.benchFence = VK_NULL_HANDLE;
@@ -3199,6 +3335,454 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
     }
 
     vkDestroyQueryPool(g_app.benchDevice, queryPool, nullptr);
+    return result;
+}
+
+std::vector<uint32_t> GeneratePointerChaseChain(size_t numElements) {
+    std::vector<uint32_t> chain(numElements);
+    for (size_t i = 0; i < numElements; i++)
+        chain[i] = static_cast<uint32_t>(i);
+    std::mt19937 rng(42);
+    for (size_t i = numElements - 1; i > 0; i--) {
+        size_t j = std::uniform_int_distribution<size_t>(0, i - 1)(rng);
+        std::swap(chain[i], chain[j]);
+    }
+    return chain;
+}
+
+BenchmarkResult RunMemoryLatencyTest() {
+    BenchmarkResult result;
+    result.testName = "GPU Memory Latency";
+    result.unit = "ns";
+    g_app.currentTest = "GPU Memory Latency";
+    g_app.progress = 0;
+
+    // ===== Create a SEPARATE VkDevice for compute work =====
+    // This isolates compute operations from the benchmark device's transfer queues.
+    // On AMD iGPUs, requesting queues from both compute (family 0) and dedicated transfer
+    // (family 1) on the same device causes driver-internal state corruption, leading to
+    // fence timeouts and GPU hangs during normal transfer operations.
+    // Using a separate device avoids this entirely.
+
+    VkDevice computeDevice = VK_NULL_HANDLE;
+    VkQueue computeQueue = VK_NULL_HANDLE;
+    VkCommandPool computeCommandPool = VK_NULL_HANDLE;
+    VkCommandBuffer computeCmdBuf = VK_NULL_HANDLE;
+    uint32_t computeFamily = UINT32_MAX;
+    double timestampPeriod = g_app.benchTimestampPeriod;
+
+    // 1. Find a compute-capable queue family with timestamp support
+    uint32_t queueFamilyCount = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(g_app.benchPhysicalDevice, &queueFamilyCount, nullptr);
+    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
+    vkGetPhysicalDeviceQueueFamilyProperties(g_app.benchPhysicalDevice, &queueFamilyCount, queueFamilies.data());
+
+    for (uint32_t i = 0; i < queueFamilyCount; i++) {
+        bool hasCompute = (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+        bool hasTimestamps = queueFamilies[i].timestampValidBits > 0;
+        if (hasCompute && hasTimestamps) {
+            computeFamily = i;
+            break;
+        }
+    }
+    if (computeFamily == UINT32_MAX) {
+        Log("[WARNING] No compute-capable queue with timestamps - skipping GPU memory latency test");
+        return result;
+    }
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Creating separate compute device (family " + std::to_string(computeFamily) + ") for memory latency test");
+
+    // 2. Create a separate VkDevice with ONLY the compute queue
+    float priority = 1.0f;
+    VkDeviceQueueCreateInfo computeQueueInfo = {};
+    computeQueueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    computeQueueInfo.queueFamilyIndex = computeFamily;
+    computeQueueInfo.queueCount = 1;
+    computeQueueInfo.pQueuePriorities = &priority;
+
+    VkDeviceCreateInfo deviceInfo = {};
+    deviceInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    deviceInfo.queueCreateInfoCount = 1;
+    deviceInfo.pQueueCreateInfos = &computeQueueInfo;
+
+    VkResult vr = vkCreateDevice(g_app.benchPhysicalDevice, &deviceInfo, nullptr, &computeDevice);
+    if (vr != VK_SUCCESS) {
+        Log("[ERROR] Failed to create compute device for memory latency test: " + std::to_string((int)vr));
+        return result;
+    }
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Compute device created successfully");
+
+    vkGetDeviceQueue(computeDevice, computeFamily, 0, &computeQueue);
+
+    // 3. Create command pool and buffer on compute device
+    VkCommandPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = computeFamily;
+    if (vkCreateCommandPool(computeDevice, &poolInfo, nullptr, &computeCommandPool) != VK_SUCCESS) {
+        Log("[ERROR] Failed to create compute command pool");
+        vkDestroyDevice(computeDevice, nullptr);
+        return result;
+    }
+
+    VkCommandBufferAllocateInfo cmdAllocInfo = {};
+    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAllocInfo.commandPool = computeCommandPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(computeDevice, &cmdAllocInfo, &computeCmdBuf) != VK_SUCCESS) {
+        Log("[ERROR] Failed to allocate compute command buffer");
+        vkDestroyCommandPool(computeDevice, computeCommandPool, nullptr);
+        vkDestroyDevice(computeDevice, nullptr);
+        return result;
+    }
+
+    // ===== Now create all resources on the compute device =====
+
+    // 4. Create shader module from embedded SPIR-V
+    VkShaderModuleCreateInfo shaderCreateInfo = {};
+    shaderCreateInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderCreateInfo.codeSize = g_memoryLatencySPIRVSize;
+    shaderCreateInfo.pCode = g_memoryLatencySPIRV;
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(computeDevice, &shaderCreateInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+        Log("[ERROR] Failed to create compute shader module");
+        vkDestroyCommandPool(computeDevice, computeCommandPool, nullptr);
+        vkDestroyDevice(computeDevice, nullptr);
+        return result;
+    }
+
+    // 5. Create descriptor set layout (1 storage buffer)
+    VkDescriptorSetLayoutBinding binding = {};
+    binding.binding = 0;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    binding.descriptorCount = 1;
+    binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &binding;
+    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+    vkCreateDescriptorSetLayout(computeDevice, &layoutInfo, nullptr, &descriptorSetLayout);
+
+    // 6. Create pipeline layout (descriptor set + push constants)
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.offset = 0;
+    pushRange.size = 8;  // numChases + startIndex
+
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    vkCreatePipelineLayout(computeDevice, &pipelineLayoutInfo, nullptr, &pipelineLayout);
+
+    // 7. Create compute pipeline
+    VkComputePipelineCreateInfo pipelineCreateInfo = {};
+    pipelineCreateInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    pipelineCreateInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineCreateInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineCreateInfo.stage.module = shaderModule;
+    pipelineCreateInfo.stage.pName = "main";
+    pipelineCreateInfo.layout = pipelineLayout;
+    VkPipeline computePipeline = VK_NULL_HANDLE;
+    vr = vkCreateComputePipelines(computeDevice, VK_NULL_HANDLE, 1, &pipelineCreateInfo, nullptr, &computePipeline);
+    if (vr != VK_SUCCESS) {
+        Log("[ERROR] Failed to create compute pipeline: " + std::to_string((int)vr));
+        vkDestroyShaderModule(computeDevice, shaderModule, nullptr);
+        vkDestroyPipelineLayout(computeDevice, pipelineLayout, nullptr);
+        vkDestroyDescriptorSetLayout(computeDevice, descriptorSetLayout, nullptr);
+        vkDestroyCommandPool(computeDevice, computeCommandPool, nullptr);
+        vkDestroyDevice(computeDevice, nullptr);
+        return result;
+    }
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Compute pipeline created successfully");
+
+    // 8. Generate chain data
+    const size_t numElements = Constants::MEMORY_LATENCY_BUFFER_SIZE / sizeof(uint32_t);
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Generating pointer-chase chain (" + std::to_string(numElements) + " elements, " + FormatSize(Constants::MEMORY_LATENCY_BUFFER_SIZE) + ")");
+    auto chainData = GeneratePointerChaseChain(numElements);
+
+    // 9. Create chain buffer (device-local, storage buffer compatible)
+    VkBufferCreateInfo chainBufInfo = {};
+    chainBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    chainBufInfo.size = Constants::MEMORY_LATENCY_BUFFER_SIZE;
+    chainBufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    chainBufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer chainBuffer = VK_NULL_HANDLE;
+    vkCreateBuffer(computeDevice, &chainBufInfo, nullptr, &chainBuffer);
+
+    VkMemoryRequirements chainMemReqs;
+    vkGetBufferMemoryRequirements(computeDevice, chainBuffer, &chainMemReqs);
+    VkMemoryAllocateInfo chainAllocInfo = {};
+    chainAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    chainAllocInfo.allocationSize = chainMemReqs.size;
+    chainAllocInfo.memoryTypeIndex = FindMemoryType(g_app.benchPhysicalDevice, chainMemReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkDeviceMemory chainMemory = VK_NULL_HANDLE;
+    vkAllocateMemory(computeDevice, &chainAllocInfo, nullptr, &chainMemory);
+    vkBindBufferMemory(computeDevice, chainBuffer, chainMemory, 0);
+
+    // 10. Create staging buffer and upload chain data
+    VkBufferCreateInfo stagingBufInfo = {};
+    stagingBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    stagingBufInfo.size = Constants::MEMORY_LATENCY_BUFFER_SIZE;
+    stagingBufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    stagingBufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    vkCreateBuffer(computeDevice, &stagingBufInfo, nullptr, &stagingBuffer);
+
+    VkMemoryRequirements stagingMemReqs;
+    vkGetBufferMemoryRequirements(computeDevice, stagingBuffer, &stagingMemReqs);
+    VkMemoryAllocateInfo stagingAllocInfo = {};
+    stagingAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    stagingAllocInfo.allocationSize = stagingMemReqs.size;
+    stagingAllocInfo.memoryTypeIndex = FindMemoryType(g_app.benchPhysicalDevice, stagingMemReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+    vkAllocateMemory(computeDevice, &stagingAllocInfo, nullptr, &stagingMemory);
+    vkBindBufferMemory(computeDevice, stagingBuffer, stagingMemory, 0);
+
+    // Map and copy chain data
+    void* mappedData = nullptr;
+    vkMapMemory(computeDevice, stagingMemory, 0, Constants::MEMORY_LATENCY_BUFFER_SIZE, 0, &mappedData);
+    memcpy(mappedData, chainData.data(), Constants::MEMORY_LATENCY_BUFFER_SIZE);
+    vkUnmapMemory(computeDevice, stagingMemory);
+
+    // Upload chain data via compute queue (compute families implicitly support transfer)
+    {
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(computeCmdBuf, &beginInfo);
+
+        VkBufferCopy copyRegion = {};
+        copyRegion.size = Constants::MEMORY_LATENCY_BUFFER_SIZE;
+        vkCmdCopyBuffer(computeCmdBuf, stagingBuffer, chainBuffer, 1, &copyRegion);
+
+        // Barrier: transfer write -> shader read (same queue family, no ownership transfer)
+        VkBufferMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = chainBuffer;
+        barrier.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(computeCmdBuf,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 1, &barrier, 0, nullptr);
+
+        vkEndCommandBuffer(computeCmdBuf);
+
+        VkFence uploadFence;
+        VkFenceCreateInfo fenceInfo = {};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        vkCreateFence(computeDevice, &fenceInfo, nullptr, &uploadFence);
+
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &computeCmdBuf;
+        vkQueueSubmit(computeQueue, 1, &submitInfo, uploadFence);
+        vkWaitForFences(computeDevice, 1, &uploadFence, VK_TRUE, UINT64_MAX);
+        vkDestroyFence(computeDevice, uploadFence, nullptr);
+    }
+
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Chain data uploaded successfully (" + FormatSize(Constants::MEMORY_LATENCY_BUFFER_SIZE) + ")");
+
+    // Free staging resources
+    vkDestroyBuffer(computeDevice, stagingBuffer, nullptr);
+    vkFreeMemory(computeDevice, stagingMemory, nullptr);
+
+    // 11. Create descriptor pool and set
+    VkDescriptorPoolSize descPoolSize = {};
+    descPoolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    descPoolSize.descriptorCount = 1;
+    VkDescriptorPoolCreateInfo descriptorPoolInfo = {};
+    descriptorPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    descriptorPoolInfo.maxSets = 1;
+    descriptorPoolInfo.poolSizeCount = 1;
+    descriptorPoolInfo.pPoolSizes = &descPoolSize;
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    vkCreateDescriptorPool(computeDevice, &descriptorPoolInfo, nullptr, &descriptorPool);
+
+    VkDescriptorSetAllocateInfo descAllocInfo = {};
+    descAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    descAllocInfo.descriptorPool = descriptorPool;
+    descAllocInfo.descriptorSetCount = 1;
+    descAllocInfo.pSetLayouts = &descriptorSetLayout;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    vkAllocateDescriptorSets(computeDevice, &descAllocInfo, &descriptorSet);
+
+    VkDescriptorBufferInfo bufferDescInfo = {};
+    bufferDescInfo.buffer = chainBuffer;
+    bufferDescInfo.offset = 0;
+    bufferDescInfo.range = Constants::MEMORY_LATENCY_BUFFER_SIZE;
+    VkWriteDescriptorSet writeDesc = {};
+    writeDesc.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writeDesc.dstSet = descriptorSet;
+    writeDesc.dstBinding = 0;
+    writeDesc.descriptorCount = 1;
+    writeDesc.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writeDesc.pBufferInfo = &bufferDescInfo;
+    vkUpdateDescriptorSets(computeDevice, 1, &writeDesc, 0, nullptr);
+
+    // 12. Create timestamp query pool
+    VkQueryPoolCreateInfo queryPoolInfo = {};
+    queryPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    queryPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    queryPoolInfo.queryCount = 2;
+    VkQueryPool queryPool = VK_NULL_HANDLE;
+    vkCreateQueryPool(computeDevice, &queryPoolInfo, nullptr, &queryPool);
+
+    // Push constants
+    struct { uint32_t numChases; uint32_t startIndex; } params = { Constants::MEMORY_LATENCY_NUM_CHASES, 0 };
+
+    // Fence for compute submissions
+    VkFence computeFence;
+    VkFenceCreateInfo computeFenceInfo = {};
+    computeFenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(computeDevice, &computeFenceInfo, nullptr, &computeFence);
+
+    // 13. Warmup dispatches
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Running " + std::to_string(Constants::MEMORY_LATENCY_WARMUP_DISPATCHES) + " warmup dispatches...");
+    for (int w = 0; w < Constants::MEMORY_LATENCY_WARMUP_DISPATCHES && !ShouldAbortBenchmark(); w++) {
+        vkResetCommandBuffer(computeCmdBuf, 0);
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(computeCmdBuf, &beginInfo);
+
+        vkCmdBindPipeline(computeCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+        vkCmdBindDescriptorSets(computeCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdPushConstants(computeCmdBuf, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &params);
+        vkCmdDispatch(computeCmdBuf, 1, 1, 1);
+
+        vkEndCommandBuffer(computeCmdBuf);
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &computeCmdBuf;
+        vkResetFences(computeDevice, 1, &computeFence);
+        vr = vkQueueSubmit(computeQueue, 1, &submitInfo, computeFence);
+        if (vr != VK_SUCCESS) {
+            Log("[ERROR] Warmup dispatch " + std::to_string(w) + " submit failed: " + std::to_string((int)vr));
+        }
+        vr = vkWaitForFences(computeDevice, 1, &computeFence, VK_TRUE, Constants::FENCE_WAIT_TIMEOUT_MS * 1000000ULL);
+        if (vr != VK_SUCCESS) {
+            Log("[ERROR] Warmup dispatch " + std::to_string(w) + " fence wait failed: " + std::to_string((int)vr));
+        }
+    }
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Warmup dispatches complete");
+
+    if (ShouldAbortBenchmark()) goto cleanup;
+
+    // 14. Measurement dispatches
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Running " + std::to_string(Constants::MEMORY_LATENCY_MEASURE_DISPATCHES) + " measurement dispatches...");
+    for (int m = 0; m < Constants::MEMORY_LATENCY_MEASURE_DISPATCHES && !ShouldAbortBenchmark(); m++) {
+        vkResetCommandBuffer(computeCmdBuf, 0);
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(computeCmdBuf, &beginInfo);
+
+        vkCmdResetQueryPool(computeCmdBuf, queryPool, 0, 2);
+        vkCmdWriteTimestamp(computeCmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queryPool, 0);
+
+        vkCmdBindPipeline(computeCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+        vkCmdBindDescriptorSets(computeCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+        vkCmdPushConstants(computeCmdBuf, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &params);
+        vkCmdDispatch(computeCmdBuf, 1, 1, 1);
+
+        vkCmdWriteTimestamp(computeCmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool, 1);
+
+        vkEndCommandBuffer(computeCmdBuf);
+        VkSubmitInfo submitInfo = {};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &computeCmdBuf;
+        vkResetFences(computeDevice, 1, &computeFence);
+        vr = vkQueueSubmit(computeQueue, 1, &submitInfo, computeFence);
+        if (vr != VK_SUCCESS) {
+            Log("[ERROR] Measurement dispatch " + std::to_string(m) + " submit failed: " + std::to_string((int)vr));
+            continue;
+        }
+        vr = vkWaitForFences(computeDevice, 1, &computeFence, VK_TRUE, Constants::FENCE_WAIT_TIMEOUT_MS * 1000000ULL);
+        if (vr != VK_SUCCESS) {
+            Log("[ERROR] Measurement dispatch " + std::to_string(m) + " fence wait failed: " + std::to_string((int)vr));
+            continue;
+        }
+
+        uint64_t timestamps[2] = {};
+        vr = vkGetQueryPoolResults(computeDevice, queryPool, 0, 2,
+            sizeof(timestamps), timestamps, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+        if (g_app.config.debugLogging && m == 0) {
+            Log("[DEBUG] Timestamp query result: " + std::to_string((int)vr) +
+                ", ts[0]=" + std::to_string(timestamps[0]) +
+                ", ts[1]=" + std::to_string(timestamps[1]) +
+                ", period=" + std::to_string(timestampPeriod) + " ns/tick");
+        }
+
+        if (vr == VK_SUCCESS && timestamps[1] > timestamps[0]) {
+            double totalNs = static_cast<double>(timestamps[1] - timestamps[0]) * static_cast<double>(timestampPeriod);
+            double perChaseNs = totalNs / Constants::MEMORY_LATENCY_NUM_CHASES;
+            result.samples.push_back(perChaseNs);
+        } else if (m == 0) {
+            Log("[WARNING] Invalid timestamps on first measurement: vr=" + std::to_string((int)vr) +
+                " ts[0]=" + std::to_string(timestamps[0]) +
+                " ts[1]=" + std::to_string(timestamps[1]));
+        }
+
+        g_app.progress = static_cast<float>(m + 1) / Constants::MEMORY_LATENCY_MEASURE_DISPATCHES;
+    }
+
+    // 15. Calculate statistics
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Memory latency test collected " + std::to_string(result.samples.size()) + " valid samples");
+
+    if (!result.samples.empty()) {
+        std::sort(result.samples.begin(), result.samples.end());
+        result.minValue = result.samples.front();
+        result.maxValue = result.samples.back();
+        double sum = 0;
+        for (double s : result.samples) sum += s;
+        result.avgValue = sum / result.samples.size();
+
+        if (g_app.config.debugLogging)
+            Log("[DEBUG] GPU Memory Latency: min=" + std::to_string(result.minValue) +
+                " avg=" + std::to_string(result.avgValue) +
+                " max=" + std::to_string(result.maxValue) + " ns");
+    } else {
+        Log("[WARNING] No valid memory latency samples collected");
+    }
+
+cleanup:
+    // 16. Cleanup — destroy everything on the compute device, then destroy the device itself
+    vkDeviceWaitIdle(computeDevice);
+    vkDestroyFence(computeDevice, computeFence, nullptr);
+    vkDestroyQueryPool(computeDevice, queryPool, nullptr);
+    vkDestroyDescriptorPool(computeDevice, descriptorPool, nullptr);
+    vkDestroyBuffer(computeDevice, chainBuffer, nullptr);
+    vkFreeMemory(computeDevice, chainMemory, nullptr);
+    vkDestroyPipeline(computeDevice, computePipeline, nullptr);
+    vkDestroyPipelineLayout(computeDevice, pipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(computeDevice, descriptorSetLayout, nullptr);
+    vkDestroyShaderModule(computeDevice, shaderModule, nullptr);
+    vkDestroyCommandPool(computeDevice, computeCommandPool, nullptr);
+    vkDestroyDevice(computeDevice, nullptr);
+
     return result;
 }
 
@@ -3974,9 +4558,10 @@ void BenchmarkThreadFunc() {
     }
     
     g_app.systemMemory = DetectSystemMemory();
+    EstimateRatedLatency(g_app.systemMemory);
     if (g_app.systemMemory.detected) {
         Log(FormatSystemMemoryInfo(g_app.systemMemory));
-        
+
         if (g_app.systemMemory.configuredSpeedMT > 0 && 
             g_app.systemMemory.speedMT > 0 &&
             g_app.systemMemory.configuredSpeedMT < g_app.systemMemory.speedMT * 0.85) {
@@ -4032,6 +4617,7 @@ void BenchmarkThreadFunc() {
     if (g_app.config.runBidirectional) testsPerRun++;
     if (g_app.config.runLatency) testsPerRun += 3;
     g_app.totalTests = testsPerRun * g_app.config.numRuns;
+    if (g_app.config.runMemoryLatency) g_app.totalTests++;  // Memory latency runs once (hardware constant)
 
     double avgUpload = 0, avgDownload = 0;
     double maxUpload = 0, maxDownload = 0;
@@ -4224,10 +4810,24 @@ void BenchmarkThreadFunc() {
             latGpuDefault.Destroy(g_app.benchDevice);
             latGpuSrc.Destroy(g_app.benchDevice);
             latCpuReadback.Destroy(g_app.benchDevice);
-            
+
             if (ShouldAbortBenchmark()) break;
         }
-        
+
+        // GPU Memory Latency test (compute shader pointer-chase)
+        // Only run on first run — measures hardware latency which doesn't vary between runs.
+        if (g_app.config.runMemoryLatency && !ShouldAbortBenchmark() && run == 1) {
+            auto resMemLat = RunMemoryLatencyTest();
+            if (!resMemLat.samples.empty()) {
+                resMemLat.testName = "GPU Memory Latency";
+                allResults.push_back(resMemLat);
+                Log("  GPU Memory Latency: " + std::to_string(resMemLat.avgValue).substr(0, 7) + " ns");
+            }
+            g_app.completedTests++;
+            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
+            if (ShouldAbortBenchmark()) break;
+        }
+
         successfulRuns++;
     }
 
@@ -4510,7 +5110,10 @@ void ExportCSV(const std::string& filename) {
         file << "Total Capacity," << g_app.systemMemory.totalCapacityGB << " GB\n";
         file << "Theoretical Bandwidth," << std::fixed << std::setprecision(1) << g_app.systemMemory.theoreticalBandwidth << " GB/s\n";
     }
-    
+    if (g_app.systemMemory.latencyEstimated) {
+        file << "Est. Chip Latency," << std::fixed << std::setprecision(1) << g_app.systemMemory.ratedLatencyNs << " ns (~CL" << g_app.systemMemory.estimatedCL << " typical for speed tier)\n";
+    }
+
     // Add eGPU detection info
     if (g_app.possibleEGPU) {
         file << "\neGPU Detection,Possible eGPU," << g_app.eGPUConnectionType << "\n";
@@ -4700,7 +5303,14 @@ void RenderGUI() {
             snprintf(ramBuf, sizeof(ramBuf), "  %s-channel (~%.0f GB/s)",
                     channelStr, g_app.systemMemory.theoreticalBandwidth * 0.8);  // ~80% efficiency
             ImGui::Text("%s", ramBuf);
-            
+
+            // Estimated chip latency (from speed tier lookup, not hardware)
+            if (g_app.systemMemory.latencyEstimated) {
+                snprintf(ramBuf, sizeof(ramBuf), "  Est. Chip Latency: ~%.1f ns (~CL%d typical)",
+                        g_app.systemMemory.ratedLatencyNs, g_app.systemMemory.estimatedCL);
+                ImGui::Text("%s", ramBuf);
+            }
+
             ImGui::PopStyleColor();
         }
     }
@@ -4754,7 +5364,19 @@ void RenderGUI() {
     ImGui::Spacing();
     ImGui::Checkbox("Run Bidirectional Test", &g_app.config.runBidirectional);
     ImGui::Checkbox("Run Latency Tests", &g_app.config.runLatency);
-    
+    ImGui::Checkbox("Run Memory Latency Test", &g_app.config.runMemoryLatency);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Measures GPU memory access latency using a compute shader pointer-chase.\n"
+                         "On discrete GPUs, this measures VRAM latency.\n"
+                         "On integrated GPUs (APUs), this measures system RAM latency\n"
+                         "from the GPU's perspective (includes fabric overhead).");
+    }
+    ImGui::Checkbox("Debug Logging", &g_app.config.debugLogging);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Enable verbose diagnostic logging for memory latency test\n"
+                         "and other internal operations. Useful for troubleshooting.");
+    }
+
     ImGui::Spacing();
     
     // Track previous state to detect changes
@@ -4928,8 +5550,10 @@ void RenderGUI() {
         g_app.config.numRuns = Constants::DEFAULT_NUM_RUNS;
         g_app.config.runBidirectional = true;
         g_app.config.runLatency = true;
+        g_app.config.runMemoryLatency = true;
         g_app.config.quickMode = false;
         g_app.config.averageRuns = true;
+        g_app.config.debugLogging = false;
         // Don't reset selectedGPU or clear results
         Log("[INFO] Settings reset to defaults");
     }
@@ -5259,11 +5883,61 @@ void RenderGUI() {
         ImGui::PopTextWrapPos();
         
         ImGui::Unindent();
-        
+
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-        
+
+        // Memory Latency section
+        {
+            bool hasMemLatency = false;
+            double measuredLatencyNs = 0, measuredLatencyMin = 0, measuredLatencyMax = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_app.resultsMutex);
+                for (const auto& r : g_app.results) {
+                    if (r.testName.find("GPU Memory Latency") != std::string::npos) {
+                        hasMemLatency = true;
+                        measuredLatencyNs = r.avgValue;
+                        measuredLatencyMin = r.minValue;
+                        measuredLatencyMax = r.maxValue;
+                        break;
+                    }
+                }
+            }
+            if (hasMemLatency || g_app.systemMemory.latencyEstimated) {
+                ImGui::TextColored(ImVec4(0.8f, 0.6f, 1.0f, 1.0f), "MEMORY LATENCY");
+                ImGui::Indent();
+                if (hasMemLatency) {
+                    ImGui::Text("GPU Measured: ");
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "~%.1f ns", measuredLatencyNs);
+                    ImGui::SameLine();
+                    const char* memType = gpu.isIntegrated ? "(system RAM via fabric)" : "(VRAM)";
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", memType);
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "  Range: %.1f - %.1f ns", measuredLatencyMin, measuredLatencyMax);
+                }
+                if (g_app.systemMemory.latencyEstimated) {
+                    ImGui::Text("Chip (estimated):");
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "~%.1f ns", g_app.systemMemory.ratedLatencyNs);
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(~CL%d typical for speed tier)", g_app.systemMemory.estimatedCL);
+                }
+                if (hasMemLatency && g_app.systemMemory.latencyEstimated && gpu.isIntegrated) {
+                    double overhead = measuredLatencyNs - g_app.systemMemory.ratedLatencyNs;
+                    if (overhead > 0) {
+                        ImGui::Text("Fabric Overhead: ");
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "~%.1f ns", overhead);
+                    }
+                }
+                ImGui::Unindent();
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+            }
+        }
+
         // Close button
         float buttonWidth = 120.0f;
         ImGui::SetCursorPosX((ImGui::GetWindowWidth() - buttonWidth) * 0.5f);
@@ -6255,6 +6929,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     
     // Detect system memory early
     g_app.systemMemory = DetectSystemMemory();
+    EstimateRatedLatency(g_app.systemMemory);
 
     // Prepare GPU combo
     g_app.gpuComboNames.clear();

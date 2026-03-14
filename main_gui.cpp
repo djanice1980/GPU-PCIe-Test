@@ -100,6 +100,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl.h>
 #include <setupapi.h>
@@ -133,6 +134,7 @@
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "d3dcompiler.lib")
 
 // ImGui headers (must be in imgui/ subfolder)
 #include "imgui/imgui.h"
@@ -188,7 +190,36 @@ namespace Constants {
 
     // Inter-batch sleep to avoid starving other work (microseconds)
     constexpr int BENCHMARK_SLEEP_US = 50;
+
+    // Memory latency compute shader test
+    constexpr size_t MEMORY_LATENCY_BUFFER_SIZE = 32ull * 1024 * 1024;  // 32 MB (> typical GPU L2 cache)
+    constexpr uint32_t MEMORY_LATENCY_NUM_CHASES = 100000;              // Pointer chases per dispatch
+    constexpr int MEMORY_LATENCY_WARMUP_DISPATCHES = 3;                 // Warmup dispatches (stabilize clocks)
+    constexpr int MEMORY_LATENCY_MEASURE_DISPATCHES = 10;               // Measurement dispatches
 }
+
+// Embedded HLSL compute shader for GPU memory latency measurement (pointer-chase)
+// A single thread chases a randomly-shuffled linked list through a large buffer,
+// forcing dependent loads that cannot be prefetched. Each load measures true memory
+// round-trip latency from the GPU's perspective.
+static const char* g_memoryLatencyHLSL = R"(
+RWStructuredBuffer<uint> chain : register(u0);
+
+cbuffer Params : register(b0) {
+    uint numChases;
+    uint startIndex;
+};
+
+[numthreads(1, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+    uint idx = startIndex;
+    [loop]
+    for (uint i = 0; i < numChases; i++) {
+        idx = chain[idx];
+    }
+    chain[0] = idx;  // prevent dead code elimination
+}
+)";
 
 // ============================================================================
 // DATA STRUCTURES
@@ -234,6 +265,9 @@ struct SystemMemoryInfo {
     double theoreticalBandwidth = 0;   // Calculated theoretical bandwidth in GB/s
     bool detected = false;             // True if WMI query succeeded
     std::string errorMessage;          // Error message if detection failed
+    double ratedLatencyNs = 0;         // Estimated chip latency from speed tier (ns)
+    int    estimatedCL = 0;            // Estimated CAS latency
+    bool   latencyEstimated = false;   // True if we found a matching speed tier
 };
 
 // VRAM test pattern types
@@ -333,8 +367,10 @@ struct BenchmarkConfig {
     int    numRuns = Constants::DEFAULT_NUM_RUNS;
     bool   runBidirectional = true;
     bool   runLatency = true;
+    bool   runMemoryLatency = true;  // GPU memory latency via compute shader pointer-chase
     bool   quickMode = false;
     bool   averageRuns = true;  // When false, record each run individually
+    bool   debugLogging = false;  // Verbose diagnostic logging for memory latency test etc.
     int    selectedGPU = 0;
 };
 
@@ -385,6 +421,37 @@ static const InterfaceSpeed MEMORY_STANDARDS[] = {
     {"DDR6-17600 DC",   225.3,  281.6, "Dual-channel DDR6-17600 (projected)"},
 };
 static const int NUM_MEMORY_STANDARDS = sizeof(MEMORY_STANDARDS) / sizeof(MEMORY_STANDARDS[0]);
+
+// Typical CAS latency by speed tier for rated chip latency estimation
+// Formula: latency_ns = CL / (speedMT / 2000.0) * 1000.0
+struct MemoryLatencyEntry {
+    uint32_t speedMT;       // Speed in MT/s
+    const char* type;       // "DDR4", "DDR5", "DDR6", etc.
+    int typicalCL;          // Typical CAS latency for this speed tier
+    double latencyNs;       // Pre-calculated chip latency in nanoseconds
+};
+
+static const MemoryLatencyEntry MEMORY_LATENCY_TABLE[] = {
+    { 2400,  "DDR4",    17, 14.17 },
+    { 2666,  "DDR4",    17, 12.76 },
+    { 3200,  "DDR4",    16, 10.00 },
+    { 3600,  "DDR4",    18, 10.00 },
+    { 4800,  "DDR5",    40, 16.67 },
+    { 5200,  "DDR5",    38, 14.62 },
+    { 5600,  "DDR5",    36, 12.86 },
+    { 6000,  "DDR5",    36, 12.00 },
+    { 6400,  "DDR5",    40, 12.50 },
+    { 6800,  "DDR5",    40, 11.76 },
+    { 7200,  "DDR5",    40, 11.11 },
+    { 7500,  "LPDDR5X", 36,  9.60 },
+    { 7600,  "DDR5",    40, 10.53 },
+    { 8000,  "DDR5",    40, 10.00 },
+    { 8533,  "LPDDR5X", 36,  8.44 },
+    { 8800,  "DDR5",    44, 10.00 },
+    { 12800, "DDR6",    52,  8.13 },  // projected
+    { 17600, "DDR6",    60,  6.82 },  // projected
+};
+static const int NUM_MEMORY_LATENCY_ENTRIES = sizeof(MEMORY_LATENCY_TABLE) / sizeof(MEMORY_LATENCY_TABLE[0]);
 
 // ============================================================================
 // APPLICATION STATE
@@ -823,8 +890,61 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
     if (mem.theoreticalBandwidth > 0) {
         oss << " (~" << std::fixed << std::setprecision(1) << mem.theoreticalBandwidth << " GB/s theoretical)";
     }
-    
+
+    if (mem.latencyEstimated) {
+        oss << " | Est. Chip Latency: ~" << std::fixed << std::setprecision(1)
+            << mem.ratedLatencyNs << " ns (~CL" << mem.estimatedCL << " typical for speed tier)";
+    }
+
     return oss.str();
+}
+
+// Estimate rated chip latency from detected memory speed tier
+// Uses lookup table of typical CAS latency values per speed/type combination
+void EstimateRatedLatency(SystemMemoryInfo& mem) {
+    if (mem.speedMT == 0 && mem.configuredSpeedMT == 0) return;
+    uint32_t speed = mem.configuredSpeedMT > 0 ? mem.configuredSpeedMT : mem.speedMT;
+
+    // Find closest speed tier in lookup table (matching memory type if known)
+    int bestIdx = -1;
+    uint32_t bestDiff = UINT32_MAX;
+    for (int i = 0; i < NUM_MEMORY_LATENCY_ENTRIES; i++) {
+        // If we know the memory type, only consider matching entries
+        if (!mem.type.empty() && mem.type.find(MEMORY_LATENCY_TABLE[i].type) == std::string::npos)
+            continue;
+        uint32_t diff = (speed > MEMORY_LATENCY_TABLE[i].speedMT)
+            ? speed - MEMORY_LATENCY_TABLE[i].speedMT
+            : MEMORY_LATENCY_TABLE[i].speedMT - speed;
+        if (diff < bestDiff) {
+            bestDiff = diff;
+            bestIdx = i;
+        }
+    }
+
+    // Fallback: if type filtering excluded everything, try without type filter
+    if (bestIdx < 0) {
+        for (int i = 0; i < NUM_MEMORY_LATENCY_ENTRIES; i++) {
+            uint32_t diff = (speed > MEMORY_LATENCY_TABLE[i].speedMT)
+                ? speed - MEMORY_LATENCY_TABLE[i].speedMT
+                : MEMORY_LATENCY_TABLE[i].speedMT - speed;
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIdx = i;
+            }
+        }
+    }
+
+    if (bestIdx >= 0) {
+        mem.estimatedCL = MEMORY_LATENCY_TABLE[bestIdx].typicalCL;
+        if (bestDiff == 0) {
+            // Exact match — use pre-calculated value
+            mem.ratedLatencyNs = MEMORY_LATENCY_TABLE[bestIdx].latencyNs;
+        } else {
+            // Interpolate: CL / (speed_MT / 2000) * 1000
+            mem.ratedLatencyNs = static_cast<double>(mem.estimatedCL) / (speed / 2000.0) * 1000.0;
+        }
+        mem.latencyEstimated = true;
+    }
 }
 
 // ============================================================================
@@ -2656,6 +2776,390 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
     return result;
 }
 
+// Generate a randomly-shuffled linked list for pointer-chase latency test.
+// Uses Sattolo's algorithm to create a single Hamiltonian cycle through all elements,
+// ensuring every element is visited exactly once before returning to the start.
+std::vector<uint32_t> GeneratePointerChaseChain(size_t numElements) {
+    std::vector<uint32_t> chain(numElements);
+    for (size_t i = 0; i < numElements; i++)
+        chain[i] = static_cast<uint32_t>(i);
+
+    // Sattolo's algorithm: guaranteed single cycle visiting all elements
+    std::mt19937 rng(42);  // Fixed seed for reproducibility
+    for (size_t i = numElements - 1; i > 0; i--) {
+        size_t j = std::uniform_int_distribution<size_t>(0, i - 1)(rng);
+        std::swap(chain[i], chain[j]);
+    }
+    return chain;
+}
+
+// Create a buffer with custom resource flags (needed for UAV-compatible buffers)
+ComPtr<ID3D12Resource> CreateBufferWithFlags(D3D12_HEAP_TYPE heapType, size_t size,
+                                              D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags) {
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = heapType;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = flags;
+
+    ComPtr<ID3D12Resource> resource;
+    HRESULT hr = g_app.benchDevice->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource));
+
+    if (FAILED(hr)) {
+        Log("[ERROR] CreateBufferWithFlags failed: HRESULT = 0x" + std::to_string(hr) +
+            " (Size: " + FormatSize(size) + ")");
+        return nullptr;
+    }
+    return resource;
+}
+
+// GPU memory latency test using compute shader pointer-chase.
+// Measures true memory round-trip latency by performing dependent loads through
+// a randomly-shuffled linked list in GPU memory. Each load depends on the result
+// of the previous load, preventing prefetching and measuring actual memory latency.
+BenchmarkResult RunMemoryLatencyTest() {
+    BenchmarkResult result;
+    result.testName = "GPU Memory Latency";
+    result.unit = "ns";
+
+    g_app.currentTest = "GPU Memory Latency";
+    g_app.progress = 0;
+
+    // ===== 1. Compile HLSL compute shader =====
+    ComPtr<ID3DBlob> shaderBlob, errorBlob;
+    HRESULT hr = D3DCompile(g_memoryLatencyHLSL, strlen(g_memoryLatencyHLSL),
+        "MemoryLatency", nullptr, nullptr, "CSMain", "cs_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shaderBlob, &errorBlob);
+
+    if (FAILED(hr)) {
+        std::string errMsg = "Shader compilation failed";
+        if (errorBlob) {
+            errMsg += ": " + std::string(static_cast<const char*>(errorBlob->GetBufferPointer()),
+                                          errorBlob->GetBufferSize());
+        }
+        Log("[ERROR] " + errMsg);
+        return result;
+    }
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Memory latency compute shader compiled successfully");
+
+    // ===== 2. Create root signature =====
+    // Root parameter 0: Descriptor table with 1 UAV (u0) for the chain buffer
+    // Root parameter 1: Root constants (2 x uint32: numChases, startIndex)
+    D3D12_DESCRIPTOR_RANGE uavRange = {};
+    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uavRange.NumDescriptors = 1;
+    uavRange.BaseShaderRegister = 0;  // u0
+    uavRange.RegisterSpace = 0;
+    uavRange.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER rootParams[2] = {};
+    // Param 0: UAV descriptor table
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[0].DescriptorTable.NumDescriptorRanges = 1;
+    rootParams[0].DescriptorTable.pDescriptorRanges = &uavRange;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    // Param 1: Root constants (numChases + startIndex = 2 uint32s = 8 bytes)
+    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParams[1].Constants.ShaderRegister = 0;  // b0
+    rootParams[1].Constants.RegisterSpace = 0;
+    rootParams[1].Constants.Num32BitValues = 2;
+    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rootSigDesc = {};
+    rootSigDesc.NumParameters = 2;
+    rootSigDesc.pParameters = rootParams;
+    rootSigDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    ComPtr<ID3DBlob> serializedRootSig, rootSigError;
+    hr = D3D12SerializeRootSignature(&rootSigDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                                      &serializedRootSig, &rootSigError);
+    if (FAILED(hr)) {
+        Log("[ERROR] Failed to serialize root signature");
+        return result;
+    }
+
+    ComPtr<ID3D12RootSignature> rootSignature;
+    hr = g_app.benchDevice->CreateRootSignature(0, serializedRootSig->GetBufferPointer(),
+                                                 serializedRootSig->GetBufferSize(),
+                                                 IID_PPV_ARGS(&rootSignature));
+    if (FAILED(hr)) {
+        Log("[ERROR] Failed to create root signature");
+        return result;
+    }
+
+    // ===== 3. Create compute pipeline state =====
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = rootSignature.Get();
+    psoDesc.CS.pShaderBytecode = shaderBlob->GetBufferPointer();
+    psoDesc.CS.BytecodeLength = shaderBlob->GetBufferSize();
+
+    ComPtr<ID3D12PipelineState> pso;
+    hr = g_app.benchDevice->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&pso));
+    if (FAILED(hr)) {
+        Log("[ERROR] Failed to create compute PSO");
+        return result;
+    }
+
+    // ===== 4. Create UAV descriptor heap =====
+    D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heapDesc.NumDescriptors = 1;
+    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+    ComPtr<ID3D12DescriptorHeap> uavHeap;
+    hr = g_app.benchDevice->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&uavHeap));
+    if (FAILED(hr)) {
+        Log("[ERROR] Failed to create UAV descriptor heap");
+        return result;
+    }
+
+    // ===== 5. Generate chain data =====
+    const size_t numElements = Constants::MEMORY_LATENCY_BUFFER_SIZE / sizeof(uint32_t);
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Generating pointer-chase chain (" + std::to_string(numElements) +
+            " elements, " + FormatSize(Constants::MEMORY_LATENCY_BUFFER_SIZE) + ")");
+    auto chainData = GeneratePointerChaseChain(numElements);
+
+    // ===== 6. Create chain buffer (device-local, UAV-compatible) =====
+    auto chainBuffer = CreateBufferWithFlags(D3D12_HEAP_TYPE_DEFAULT,
+        Constants::MEMORY_LATENCY_BUFFER_SIZE,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    if (!chainBuffer) {
+        Log("[ERROR] Failed to create chain buffer for memory latency test");
+        return result;
+    }
+
+    // ===== 7. Upload chain data via staging buffer =====
+    auto stagingBuffer = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD,
+        Constants::MEMORY_LATENCY_BUFFER_SIZE, D3D12_RESOURCE_STATE_GENERIC_READ);
+
+    if (!stagingBuffer) {
+        Log("[ERROR] Failed to create staging buffer for memory latency test");
+        return result;
+    }
+
+    // Map, copy chain data, unmap
+    {
+        void* mappedData = nullptr;
+        D3D12_RANGE readRange = { 0, 0 };  // Not reading
+        hr = stagingBuffer->Map(0, &readRange, &mappedData);
+        if (FAILED(hr)) {
+            Log("[ERROR] Failed to map staging buffer");
+            return result;
+        }
+        memcpy(mappedData, chainData.data(), Constants::MEMORY_LATENCY_BUFFER_SIZE);
+        stagingBuffer->Unmap(0, nullptr);
+    }
+
+    // Upload: copy staging → chain buffer
+    g_app.benchAllocator->Reset();
+    g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+    g_app.benchList->CopyResource(chainBuffer.Get(), stagingBuffer.Get());
+
+    // Transition chain buffer: COPY_DEST → UNORDERED_ACCESS
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = chainBuffer.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    g_app.benchList->ResourceBarrier(1, &barrier);
+
+    g_app.benchList->Close();
+    ID3D12CommandList* lists[] = { g_app.benchList.Get() };
+    g_app.benchQueue->ExecuteCommandLists(1, lists);
+    auto fenceResult = WaitForBenchFenceEx();
+    if (fenceResult != FenceWaitResult::Success) {
+        Log("[ERROR] Failed to upload chain data");
+        return result;
+    }
+
+    // Free staging buffer (no longer needed)
+    stagingBuffer.Reset();
+
+    // ===== 8. Create UAV for chain buffer =====
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    uavDesc.Buffer.FirstElement = 0;
+    uavDesc.Buffer.NumElements = static_cast<UINT>(numElements);
+    uavDesc.Buffer.StructureByteStride = sizeof(uint32_t);
+    uavDesc.Buffer.CounterOffsetInBytes = 0;
+    uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+
+    g_app.benchDevice->CreateUnorderedAccessView(
+        chainBuffer.Get(), nullptr, &uavDesc,
+        uavHeap->GetCPUDescriptorHandleForHeapStart());
+
+    // ===== 9. Create timestamp query heap =====
+    D3D12_QUERY_HEAP_DESC queryHeapDesc = {};
+    queryHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    queryHeapDesc.Count = 2;
+
+    ComPtr<ID3D12QueryHeap> queryHeap;
+    hr = g_app.benchDevice->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&queryHeap));
+    if (FAILED(hr)) {
+        Log("[ERROR] Failed to create timestamp query heap");
+        return result;
+    }
+
+    auto queryReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, sizeof(UINT64) * 2,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!queryReadback) {
+        Log("[ERROR] Failed to create query readback buffer");
+        return result;
+    }
+
+    UINT64 timestampFreq = 0;
+    g_app.benchQueue->GetTimestampFrequency(&timestampFreq);
+    if (timestampFreq == 0) {
+        Log("[ERROR] GPU reports zero timestamp frequency");
+        return result;
+    }
+
+    // ===== 10. Warmup dispatches =====
+    struct LatencyParams {
+        uint32_t numChases;
+        uint32_t startIndex;
+    };
+    LatencyParams params = { Constants::MEMORY_LATENCY_NUM_CHASES, 0 };
+
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Running " + std::to_string(Constants::MEMORY_LATENCY_WARMUP_DISPATCHES) + " warmup dispatches...");
+    for (int w = 0; w < Constants::MEMORY_LATENCY_WARMUP_DISPATCHES && !ShouldAbortBenchmark(); w++) {
+        g_app.benchAllocator->Reset();
+        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+
+        ID3D12DescriptorHeap* heaps[] = { uavHeap.Get() };
+        g_app.benchList->SetDescriptorHeaps(1, heaps);
+        g_app.benchList->SetComputeRootSignature(rootSignature.Get());
+        g_app.benchList->SetPipelineState(pso.Get());
+        g_app.benchList->SetComputeRootDescriptorTable(0, uavHeap->GetGPUDescriptorHandleForHeapStart());
+        g_app.benchList->SetComputeRoot32BitConstants(1, 2, &params, 0);
+        g_app.benchList->Dispatch(1, 1, 1);
+
+        g_app.benchList->Close();
+        g_app.benchQueue->ExecuteCommandLists(1, lists);
+        fenceResult = WaitForBenchFenceEx();
+        if (fenceResult != FenceWaitResult::Success) {
+            Log("[WARNING] Warmup dispatch " + std::to_string(w) + " timed out");
+        }
+    }
+
+    if (ShouldAbortBenchmark()) {
+        return result;
+    }
+
+    // ===== 11. Measurement dispatches =====
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Running " + std::to_string(Constants::MEMORY_LATENCY_MEASURE_DISPATCHES) + " measurement dispatches...");
+    int totalDispatches = Constants::MEMORY_LATENCY_MEASURE_DISPATCHES;
+
+    for (int m = 0; m < totalDispatches && !ShouldAbortBenchmark(); m++) {
+        g_app.benchAllocator->Reset();
+        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+
+        // Write start timestamp
+        g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+
+        // Set compute pipeline and dispatch
+        ID3D12DescriptorHeap* heaps[] = { uavHeap.Get() };
+        g_app.benchList->SetDescriptorHeaps(1, heaps);
+        g_app.benchList->SetComputeRootSignature(rootSignature.Get());
+        g_app.benchList->SetPipelineState(pso.Get());
+        g_app.benchList->SetComputeRootDescriptorTable(0, uavHeap->GetGPUDescriptorHandleForHeapStart());
+        g_app.benchList->SetComputeRoot32BitConstants(1, 2, &params, 0);
+        g_app.benchList->Dispatch(1, 1, 1);
+
+        // Write end timestamp
+        g_app.benchList->EndQuery(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+
+        // Resolve timestamps
+        g_app.benchList->ResolveQueryData(queryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                           0, 2, queryReadback.Get(), 0);
+
+        g_app.benchList->Close();
+        g_app.benchQueue->ExecuteCommandLists(1, lists);
+        fenceResult = WaitForBenchFenceEx();
+        if (fenceResult != FenceWaitResult::Success) {
+            Log("[WARNING] Measurement dispatch " + std::to_string(m) + " fence wait failed");
+            continue;
+        }
+
+        // Read timestamps
+        UINT64* timestamps = nullptr;
+        D3D12_RANGE readRange = { 0, sizeof(UINT64) * 2 };
+        hr = queryReadback->Map(0, &readRange, reinterpret_cast<void**>(&timestamps));
+        if (SUCCEEDED(hr) && timestamps) {
+            UINT64 tStart = timestamps[0];
+            UINT64 tEnd = timestamps[1];
+            D3D12_RANGE writeRange = { 0, 0 };
+            queryReadback->Unmap(0, &writeRange);
+
+            if (g_app.config.debugLogging && m == 0) {
+                Log("[DEBUG] Timestamp: tStart=" + std::to_string(tStart) +
+                    ", tEnd=" + std::to_string(tEnd) +
+                    ", freq=" + std::to_string(timestampFreq) + " Hz");
+            }
+
+            if (tEnd > tStart) {
+                double totalSeconds = static_cast<double>(tEnd - tStart) / static_cast<double>(timestampFreq);
+                double totalNs = totalSeconds * 1e9;
+                double perChaseNs = totalNs / Constants::MEMORY_LATENCY_NUM_CHASES;
+                result.samples.push_back(perChaseNs);
+            }
+        } else {
+            if (timestamps) {
+                D3D12_RANGE writeRange = { 0, 0 };
+                queryReadback->Unmap(0, &writeRange);
+            }
+        }
+
+        g_app.progress = static_cast<float>(m + 1) / totalDispatches;
+    }
+
+    // ===== 12. Calculate statistics =====
+    if (g_app.config.debugLogging)
+        Log("[DEBUG] Memory latency test collected " + std::to_string(result.samples.size()) + " valid samples");
+
+    if (!result.samples.empty()) {
+        std::sort(result.samples.begin(), result.samples.end());
+        result.minValue = result.samples.front();
+        result.maxValue = result.samples.back();
+        double sum = 0;
+        for (double s : result.samples) sum += s;
+        result.avgValue = sum / result.samples.size();
+
+        if (g_app.config.debugLogging)
+            Log("[DEBUG] GPU Memory Latency: min=" + std::to_string(result.minValue) +
+                " avg=" + std::to_string(result.avgValue) +
+                " max=" + std::to_string(result.maxValue) + " ns");
+    } else {
+        Log("[WARNING] No valid memory latency samples collected");
+    }
+
+    // ===== 13. Cleanup =====
+    queryReadback.Reset();
+    queryHeap.Reset();
+    chainBuffer.Reset();
+    uavHeap.Reset();
+    pso.Reset();
+    rootSignature.Reset();
+
+    return result;
+}
+
 BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
     g_app.currentTest = "Bidirectional " + FormatSize(size);
     BenchmarkResult result;
@@ -3431,6 +3935,7 @@ void BenchmarkThreadFunc() {
     
     // Detect and log system memory info (helps diagnose RAM-related bottlenecks)
     g_app.systemMemory = DetectSystemMemory();
+    EstimateRatedLatency(g_app.systemMemory);
     if (g_app.systemMemory.detected) {
         Log(FormatSystemMemoryInfo(g_app.systemMemory));
         
@@ -3492,6 +3997,7 @@ void BenchmarkThreadFunc() {
     if (g_app.config.runBidirectional) testsPerRun++;
     if (g_app.config.runLatency) testsPerRun += 3;  // Upload latency, Download latency, Command latency
     g_app.totalTests = testsPerRun * g_app.config.numRuns;
+    if (g_app.config.runMemoryLatency) g_app.totalTests++;  // Memory latency runs once (hardware constant)
 
     double avgUpload = 0, avgDownload = 0;
     double maxUpload = 0, maxDownload = 0;  // Track best (max) values for individual mode
@@ -3661,7 +4167,21 @@ void BenchmarkThreadFunc() {
             g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
             if (ShouldAbortBenchmark()) break;
         }
-        
+
+        // GPU Memory Latency test (compute shader pointer-chase)
+        // Only run on first run — measures hardware latency which doesn't vary between runs.
+        if (g_app.config.runMemoryLatency && !ShouldAbortBenchmark() && run == 1) {
+            auto resMemLat = RunMemoryLatencyTest();
+            if (!resMemLat.samples.empty()) {
+                resMemLat.testName = "GPU Memory Latency";
+                allResults.push_back(resMemLat);
+                Log("  GPU Memory Latency: " + std::to_string(resMemLat.avgValue).substr(0, 7) + " ns");
+            }
+            g_app.completedTests++;
+            g_app.overallProgress = float(g_app.completedTests) / float(g_app.totalTests);
+            if (ShouldAbortBenchmark()) break;
+        }
+
         successfulRuns++;
     }
 
@@ -3943,8 +4463,11 @@ void ExportCSV(const std::string& filename) {
         file << "DIMMs," << g_app.systemMemory.totalSticks << "\n";
         file << "Total Capacity," << g_app.systemMemory.totalCapacityGB << " GB\n";
         file << "Theoretical Bandwidth," << std::fixed << std::setprecision(1) << g_app.systemMemory.theoreticalBandwidth << " GB/s\n";
+        if (g_app.systemMemory.latencyEstimated) {
+            file << "Est. Chip Latency," << std::fixed << std::setprecision(1) << g_app.systemMemory.ratedLatencyNs << " ns (~CL" << g_app.systemMemory.estimatedCL << " typical for speed tier)\n";
+        }
     }
-    
+
     // Add eGPU detection info
     if (g_app.possibleEGPU) {
         file << "\neGPU Detection,Possible eGPU," << g_app.eGPUConnectionType << "\n";
@@ -4134,7 +4657,14 @@ void RenderGUI() {
             snprintf(ramBuf, sizeof(ramBuf), "  %s-channel (~%.0f GB/s)",
                     channelStr, g_app.systemMemory.theoreticalBandwidth * 0.8);  // ~80% efficiency
             ImGui::Text("%s", ramBuf);
-            
+
+            // Estimated chip latency (from speed tier lookup, not hardware)
+            if (g_app.systemMemory.latencyEstimated) {
+                snprintf(ramBuf, sizeof(ramBuf), "  Est. Chip Latency: ~%.1f ns (~CL%d typical)",
+                        g_app.systemMemory.ratedLatencyNs, g_app.systemMemory.estimatedCL);
+                ImGui::Text("%s", ramBuf);
+            }
+
             ImGui::PopStyleColor();
         }
     }
@@ -4188,7 +4718,19 @@ void RenderGUI() {
     ImGui::Spacing();
     ImGui::Checkbox("Run Bidirectional Test", &g_app.config.runBidirectional);
     ImGui::Checkbox("Run Latency Tests", &g_app.config.runLatency);
-    
+    ImGui::Checkbox("Run Memory Latency Test", &g_app.config.runMemoryLatency);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Measures GPU memory access latency using a compute shader pointer-chase.\n"
+                         "On discrete GPUs, this measures VRAM latency.\n"
+                         "On integrated GPUs (APUs), this measures system RAM latency\n"
+                         "from the GPU's perspective (includes fabric overhead).");
+    }
+    ImGui::Checkbox("Debug Logging", &g_app.config.debugLogging);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Enable verbose diagnostic logging for memory latency test\n"
+                         "and other internal operations. Useful for troubleshooting.");
+    }
+
     ImGui::Spacing();
     
     // Track previous state to detect changes
@@ -4362,8 +4904,10 @@ void RenderGUI() {
         g_app.config.numRuns = Constants::DEFAULT_NUM_RUNS;
         g_app.config.runBidirectional = true;
         g_app.config.runLatency = true;
+        g_app.config.runMemoryLatency = true;
         g_app.config.quickMode = false;
         g_app.config.averageRuns = true;
+        g_app.config.debugLogging = false;
         // Don't reset selectedGPU or clear results
         Log("[INFO] Settings reset to defaults");
     }
@@ -4697,14 +5241,75 @@ void RenderGUI() {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-        
+
+        // Memory Latency section (if measured or estimated)
+        {
+            bool hasMemLatency = false;
+            double measuredLatencyNs = 0;
+            double measuredLatencyMin = 0;
+            double measuredLatencyMax = 0;
+            {
+                std::lock_guard<std::mutex> lock(g_app.resultsMutex);
+                for (const auto& r : g_app.results) {
+                    if (r.testName.find("GPU Memory Latency") != std::string::npos) {
+                        hasMemLatency = true;
+                        measuredLatencyNs = r.avgValue;
+                        measuredLatencyMin = r.minValue;
+                        measuredLatencyMax = r.maxValue;
+                        break;
+                    }
+                }
+            }
+
+            if (hasMemLatency || g_app.systemMemory.latencyEstimated) {
+                ImGui::TextColored(ImVec4(0.8f, 0.6f, 1.0f, 1.0f), "MEMORY LATENCY");
+                ImGui::Indent();
+
+                if (hasMemLatency) {
+                    ImGui::Text("GPU Measured: ");
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "~%.1f ns", measuredLatencyNs);
+                    ImGui::SameLine();
+                    const char* memType = gpu.isIntegrated ? "(system RAM via fabric)" : "(VRAM)";
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s", memType);
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "  Range: %.1f - %.1f ns",
+                        measuredLatencyMin, measuredLatencyMax);
+                }
+
+                if (g_app.systemMemory.latencyEstimated) {
+                    ImGui::Text("Chip (estimated):");
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "~%.1f ns",
+                        g_app.systemMemory.ratedLatencyNs);
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(~CL%d typical for speed tier)",
+                        g_app.systemMemory.estimatedCL);
+                }
+
+                // Show fabric overhead for iGPU
+                if (hasMemLatency && g_app.systemMemory.latencyEstimated && gpu.isIntegrated) {
+                    double overhead = measuredLatencyNs - g_app.systemMemory.ratedLatencyNs;
+                    if (overhead > 0) {
+                        ImGui::Text("Fabric Overhead: ");
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "~%.1f ns", overhead);
+                    }
+                }
+                ImGui::Unindent();
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+            }
+        }
+
         // Close button
         float buttonWidth = 120.0f;
         ImGui::SetCursorPosX((ImGui::GetWindowWidth() - buttonWidth) * 0.5f);
         if (ImGui::Button("Close", ImVec2(buttonWidth, 30))) {
             g_app.showSummaryWindow = false;
         }
-        
+
         ImGui::End();
     }
 
@@ -5614,6 +6219,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     
     // Detect system memory early (needed for iGPU comparison and config display)
     g_app.systemMemory = DetectSystemMemory();
+    EstimateRatedLatency(g_app.systemMemory);
 
     // Prepare GPU combo (build once, not per frame)
     g_app.gpuComboNames.clear();
