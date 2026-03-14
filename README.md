@@ -38,6 +38,10 @@ A tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Measures re
 
 *Coming soon*
 
+## Download
+
+Pre-built Windows executables are available on the [Releases page](https://github.com/djanice1980/GPU-PCIe-Test/releases).
+
 ## Requirements
 
 ### Windows

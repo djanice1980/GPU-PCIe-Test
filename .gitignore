@@ -1,3 +1,7 @@
+# Compiled executables (distributed via GitHub Releases)
+GPU-PCIe-Test_GUI.exe
+Vulkan/GPU-PCIe-Test-Vulkan.exe
+
 # Build outputs
 *.obj
 *.pdb
