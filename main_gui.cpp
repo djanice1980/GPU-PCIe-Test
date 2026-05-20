@@ -126,6 +126,7 @@
 #include <map>
 #include <set>
 #include <random>
+#include <array>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -282,6 +283,30 @@ enum class VRAMTestPattern {
     AddressPattern      // Address-based pattern for location detection
 };
 
+// Classification of a memory error by physical mechanism. Knowing the kind
+// of error helps diagnose whether the fault is in a single wire, a chip's
+// internal logic, or the address bus.
+enum class VRAMErrorKind {
+    SingleBit,     // Exactly one bit flipped (single-wire / single-cell error)
+    MultiBit,      // 2-6 bits flipped (multi-bit transmission/burst error)
+    AddressBus,    // 7+ bits flipped with random distribution (wrong cell returned)
+    StuckAtZero,   // Read back 0x00000000 when non-zero was written
+    StuckAtOne,    // Read back 0xFFFFFFFF when non-FF was written
+    RefreshError   // Mismatch appeared on re-read after initial write succeeded
+};
+
+inline const char* GetErrorKindName(VRAMErrorKind k) {
+    switch (k) {
+        case VRAMErrorKind::SingleBit:    return "single-bit";
+        case VRAMErrorKind::MultiBit:     return "multi-bit";
+        case VRAMErrorKind::AddressBus:   return "address-bus";
+        case VRAMErrorKind::StuckAtZero:  return "stuck-at-0";
+        case VRAMErrorKind::StuckAtOne:   return "stuck-at-1";
+        case VRAMErrorKind::RefreshError: return "refresh";
+        default:                          return "unknown";
+    }
+}
+
 // VRAM error information
 struct VRAMError {
     size_t offsetStart = 0;     // Start offset of error region
@@ -290,6 +315,12 @@ struct VRAMError {
     uint32_t actual = 0;        // Actual value read back
     VRAMTestPattern pattern;    // Which pattern detected the error
     size_t errorCount = 0;      // Number of errors in this region
+
+    // Bit-level diagnostic info (populated by CompareBuffers for the first error in the cluster)
+    uint32_t bitFlipMask = 0;   // XOR(expected, actual) - bits that flipped
+    uint32_t bitFlipCount = 0;  // popcount(bitFlipMask)
+    int      bitIndex = -1;     // For SingleBit errors: 0-31; otherwise -1
+    VRAMErrorKind kind = VRAMErrorKind::SingleBit;
 };
 
 // VRAM test results
@@ -302,6 +333,11 @@ struct VRAMTestResult {
     std::vector<std::string> patternResults;  // Results per pattern
     double testDurationSeconds = 0;
     std::string summary;
+
+    // Aggregate bit-level error stats (across ALL chunks and patterns):
+    std::array<size_t, 32> bitFlipHistogram = {};  // bitFlipHistogram[b] = times bit b flipped
+    std::array<size_t, 6>  errorKindCounts  = {};  // Indexed by VRAMErrorKind enum order
+    size_t refreshPassErrors = 0;                  // Errors detected during re-read phase only
 };
 
 // PCIe generation speed in GT/s (gigatransfers per second)
@@ -358,6 +394,17 @@ struct BenchmarkResult {
     std::vector<double> samples;  // For graphing
 };
 
+// VRAM scan preset modes. Selecting a preset snaps all individual VRAM scan
+// options to predefined values; editing any individual option switches the
+// preset to Custom.
+enum class VRAMScanPreset {
+    Quick,      // 4 patterns, no re-read, no non-sequential, 50% coverage (~30s on 8GB)
+    Standard,   // All 8 patterns, no re-read, no non-sequential, 80% coverage (~2-3min) - default
+    Deep,       // All 8 + re-read x4 + non-sequential 64KB, 90% coverage (~5min)
+    Thorough,   // All 8 + re-read x10 + non-sequential 64KB, 95% coverage (~12-15min)
+    Custom      // User has manually edited individual options
+};
+
 struct BenchmarkConfig {
     size_t bandwidthSize = Constants::DEFAULT_BANDWIDTH_SIZE;
     size_t latencySize = Constants::DEFAULT_LATENCY_SIZE;
@@ -372,6 +419,18 @@ struct BenchmarkConfig {
     bool   averageRuns = true;  // When false, record each run individually
     bool   debugLogging = false;  // Verbose diagnostic logging for memory latency test etc.
     int    selectedGPU = 0;
+
+    // VRAM scan options (borrowed from memtest_vulkan-style stress testing)
+    // Pattern order matches VRAMTestPattern enum:
+    //   0=AllZeros, 1=AllOnes, 2=Checkerboard, 3=InverseCheckerboard,
+    //   4=Random, 5=MarchingOnes, 6=MarchingZeros, 7=AddressPattern
+    VRAMScanPreset vramScanPreset = VRAMScanPreset::Standard;
+    std::array<bool, 8> vramPatternsEnabled = { true, true, true, true, true, true, true, true };
+    bool   vramRereadEnabled = false;                // Re-read pass to catch refresh/retention errors
+    int    vramRereadIterations = 4;                 // Number of re-reads (1-20)
+    bool   vramNonSequentialEnabled = false;         // Shuffle block read order to defeat row buffer caching
+    int    vramNonSequentialBlockSize = 65536;       // 16384 / 65536 / 262144 (16/64/256 KB)
+    int    vramCoveragePercent = 80;                 // 50 / 80 / 90 / 95
 };
 
 struct InterfaceSpeed {
@@ -579,7 +638,7 @@ struct AppContext {
     std::atomic<float> vramTestProgress{ 0.0f };
     std::string vramTestCurrentPattern;
     bool showVRAMTestWindow = false;
-    bool vramTestFullScan = false;  // If true, test ~90% of VRAM instead of 80%
+    // (Coverage is now driven by g_app.config.vramCoveragePercent - see BenchmarkConfig)
 };
 
 static AppContext g_app;
@@ -3474,48 +3533,205 @@ void GenerateTestPattern(VRAMTestPattern pattern, uint32_t* data, size_t count, 
     }
 }
 
-// Compare buffers and find errors
+// Popcount on uint32_t. Portable manual implementation - avoids dependence on
+// compiler intrinsics so the code compiles cleanly on all 3 platform variants.
+inline uint32_t PopCount32(uint32_t v) {
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    v = (v + (v >> 4)) & 0x0F0F0F0Fu;
+    return (v * 0x01010101u) >> 24;
+}
+
+// Classify a single dword mismatch into a VRAMErrorKind by the pattern of
+// bits that differ between expected and actual. Borrowed from memtest_vulkan's
+// approach to error categorization.
+inline VRAMErrorKind ClassifyError(uint32_t expected, uint32_t actual,
+                                   uint32_t flipMask, uint32_t flipCount,
+                                   int* outBitIndex) {
+    if (outBitIndex) *outBitIndex = -1;
+
+    // Stuck-at: actual is all-zero or all-FF while expected was something else
+    if (actual == 0x00000000u && expected != 0x00000000u) return VRAMErrorKind::StuckAtZero;
+    if (actual == 0xFFFFFFFFu && expected != 0xFFFFFFFFu) return VRAMErrorKind::StuckAtOne;
+
+    if (flipCount == 1) {
+        // Single-bit flip - find which bit
+        if (outBitIndex) {
+            for (int b = 0; b < 32; ++b) {
+                if (flipMask & (1u << b)) { *outBitIndex = b; break; }
+            }
+        }
+        return VRAMErrorKind::SingleBit;
+    }
+    if (flipCount >= 2 && flipCount <= 6) {
+        return VRAMErrorKind::MultiBit;
+    }
+    // 7+ bits flipped - statistically this looks like a completely-different value,
+    // typical signature of an address-bus error (wrong cell was returned)
+    return VRAMErrorKind::AddressBus;
+}
+
+// Generate a Fisher-Yates shuffled list of block offsets covering [0, totalBytes).
+// Used to defeat row buffer caching when verifying VRAM contents - reading blocks
+// in a randomized order forces actual cell access instead of cached row reads.
+// Seeded from a fixed value for reproducibility across runs.
+std::vector<size_t> GenerateBlockReadOrder(size_t totalBytes, size_t blockBytes) {
+    if (blockBytes == 0) blockBytes = 65536;
+    size_t numBlocks = (totalBytes + blockBytes - 1) / blockBytes;
+    std::vector<size_t> order(numBlocks);
+    for (size_t i = 0; i < numBlocks; ++i) order[i] = i * blockBytes;
+    // Fixed seed - deterministic shuffle for reproducible scan behavior
+    std::mt19937 rng(0xCAFEBABEu);
+    // Fisher-Yates
+    for (size_t i = numBlocks; i > 1; --i) {
+        std::uniform_int_distribution<size_t> dist(0, i - 1);
+        size_t j = dist(rng);
+        std::swap(order[i - 1], order[j]);
+    }
+    return order;
+}
+
+// Internal helper: process a single dword mismatch - update the current cluster
+// or start a new one, populate bit-level diagnostic fields, and update result
+// aggregates (bit flip histogram, error kind counts).
+static void RecordDwordError(uint32_t expected, uint32_t actual, size_t byteOffset,
+                             VRAMTestPattern pattern, VRAMErrorKind forcedKind,
+                             bool forceKind,
+                             const size_t CLUSTER_THRESHOLD,
+                             VRAMError& currentCluster, bool& inCluster,
+                             std::vector<VRAMError>& errors,
+                             VRAMTestResult* aggResult)
+{
+    uint32_t flipMask = expected ^ actual;
+    uint32_t flipCount = PopCount32(flipMask);
+
+    int bitIdx = -1;
+    VRAMErrorKind kind = forceKind ? forcedKind
+                                   : ClassifyError(expected, actual, flipMask, flipCount, &bitIdx);
+    if (forceKind && kind == VRAMErrorKind::SingleBit && flipCount == 1) {
+        for (int b = 0; b < 32; ++b) {
+            if (flipMask & (1u << b)) { bitIdx = b; break; }
+        }
+    }
+
+    // Update aggregate stats (every dword error contributes - not just first in cluster)
+    if (aggResult) {
+        for (int b = 0; b < 32; ++b) {
+            if (flipMask & (1u << b)) aggResult->bitFlipHistogram[b]++;
+        }
+        size_t kindIdx = static_cast<size_t>(kind);
+        if (kindIdx < aggResult->errorKindCounts.size()) {
+            aggResult->errorKindCounts[kindIdx]++;
+        }
+        if (kind == VRAMErrorKind::RefreshError) aggResult->refreshPassErrors++;
+    }
+
+    if (!inCluster) {
+        // Start new cluster - record diagnostic fields from the first error in it
+        currentCluster = {};
+        currentCluster.offsetStart = byteOffset;
+        currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+        currentCluster.expected = expected;
+        currentCluster.actual = actual;
+        currentCluster.pattern = pattern;
+        currentCluster.errorCount = 1;
+        currentCluster.bitFlipMask = flipMask;
+        currentCluster.bitFlipCount = flipCount;
+        currentCluster.bitIndex = bitIdx;
+        currentCluster.kind = kind;
+        inCluster = true;
+    } else if (byteOffset - currentCluster.offsetEnd <= CLUSTER_THRESHOLD * sizeof(uint32_t)) {
+        // Extend current cluster
+        currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+        currentCluster.errorCount++;
+    } else {
+        // Close current cluster and start new one
+        errors.push_back(currentCluster);
+        currentCluster = {};
+        currentCluster.offsetStart = byteOffset;
+        currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+        currentCluster.expected = expected;
+        currentCluster.actual = actual;
+        currentCluster.pattern = pattern;
+        currentCluster.errorCount = 1;
+        currentCluster.bitFlipMask = flipMask;
+        currentCluster.bitFlipCount = flipCount;
+        currentCluster.bitIndex = bitIdx;
+        currentCluster.kind = kind;
+    }
+}
+
+// Compare buffers and find errors. If config.vramNonSequentialEnabled is true,
+// the read traversal is done in randomized block order to defeat row buffer
+// caching - exposing address-bus errors that sequential scans miss.
 void CompareBuffers(const uint32_t* expected, const uint32_t* actual, size_t count,
                    VRAMTestPattern pattern, std::vector<VRAMError>& errors,
-                   size_t baseOffset, size_t& totalErrorCount) {
-    
+                   size_t baseOffset, size_t& totalErrorCount,
+                   VRAMTestResult* aggResult = nullptr,
+                   bool forceRefreshKind = false) {
+
     const size_t CLUSTER_THRESHOLD = 256u;  // Merge errors within this range
     VRAMError currentCluster;
     bool inCluster = false;
-    
-    for (size_t i = 0; i < count; ++i) {
-        if (expected[i] != actual[i]) {
-            totalErrorCount++;
-            size_t byteOffset = baseOffset + (i * sizeof(uint32_t));
-            
-            if (!inCluster) {
-                // Start new cluster
-                currentCluster = {};
-                currentCluster.offsetStart = byteOffset;
-                currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
-                currentCluster.expected = expected[i];
-                currentCluster.actual = actual[i];
-                currentCluster.pattern = pattern;
-                currentCluster.errorCount = 1;
-                inCluster = true;
-            } else if (byteOffset - currentCluster.offsetEnd <= CLUSTER_THRESHOLD * sizeof(uint32_t)) {
-                // Extend current cluster
-                currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
-                currentCluster.errorCount++;
-            } else {
-                // Close current cluster and start new one
+
+    bool useNonSequential = g_app.config.vramNonSequentialEnabled;
+    size_t blockBytes = static_cast<size_t>(g_app.config.vramNonSequentialBlockSize);
+    if (blockBytes == 0) blockBytes = 65536;
+    size_t dwordsPerBlock = blockBytes / sizeof(uint32_t);
+    if (dwordsPerBlock == 0) dwordsPerBlock = 1;
+
+    if (useNonSequential && count > dwordsPerBlock) {
+        // Build shuffled block order (offsets in dwords)
+        size_t numBlocks = (count + dwordsPerBlock - 1) / dwordsPerBlock;
+        std::vector<size_t> blockOrder(numBlocks);
+        for (size_t i = 0; i < numBlocks; ++i) blockOrder[i] = i * dwordsPerBlock;
+        std::mt19937 rng(0xCAFEBABEu);
+        for (size_t i = numBlocks; i > 1; --i) {
+            std::uniform_int_distribution<size_t> dist(0, i - 1);
+            size_t j = dist(rng);
+            std::swap(blockOrder[i - 1], blockOrder[j]);
+        }
+
+        // Iterate blocks in shuffled order, but within each block iterate
+        // sequentially so cluster detection still works for nearby errors.
+        // Note: clusters won't span block boundaries when using non-sequential
+        // order, which is acceptable - the goal is exposing errors, not
+        // optimally clustering them.
+        for (size_t b = 0; b < numBlocks; ++b) {
+            size_t blockStart = blockOrder[b];
+            size_t blockEnd = std::min(blockStart + dwordsPerBlock, count);
+
+            // Each new block starts fresh - flush any open cluster
+            if (inCluster) {
                 errors.push_back(currentCluster);
-                currentCluster = {};
-                currentCluster.offsetStart = byteOffset;
-                currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
-                currentCluster.expected = expected[i];
-                currentCluster.actual = actual[i];
-                currentCluster.pattern = pattern;
-                currentCluster.errorCount = 1;
+                inCluster = false;
+            }
+
+            for (size_t i = blockStart; i < blockEnd; ++i) {
+                if (expected[i] != actual[i]) {
+                    totalErrorCount++;
+                    size_t byteOffset = baseOffset + (i * sizeof(uint32_t));
+                    RecordDwordError(expected[i], actual[i], byteOffset, pattern,
+                                     VRAMErrorKind::RefreshError, forceRefreshKind,
+                                     CLUSTER_THRESHOLD, currentCluster, inCluster,
+                                     errors, aggResult);
+                }
+            }
+        }
+    } else {
+        // Sequential traversal (original behavior)
+        for (size_t i = 0; i < count; ++i) {
+            if (expected[i] != actual[i]) {
+                totalErrorCount++;
+                size_t byteOffset = baseOffset + (i * sizeof(uint32_t));
+                RecordDwordError(expected[i], actual[i], byteOffset, pattern,
+                                 VRAMErrorKind::RefreshError, forceRefreshKind,
+                                 CLUSTER_THRESHOLD, currentCluster, inCluster,
+                                 errors, aggResult);
             }
         }
     }
-    
+
     // Close final cluster if any
     if (inCluster) {
         errors.push_back(currentCluster);
@@ -3609,13 +3825,81 @@ bool RunVRAMPatternTest(VRAMTestPattern pattern, size_t regionSize, size_t regio
     std::vector<uint32_t> expectedData(dwordCount);
     GenerateTestPattern(pattern, expectedData.data(), dwordCount, iteration);
     
-    // Compare
+    // Compare (passes &g_app.vramTestResult so bit-level error stats accumulate
+    // across all chunks and patterns)
     const uint32_t* actualData = static_cast<const uint32_t*>(readbackData);
-    CompareBuffers(expectedData.data(), actualData, dwordCount, pattern, errors, regionOffset, totalErrors);
-    
+    CompareBuffers(expectedData.data(), actualData, dwordCount, pattern, errors,
+                   regionOffset, totalErrors, &g_app.vramTestResult, false);
+
     readbackBuffer->Unmap(0, nullptr);
-    
+
     return true;
+}
+
+// Apply a VRAM scan preset by snapping all individual options to the preset's
+// values. Selecting "Custom" leaves current values unchanged.
+void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
+    cfg.vramScanPreset = preset;
+    switch (preset) {
+        case VRAMScanPreset::Quick:
+            // 4 patterns: zeros, ones, checker, random
+            cfg.vramPatternsEnabled = { true, true, true, false, true, false, false, false };
+            cfg.vramRereadEnabled = false;
+            cfg.vramRereadIterations = 4;
+            cfg.vramNonSequentialEnabled = false;
+            cfg.vramNonSequentialBlockSize = 65536;
+            cfg.vramCoveragePercent = 50;
+            break;
+        case VRAMScanPreset::Standard:
+            cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
+            cfg.vramRereadEnabled = false;
+            cfg.vramRereadIterations = 4;
+            cfg.vramNonSequentialEnabled = false;
+            cfg.vramNonSequentialBlockSize = 65536;
+            cfg.vramCoveragePercent = 80;
+            break;
+        case VRAMScanPreset::Deep:
+            cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
+            cfg.vramRereadEnabled = true;
+            cfg.vramRereadIterations = 4;
+            cfg.vramNonSequentialEnabled = true;
+            cfg.vramNonSequentialBlockSize = 65536;
+            cfg.vramCoveragePercent = 90;
+            break;
+        case VRAMScanPreset::Thorough:
+            cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
+            cfg.vramRereadEnabled = true;
+            cfg.vramRereadIterations = 10;
+            cfg.vramNonSequentialEnabled = true;
+            cfg.vramNonSequentialBlockSize = 65536;
+            cfg.vramCoveragePercent = 95;
+            break;
+        case VRAMScanPreset::Custom:
+        default:
+            // Leave individual values as-is
+            break;
+    }
+}
+
+// Inverse of ApplyVRAMScanPreset: return the preset that exactly matches the
+// current individual settings, or Custom if none match. Called whenever the
+// user edits an individual option so the preset dropdown shows the right value.
+VRAMScanPreset DetectVRAMScanPreset(const BenchmarkConfig& cfg) {
+    auto matches = [&](const BenchmarkConfig& tmp) -> bool {
+        return tmp.vramPatternsEnabled == cfg.vramPatternsEnabled
+            && tmp.vramRereadEnabled == cfg.vramRereadEnabled
+            && tmp.vramRereadIterations == cfg.vramRereadIterations
+            && tmp.vramNonSequentialEnabled == cfg.vramNonSequentialEnabled
+            && tmp.vramNonSequentialBlockSize == cfg.vramNonSequentialBlockSize
+            && tmp.vramCoveragePercent == cfg.vramCoveragePercent;
+    };
+    for (auto p : { VRAMScanPreset::Quick, VRAMScanPreset::Standard,
+                    VRAMScanPreset::Deep, VRAMScanPreset::Thorough }) {
+        BenchmarkConfig tmp;
+        ApplyVRAMScanPreset(p, tmp);
+        if (matches(tmp)) return p;
+    }
+    return VRAMScanPreset::Custom;
 }
 
 // Main VRAM test thread function
@@ -3648,21 +3932,25 @@ void VRAMTestThreadFunc() {
         return;
     }
     
-    // Calculate test size
-    // Default: 80% of VRAM (safe margin for driver/system use)
-    // Full scan: Try to find maximum allocatable, starting at 90%
+    // Calculate test size from configured coverage percent (50/80/90/95)
     const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
-    
-    // Calculate target test size based on percentage
-    double targetPercent = g_app.vramTestFullScan ? 0.90 : Constants::VRAM_SAFETY_MARGIN;
+
+    int coveragePct = g_app.config.vramCoveragePercent;
+    if (coveragePct < 10) coveragePct = 10;
+    if (coveragePct > 99) coveragePct = 99;
+    double targetPercent = coveragePct / 100.0;
     size_t targetTestSize = static_cast<size_t>(gpu.dedicatedVRAM * targetPercent);
-    
-    if (g_app.vramTestFullScan) {
-        Log("FULL SCAN MODE: Attempting to test up to " + FormatSize(targetTestSize) + " (~90%) of VRAM");
-        Log("[WARNING] Full scan allocates maximum possible VRAM - may cause instability");
-    } else {
-        Log("Testing up to " + FormatSize(targetTestSize) + " (~80%) of VRAM");
-        Log("(Enable 'Full Scan' for more thorough testing)");
+
+    Log("Coverage target: " + std::to_string(coveragePct) + "% (" + FormatSize(targetTestSize) + ")");
+    if (coveragePct >= 90) {
+        Log("[WARNING] High coverage allocates near-maximum VRAM - may cause instability");
+    }
+    if (g_app.config.vramRereadEnabled) {
+        Log("Refresh check enabled: " + std::to_string(g_app.config.vramRereadIterations) + " re-reads per chunk");
+    }
+    if (g_app.config.vramNonSequentialEnabled) {
+        Log("Address-bus check enabled: non-sequential read order, "
+            + FormatSize((size_t)g_app.config.vramNonSequentialBlockSize) + " blocks");
     }
     Log("");
     
@@ -3674,16 +3962,35 @@ void VRAMTestThreadFunc() {
     Log("We test as much as can be allocated via D3D12.");
     Log("");
     
-    // Define test patterns
-    std::vector<VRAMTestPattern> patterns = {
-        VRAMTestPattern::AllZeros,
-        VRAMTestPattern::AllOnes,
-        VRAMTestPattern::Checkerboard,
-        VRAMTestPattern::InverseCheckerboard,
-        VRAMTestPattern::AddressPattern,
-        VRAMTestPattern::Random
+    // Define test patterns - filtered by user's per-pattern enable flags.
+    // Order matches VRAMTestPattern enum / BenchmarkConfig::vramPatternsEnabled[].
+    std::vector<VRAMTestPattern> patterns;
+    auto maybeAdd = [&](VRAMTestPattern p, int idx) {
+        if (idx >= 0 && idx < (int)g_app.config.vramPatternsEnabled.size()
+            && g_app.config.vramPatternsEnabled[idx]) {
+            patterns.push_back(p);
+        }
     };
-    
+    maybeAdd(VRAMTestPattern::AllZeros,            0);
+    maybeAdd(VRAMTestPattern::AllOnes,             1);
+    maybeAdd(VRAMTestPattern::Checkerboard,        2);
+    maybeAdd(VRAMTestPattern::InverseCheckerboard, 3);
+    maybeAdd(VRAMTestPattern::Random,              4);
+    // Marching ones/zeros and address pattern are added separately below
+    bool useMarchingOnes  = g_app.config.vramPatternsEnabled.size() > 5 && g_app.config.vramPatternsEnabled[5];
+    bool useMarchingZeros = g_app.config.vramPatternsEnabled.size() > 6 && g_app.config.vramPatternsEnabled[6];
+    bool useAddressPattern = g_app.config.vramPatternsEnabled.size() > 7 && g_app.config.vramPatternsEnabled[7];
+    if (useAddressPattern) {
+        patterns.push_back(VRAMTestPattern::AddressPattern);
+    }
+
+    if (patterns.empty() && !useMarchingOnes && !useMarchingZeros) {
+        Log("[ERROR] No test patterns enabled - nothing to do");
+        g_app.vramTestResult.completed = false;
+        g_app.vramTestRunning = false;
+        return;
+    }
+
     // Marching patterns iterations
     const int MARCH_ITERATIONS = 4;  // Reduced from 8 for speed in multi-chunk mode
     
@@ -3733,7 +4040,12 @@ void VRAMTestThreadFunc() {
     
     // Calculate number of chunks to test
     size_t numChunks = (targetTestSize + chunkSize - 1) / chunkSize;
-    size_t patternsPerChunk = patterns.size() + 2;  // Basic patterns + marching ones + marching zeros
+    // Steps per chunk = basic patterns + (marching-ones if enabled) + (marching-zeros if enabled) + (refresh check if enabled)
+    size_t patternsPerChunk = patterns.size()
+                            + (useMarchingOnes ? 1 : 0)
+                            + (useMarchingZeros ? 1 : 0)
+                            + (g_app.config.vramRereadEnabled ? 1 : 0);
+    if (patternsPerChunk == 0) patternsPerChunk = 1;  // Avoid div-by-zero
     size_t totalSteps = numChunks * patternsPerChunk;
     size_t completedSteps = 0;
     
@@ -3742,9 +4054,16 @@ void VRAMTestThreadFunc() {
     snprintf(percentBuf, sizeof(percentBuf), "%.0f%%", targetPercentDisplay);
     
     Log("");
-    Log("Will test " + FormatSize(targetTestSize) + " (" + percentBuf + " of VRAM) in " + 
+    Log("Will test " + FormatSize(targetTestSize) + " (" + percentBuf + " of VRAM) in " +
         std::to_string(numChunks) + " chunks");
-    Log("Each chunk: 6 basic patterns + marching ones + marching zeros");
+    // Build a descriptive list of what runs each chunk
+    {
+        std::string per = "Each chunk: " + std::to_string(patterns.size()) + " patterns";
+        if (useMarchingOnes)  per += " + marching-ones";
+        if (useMarchingZeros) per += " + marching-zeros";
+        if (g_app.config.vramRereadEnabled) per += " + refresh check x" + std::to_string(g_app.config.vramRereadIterations);
+        Log(per);
+    }
     Log("Reallocating between chunks to potentially hit different physical regions");
     Log("");
     
@@ -3798,11 +4117,11 @@ void VRAMTestThreadFunc() {
             chunkErrors += patternErrors;
         }
         
-        // Run marching ones (condensed - 4 iterations per chunk)
-        if (!g_app.vramTestCancelRequested && !chunkFailed) {
-            g_app.vramTestCurrentPattern = "Marching [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+        // Run marching ones (condensed - 4 iterations per chunk) if enabled
+        if (useMarchingOnes && !g_app.vramTestCancelRequested && !chunkFailed) {
+            g_app.vramTestCurrentPattern = "Marching ones [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
             g_app.fenceTimeoutCount = 0;
-            
+
             for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
                 size_t marchErrors = 0;
                 if (!RunVRAMPatternTest(VRAMTestPattern::MarchingOnes, thisChunkSize, chunkOffset,
@@ -3813,7 +4132,13 @@ void VRAMTestThreadFunc() {
                 }
                 chunkErrors += marchErrors;
             }
-            
+        }
+
+        // Run marching zeros if enabled
+        if (useMarchingZeros && !g_app.vramTestCancelRequested && !chunkFailed) {
+            g_app.vramTestCurrentPattern = "Marching zeros [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+            g_app.fenceTimeoutCount = 0;
+
             for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
                 size_t marchErrors = 0;
                 if (!RunVRAMPatternTest(VRAMTestPattern::MarchingZeros, thisChunkSize, chunkOffset,
@@ -3825,7 +4150,83 @@ void VRAMTestThreadFunc() {
                 chunkErrors += marchErrors;
             }
         }
-        
+
+        // Refresh check (re-read pass): write a known random pattern then read
+        // it back N times with brief delays. Drift between reads = data
+        // retention / refresh cycle errors. Borrowed from memtest_vulkan's
+        // "write once, re-read many" approach.
+        if (g_app.config.vramRereadEnabled && !g_app.vramTestCancelRequested && !chunkFailed) {
+            int rereadIters = g_app.config.vramRereadIterations;
+            if (rereadIters < 1) rereadIters = 1;
+            if (rereadIters > 20) rereadIters = 20;
+
+            g_app.vramTestCurrentPattern = "Refresh check [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+            g_app.fenceTimeoutCount = 0;
+
+            // Step 1: write a fixed random pattern to GPU memory (one time)
+            size_t regionSize = thisChunkSize & ~3ULL;
+            size_t dwordCount = regionSize / sizeof(uint32_t);
+            std::vector<uint32_t> expectedData(dwordCount);
+            // Use a different RNG seed than VRAMTestPattern::Random so we don't
+            // collide with that pattern's reproducibility behavior.
+            std::mt19937 refreshRng(0xFEEDF00Du + static_cast<uint32_t>(chunkNum));
+            std::uniform_int_distribution<uint32_t> dist;
+            for (size_t i = 0; i < dwordCount; ++i) expectedData[i] = dist(refreshRng);
+
+            void* uploadMap = nullptr;
+            D3D12_RANGE writeReadRange = { 0, 0 };
+            if (SUCCEEDED(uploadBuffer->Map(0, &writeReadRange, &uploadMap)) && uploadMap) {
+                memcpy(uploadMap, expectedData.data(), regionSize);
+                D3D12_RANGE writtenRange = { 0, regionSize };
+                uploadBuffer->Unmap(0, &writtenRange);
+
+                // Copy upload -> GPU once
+                g_app.benchAllocator->Reset();
+                g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+                g_app.benchList->CopyResource(gpuBuffer.Get(), uploadBuffer.Get());
+                g_app.benchList->Close();
+                ID3D12CommandList* writeList[] = { g_app.benchList.Get() };
+                g_app.benchQueue->ExecuteCommandLists(1, writeList);
+                if (WaitForBenchFenceEx() == FenceWaitResult::Success) {
+                    // Step 2: re-read N times with brief delays
+                    for (int rr = 0; rr < rereadIters && !g_app.vramTestCancelRequested && !chunkFailed; ++rr) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+                        g_app.benchAllocator->Reset();
+                        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+                        g_app.benchList->CopyResource(readbackBuffer.Get(), gpuBuffer.Get());
+                        g_app.benchList->Close();
+                        ID3D12CommandList* readList[] = { g_app.benchList.Get() };
+                        g_app.benchQueue->ExecuteCommandLists(1, readList);
+                        if (WaitForBenchFenceEx() != FenceWaitResult::Success) {
+                            Log("[WARNING] Refresh check fence wait failed on iter " + std::to_string(rr));
+                            break;
+                        }
+
+                        D3D12_RANGE readbackRange = { 0, regionSize };
+                        void* readbackData = nullptr;
+                        if (FAILED(readbackBuffer->Map(0, &readbackRange, &readbackData))) {
+                            Log("[WARNING] Refresh check could not map readback buffer");
+                            break;
+                        }
+                        const uint32_t* actualData = static_cast<const uint32_t*>(readbackData);
+                        size_t refreshErrors = 0;
+                        // forceRefreshKind=true tags all errors as RefreshError
+                        CompareBuffers(expectedData.data(), actualData, dwordCount,
+                                       VRAMTestPattern::Random, allErrors,
+                                       chunkOffset, refreshErrors,
+                                       &g_app.vramTestResult, true);
+                        readbackBuffer->Unmap(0, nullptr);
+                        chunkErrors += refreshErrors;
+                    }
+                } else {
+                    Log("[WARNING] Refresh check initial write fence wait failed");
+                }
+            } else {
+                Log("[WARNING] Refresh check could not map upload buffer");
+            }
+        }
+
         // Release buffers to free VRAM for next chunk allocation
         uploadBuffer.Reset();
         gpuBuffer.Reset();
@@ -4908,6 +5309,8 @@ void RenderGUI() {
         g_app.config.quickMode = false;
         g_app.config.averageRuns = true;
         g_app.config.debugLogging = false;
+        // Reset VRAM scan options to the Standard preset
+        ApplyVRAMScanPreset(VRAMScanPreset::Standard, g_app.config);
         // Don't reset selectedGPU or clear results
         Log("[INFO] Settings reset to defaults");
     }
@@ -4935,14 +5338,128 @@ void RenderGUI() {
         ImGui::Spacing();
     }
     
-    // Full Scan checkbox (only when not running and not iGPU)
+    // VRAM scan options (only when not running and not iGPU)
     if (!g_app.vramTestRunning && !isIntegratedGPU) {
-        ImGui::Checkbox("Full Scan (~90%)", &g_app.vramTestFullScan);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Test ~90%% of VRAM instead of default ~80%%.\n"
-                             "More thorough but may cause instability.\n"
-                             "Use if standard scan passes but you suspect issues.");
+        // ----- Preset dropdown -----
+        static const char* PRESET_NAMES[] = { "Quick", "Standard", "Deep", "Thorough", "Custom" };
+        int presetIdx = static_cast<int>(g_app.config.vramScanPreset);
+        if (presetIdx < 0 || presetIdx > 4) presetIdx = 1;
+        ImGui::Text("Scan preset:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140);
+        if (ImGui::Combo("##VRAMPreset", &presetIdx, PRESET_NAMES, IM_ARRAYSIZE(PRESET_NAMES))) {
+            ApplyVRAMScanPreset(static_cast<VRAMScanPreset>(presetIdx), g_app.config);
         }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Quick: 4 patterns, 50%% coverage (~30s)\n"
+                             "Standard: 8 patterns, 80%% coverage (~2-3min) - default\n"
+                             "Deep: 8 patterns + refresh + address-bus checks, 90%% (~5min)\n"
+                             "Thorough: same as Deep with 10x re-reads, 95%% (~12-15min)\n"
+                             "Custom: whatever you set individually below");
+        }
+
+        // Helper lambda: any edit to an individual control flips preset to Custom
+        auto markCustomIfChanged = [](bool changed) {
+            if (changed) g_app.config.vramScanPreset = DetectVRAMScanPreset(g_app.config);
+        };
+
+        // ----- Patterns (collapsible) -----
+        int enabledCount = 0;
+        for (bool b : g_app.config.vramPatternsEnabled) if (b) enabledCount++;
+        char patternHeader[64];
+        snprintf(patternHeader, sizeof(patternHeader), "Patterns (%d of 8 enabled)###VRAMPatHdr", enabledCount);
+        if (ImGui::TreeNode(patternHeader)) {
+            static const char* PATTERN_LABELS[8] = {
+                "All Zeros", "All Ones", "Checkerboard", "Inverse Checkerboard",
+                "Random", "Marching Ones", "Marching Zeros", "Address Pattern"
+            };
+            // Two columns of 4
+            for (int row = 0; row < 4; ++row) {
+                for (int col = 0; col < 2; ++col) {
+                    int idx = row + col * 4;
+                    bool v = g_app.config.vramPatternsEnabled[idx];
+                    if (col > 0) ImGui::SameLine(220);
+                    if (ImGui::Checkbox(PATTERN_LABELS[idx], &v)) {
+                        g_app.config.vramPatternsEnabled[idx] = v;
+                        markCustomIfChanged(true);
+                    }
+                }
+            }
+            ImGui::TreePop();
+        }
+
+        // ----- Stress checks (collapsible) -----
+        if (ImGui::TreeNode("Stress checks###VRAMStressHdr")) {
+            bool rr = g_app.config.vramRereadEnabled;
+            if (ImGui::Checkbox("Refresh check (re-read pass)", &rr)) {
+                g_app.config.vramRereadEnabled = rr;
+                markCustomIfChanged(true);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("After writing each chunk, re-read it multiple times\n"
+                                 "with brief delays. Drift between reads = a\n"
+                                 "data retention / refresh cycle error.");
+            }
+            if (g_app.config.vramRereadEnabled) {
+                int iters = g_app.config.vramRereadIterations;
+                ImGui::Indent();
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::SliderInt("Iterations", &iters, 1, 20)) {
+                    g_app.config.vramRereadIterations = iters;
+                    markCustomIfChanged(true);
+                }
+                ImGui::Unindent();
+            }
+
+            bool ns = g_app.config.vramNonSequentialEnabled;
+            if (ImGui::Checkbox("Address-bus check (non-sequential reads)", &ns)) {
+                g_app.config.vramNonSequentialEnabled = ns;
+                markCustomIfChanged(true);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Read back chunks in randomized block order to defeat\n"
+                                 "row buffer caching. Exposes address-bus errors and\n"
+                                 "weakly-charged cells that sequential reads hide.");
+            }
+            if (g_app.config.vramNonSequentialEnabled) {
+                static const char* BLOCK_LABELS[] = { "16 KB", "64 KB", "256 KB" };
+                static const int   BLOCK_VALUES[] = { 16384, 65536, 262144 };
+                int blockIdx = 1;  // 64 KB default
+                for (int i = 0; i < 3; ++i) {
+                    if (g_app.config.vramNonSequentialBlockSize == BLOCK_VALUES[i]) { blockIdx = i; break; }
+                }
+                ImGui::Indent();
+                ImGui::SetNextItemWidth(120);
+                if (ImGui::Combo("Block size##VRAMNSBlock", &blockIdx, BLOCK_LABELS, IM_ARRAYSIZE(BLOCK_LABELS))) {
+                    g_app.config.vramNonSequentialBlockSize = BLOCK_VALUES[blockIdx];
+                    markCustomIfChanged(true);
+                }
+                ImGui::Unindent();
+            }
+            ImGui::TreePop();
+        }
+
+        // ----- Coverage slider -----
+        static const char* COVERAGE_LABELS[] = { "50%%", "80%%", "90%%", "95%%" };
+        static const int   COVERAGE_VALUES[] = { 50, 80, 90, 95 };
+        int covIdx = 1;  // 80% default
+        for (int i = 0; i < 4; ++i) {
+            if (g_app.config.vramCoveragePercent == COVERAGE_VALUES[i]) { covIdx = i; break; }
+        }
+        ImGui::Text("Coverage:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(180);
+        if (ImGui::Combo("##VRAMCoverage", &covIdx, COVERAGE_LABELS, IM_ARRAYSIZE(COVERAGE_LABELS))) {
+            g_app.config.vramCoveragePercent = COVERAGE_VALUES[covIdx];
+            markCustomIfChanged(true);
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Percentage of VRAM to test.\n"
+                             "Higher coverage = more thorough but may reduce stability\n"
+                             "as it competes with the GPU driver / OS for memory.");
+        }
+
+        ImGui::TextDisabled("Bit-level error categorization is always on");
         ImGui::Spacing();
     }
     
@@ -5867,17 +6384,92 @@ void RenderGUI() {
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                
+
+                // ----- Error Breakdown (bit-level diagnostic info) -----
+                if (ImGui::CollapsingHeader("Error Breakdown", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    // Kind distribution
+                    static const char* KIND_LABELS[6] = {
+                        "single-bit", "multi-bit", "address-bus",
+                        "stuck-at-0", "stuck-at-1", "refresh"
+                    };
+                    std::string kindLine = "Error kinds:";
+                    bool anyKind = false;
+                    for (size_t k = 0; k < result.errorKindCounts.size(); ++k) {
+                        if (result.errorKindCounts[k] > 0) {
+                            if (anyKind) kindLine += ",";
+                            kindLine += " " + std::to_string(result.errorKindCounts[k])
+                                      + " " + KIND_LABELS[k];
+                            anyKind = true;
+                        }
+                    }
+                    if (!anyKind) kindLine += " (uncategorized)";
+                    ImGui::TextWrapped("%s", kindLine.c_str());
+
+                    if (result.refreshPassErrors > 0) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                            "%zu errors detected during refresh check (data retention issue)",
+                            result.refreshPassErrors);
+                    }
+
+                    // Top 3 most-flipped bit positions
+                    {
+                        std::vector<std::pair<size_t, int>> bitsSorted;  // (count, bit_index)
+                        for (int b = 0; b < 32; ++b) {
+                            if (result.bitFlipHistogram[b] > 0) {
+                                bitsSorted.push_back({ result.bitFlipHistogram[b], b });
+                            }
+                        }
+                        std::sort(bitsSorted.begin(), bitsSorted.end(),
+                                  [](const auto& a, const auto& b){ return a.first > b.first; });
+                        if (!bitsSorted.empty()) {
+                            std::string topLine = "Most-flipped bits:";
+                            size_t n = std::min<size_t>(3u, bitsSorted.size());
+                            for (size_t i = 0; i < n; ++i) {
+                                topLine += " bit " + std::to_string(bitsSorted[i].second)
+                                         + " (" + std::to_string(bitsSorted[i].first) + ")";
+                                if (i + 1 < n) topLine += ",";
+                            }
+                            ImGui::TextWrapped("%s", topLine.c_str());
+                        }
+                    }
+
+                    // Bit flip histogram bar chart (compact, 32 buckets)
+                    {
+                        size_t maxFlips = 0;
+                        for (size_t v : result.bitFlipHistogram) if (v > maxFlips) maxFlips = v;
+                        if (maxFlips > 0) {
+                            ImGui::Spacing();
+                            ImGui::Text("Bit position histogram:");
+                            float floats[32];
+                            for (int b = 0; b < 32; ++b) {
+                                floats[b] = (float)result.bitFlipHistogram[b];
+                            }
+                            ImGui::PlotHistogram("##VRAMBitHist", floats, 32, 0,
+                                                 nullptr, 0.0f, (float)maxFlips,
+                                                 ImVec2(0, 80));
+                        }
+                    }
+                }
+
+                ImGui::Spacing();
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Error Regions:");
                 ImGui::Spacing();
-                
+
                 ImGui::BeginChild("ErrorList", ImVec2(0, 150), true, ImGuiWindowFlags_HorizontalScrollbar);
                 for (const auto& err : result.errors) {
-                    char errBuf[256];
-                    snprintf(errBuf, sizeof(errBuf), 
-                            "0x%08zX - 0x%08zX: %zu errors (%s)",
-                            err.offsetStart, err.offsetEnd, err.errorCount,
-                            GetPatternName(err.pattern).c_str());
+                    char errBuf[320];
+                    if (err.bitFlipCount > 0) {
+                        snprintf(errBuf, sizeof(errBuf),
+                                "0x%08zX - 0x%08zX: %zu errors (%s, %s)",
+                                err.offsetStart, err.offsetEnd, err.errorCount,
+                                GetPatternName(err.pattern).c_str(),
+                                GetErrorKindName(err.kind));
+                    } else {
+                        snprintf(errBuf, sizeof(errBuf),
+                                "0x%08zX - 0x%08zX: %zu errors (%s)",
+                                err.offsetStart, err.offsetEnd, err.errorCount,
+                                GetPatternName(err.pattern).c_str());
+                    }
                     ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "%s", errBuf);
                 }
                 ImGui::EndChild();

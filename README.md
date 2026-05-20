@@ -38,10 +38,6 @@ A tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Measures re
 
 *Coming soon*
 
-## Download
-
-Pre-built Windows executables are available on the [Releases page](https://github.com/djanice1980/GPU-PCIe-Test/releases).
-
 ## Requirements
 
 ### Windows
@@ -109,11 +105,21 @@ See [Linux/Linux_README.md](Linux/Linux_README.md) for detailed instructions and
 ### VRAM Scan
 
 1. Select a discrete GPU (not available for integrated GPUs)
-2. Optionally enable **Full Scan (~90%)** for more thorough testing
-3. Click **VRAM Scan**
-4. Wait for completion - test covers multiple memory regions
+2. Pick a **Scan preset** (or use Custom for fine control):
+   - **Quick** - 4 patterns, 50% coverage (~30 sec sanity check)
+   - **Standard** - 8 patterns, 80% coverage (~2-3 min, default)
+   - **Deep** - 8 patterns + refresh check + address-bus check, 90% coverage (~5 min)
+   - **Thorough** - same as Deep with 10x re-reads, 95% coverage (~12-15 min)
+3. Optionally fine-tune individual options:
+   - **Patterns** - enable/disable any of 8 test patterns
+   - **Refresh check** - re-read each chunk multiple times to catch retention errors
+   - **Address-bus check** - randomize block read order to expose address-bus errors
+   - **Coverage** - choose 50/80/90/95% of VRAM
+4. Click **VRAM Scan**
+5. Wait for completion - test covers multiple memory regions
+6. Results window includes a bit-level **Error Breakdown** classifying any errors found (single-bit, multi-bit, address-bus, stuck-bit, refresh)
 
-**Note:** VRAM scanning is a basic integrity test using D3D12. For chip-level diagnosis, use vendor tools like NVIDIA MATS or AMD memory diagnostics.
+**Note:** VRAM scanning is a basic integrity test. For chip-level diagnosis, use vendor tools like NVIDIA MATS or AMD memory diagnostics. For extended overclock stress testing, consider [memtest_vulkan](https://github.com/GpuZelenograd/memtest_vulkan).
 
 ## How It Works
 
