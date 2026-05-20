@@ -1,0 +1,50 @@
+#version 450
+
+// GPU-side VRAM pattern verification compute shader.
+// Reads dwords from chain buffer, regenerates expected value per pattern type,
+// XORs and on mismatch atomically appends a (offset, expected, actual) record.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) restrict readonly buffer ChainBuf {
+    uint data[];
+} chainBuf;
+
+layout(set = 0, binding = 1) buffer ErrorBuf {
+    uint count;
+    uint records[];  // groups of 3: (offset, expected, actual); capped at 256
+} errBuf;
+
+layout(push_constant) uniform Params {
+    uint dwordCount;
+    uint patternType;   // matches VRAMTestPattern enum
+    uint patternIter;   // iteration index (for marching patterns)
+    uint pad;
+} pc;
+
+uint GenerateExpected(uint i) {
+    if (pc.patternType == 0u) return 0u;                                    // AllZeros
+    if (pc.patternType == 1u) return 0xFFFFFFFFu;                           // AllOnes
+    if (pc.patternType == 2u) return 0xAAAAAAAAu;                           // Checkerboard
+    if (pc.patternType == 3u) return 0x55555555u;                           // InverseCheckerboard
+    // patternType == 4 (Random) is not supported here; caller must use CPU path.
+    if (pc.patternType == 5u) return 1u << (pc.patternIter & 31u);          // MarchingOnes
+    if (pc.patternType == 6u) return ~(1u << (pc.patternIter & 31u));       // MarchingZeros
+    if (pc.patternType == 7u) return i;                                     // AddressPattern
+    return 0u;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.dwordCount) return;
+    uint actual = chainBuf.data[i];
+    uint expected = GenerateExpected(i);
+    if (actual != expected) {
+        uint slot = atomicAdd(errBuf.count, 1u);
+        if (slot < 256u) {
+            errBuf.records[slot * 3u + 0u] = i;
+            errBuf.records[slot * 3u + 1u] = expected;
+            errBuf.records[slot * 3u + 2u] = actual;
+        }
+    }
+}

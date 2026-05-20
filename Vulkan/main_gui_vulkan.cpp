@@ -414,6 +414,7 @@ enum class VRAMScanPreset {
     Standard,
     Deep,
     Thorough,
+    Marathon,
     Custom
 };
 
@@ -440,6 +441,10 @@ struct BenchmarkConfig {
     bool   vramNonSequentialEnabled = false;
     int    vramNonSequentialBlockSize = 65536;
     int    vramCoveragePercent = 80;
+    bool   vramPreheatEnabled = false;
+    int    vramPreheatSeconds = 30;
+    bool   vramMarathonMode = false;
+    bool   vramGpuVerify = false;
 };
 
 struct InterfaceSpeed {
@@ -4493,6 +4498,10 @@ bool RunVRAMPatternTest(VRAMTestPattern pattern, size_t regionSize, size_t regio
 // Apply a VRAM scan preset by snapping all individual options to the preset's values.
 void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
     cfg.vramScanPreset = preset;
+    cfg.vramPreheatEnabled = false;
+    cfg.vramPreheatSeconds = 30;
+    cfg.vramMarathonMode = false;
+    cfg.vramGpuVerify = false;
     switch (preset) {
         case VRAMScanPreset::Quick:
             cfg.vramPatternsEnabled = { true, true, true, false, true, false, false, false };
@@ -4517,6 +4526,9 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramNonSequentialEnabled = true;
             cfg.vramNonSequentialBlockSize = 65536;
             cfg.vramCoveragePercent = 90;
+            cfg.vramPreheatEnabled = true;
+            cfg.vramPreheatSeconds = 30;
+            cfg.vramGpuVerify = true;
             break;
         case VRAMScanPreset::Thorough:
             cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
@@ -4525,6 +4537,21 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramNonSequentialEnabled = true;
             cfg.vramNonSequentialBlockSize = 65536;
             cfg.vramCoveragePercent = 95;
+            cfg.vramPreheatEnabled = true;
+            cfg.vramPreheatSeconds = 60;
+            cfg.vramGpuVerify = true;
+            break;
+        case VRAMScanPreset::Marathon:
+            cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
+            cfg.vramRereadEnabled = true;
+            cfg.vramRereadIterations = 10;
+            cfg.vramNonSequentialEnabled = true;
+            cfg.vramNonSequentialBlockSize = 65536;
+            cfg.vramCoveragePercent = 95;
+            cfg.vramPreheatEnabled = true;
+            cfg.vramPreheatSeconds = 30;
+            cfg.vramGpuVerify = true;
+            cfg.vramMarathonMode = true;
             break;
         case VRAMScanPreset::Custom:
         default:
@@ -4532,7 +4559,6 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
     }
 }
 
-// Inverse: return the matching preset for the current settings, or Custom.
 VRAMScanPreset DetectVRAMScanPreset(const BenchmarkConfig& cfg) {
     auto matches = [&](const BenchmarkConfig& tmp) -> bool {
         return tmp.vramPatternsEnabled == cfg.vramPatternsEnabled
@@ -4540,15 +4566,505 @@ VRAMScanPreset DetectVRAMScanPreset(const BenchmarkConfig& cfg) {
             && tmp.vramRereadIterations == cfg.vramRereadIterations
             && tmp.vramNonSequentialEnabled == cfg.vramNonSequentialEnabled
             && tmp.vramNonSequentialBlockSize == cfg.vramNonSequentialBlockSize
-            && tmp.vramCoveragePercent == cfg.vramCoveragePercent;
+            && tmp.vramCoveragePercent == cfg.vramCoveragePercent
+            && tmp.vramPreheatEnabled == cfg.vramPreheatEnabled
+            && tmp.vramPreheatSeconds == cfg.vramPreheatSeconds
+            && tmp.vramMarathonMode == cfg.vramMarathonMode
+            && tmp.vramGpuVerify == cfg.vramGpuVerify;
     };
     for (auto p : { VRAMScanPreset::Quick, VRAMScanPreset::Standard,
-                    VRAMScanPreset::Deep, VRAMScanPreset::Thorough }) {
+                    VRAMScanPreset::Deep, VRAMScanPreset::Thorough,
+                    VRAMScanPreset::Marathon }) {
         BenchmarkConfig tmp;
         ApplyVRAMScanPreset(p, tmp);
         if (matches(tmp)) return p;
     }
     return VRAMScanPreset::Custom;
+}
+
+// SPIR-V compute shader: VRAM pattern verification (631 words / 2524 bytes)
+// Generated from vram_verify.comp with glslc -O --target-env=vulkan1.1
+static const uint32_t g_vramVerifySPIRV[] = {
+    0x07230203, 0x00010300, 0x000d000b, 0x000000d2, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x00000058, 0x00060010, 0x00000004,
+    0x00000011, 0x00000100, 0x00000001, 0x00000001, 0x00030047, 0x0000000c, 0x00000002, 0x00050048,
+    0x0000000c, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000c, 0x00000001, 0x00000023,
+    0x00000004, 0x00050048, 0x0000000c, 0x00000002, 0x00000023, 0x00000008, 0x00050048, 0x0000000c,
+    0x00000003, 0x00000023, 0x0000000c, 0x00040047, 0x00000058, 0x0000000b, 0x0000001c, 0x00040047,
+    0x00000065, 0x00000006, 0x00000004, 0x00030047, 0x00000066, 0x00000002, 0x00040048, 0x00000066,
+    0x00000000, 0x00000013, 0x00040048, 0x00000066, 0x00000000, 0x00000018, 0x00050048, 0x00000066,
+    0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000068, 0x00000013, 0x00030047, 0x00000068,
+    0x00000018, 0x00040047, 0x00000068, 0x00000021, 0x00000000, 0x00040047, 0x00000068, 0x00000022,
+    0x00000000, 0x00040047, 0x00000077, 0x00000006, 0x00000004, 0x00030047, 0x00000078, 0x00000002,
+    0x00050048, 0x00000078, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000078, 0x00000001,
+    0x00000023, 0x00000004, 0x00040047, 0x0000007a, 0x00000021, 0x00000001, 0x00040047, 0x0000007a,
+    0x00000022, 0x00000000, 0x00040047, 0x00000091, 0x0000000b, 0x00000019, 0x00020013, 0x00000002,
+    0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x0006001e,
+    0x0000000c, 0x00000006, 0x00000006, 0x00000006, 0x00000006, 0x00040020, 0x0000000d, 0x00000009,
+    0x0000000c, 0x0004003b, 0x0000000d, 0x0000000e, 0x00000009, 0x00040015, 0x0000000f, 0x00000020,
+    0x00000001, 0x0004002b, 0x0000000f, 0x00000010, 0x00000001, 0x00040020, 0x00000011, 0x00000009,
+    0x00000006, 0x0004002b, 0x00000006, 0x00000014, 0x00000000, 0x00020014, 0x00000015, 0x0004002b,
+    0x00000006, 0x0000001c, 0x00000001, 0x0004002b, 0x00000006, 0x00000020, 0xffffffff, 0x0004002b,
+    0x00000006, 0x00000024, 0x00000002, 0x0004002b, 0x00000006, 0x00000028, 0xaaaaaaaa, 0x0004002b,
+    0x00000006, 0x0000002c, 0x00000003, 0x0004002b, 0x00000006, 0x00000030, 0x55555555, 0x0004002b,
+    0x00000006, 0x00000034, 0x00000005, 0x0004002b, 0x0000000f, 0x00000038, 0x00000002, 0x0004002b,
+    0x00000006, 0x0000003b, 0x0000001f, 0x0004002b, 0x00000006, 0x00000041, 0x00000006, 0x0004002b,
+    0x00000006, 0x0000004d, 0x00000007, 0x00040017, 0x00000056, 0x00000006, 0x00000003, 0x00040020,
+    0x00000057, 0x00000001, 0x00000056, 0x0004003b, 0x00000057, 0x00000058, 0x00000001, 0x00040020,
+    0x00000059, 0x00000001, 0x00000006, 0x0004002b, 0x0000000f, 0x0000005d, 0x00000000, 0x0003001d,
+    0x00000065, 0x00000006, 0x0003001e, 0x00000066, 0x00000065, 0x00040020, 0x00000067, 0x0000000c,
+    0x00000066, 0x0004003b, 0x00000067, 0x00000068, 0x0000000c, 0x00040020, 0x0000006a, 0x0000000c,
+    0x00000006, 0x0003001d, 0x00000077, 0x00000006, 0x0004001e, 0x00000078, 0x00000006, 0x00000077,
+    0x00040020, 0x00000079, 0x0000000c, 0x00000078, 0x0004003b, 0x00000079, 0x0000007a, 0x0000000c,
+    0x0004002b, 0x00000006, 0x0000007e, 0x00000100, 0x0006002c, 0x00000056, 0x00000091, 0x0000007e,
+    0x0000001c, 0x0000001c, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8,
+    0x00000005, 0x000300f7, 0x00000092, 0x00000000, 0x000300fb, 0x00000014, 0x00000093, 0x000200f8,
+    0x00000093, 0x00050041, 0x00000059, 0x0000005a, 0x00000058, 0x00000014, 0x0004003d, 0x00000006,
+    0x0000005b, 0x0000005a, 0x00050041, 0x00000011, 0x0000005e, 0x0000000e, 0x0000005d, 0x0004003d,
+    0x00000006, 0x0000005f, 0x0000005e, 0x000500ae, 0x00000015, 0x00000060, 0x0000005b, 0x0000005f,
+    0x000300f7, 0x00000062, 0x00000000, 0x000400fa, 0x00000060, 0x00000061, 0x00000062, 0x000200f8,
+    0x00000061, 0x000200f9, 0x00000092, 0x000200f8, 0x00000062, 0x00060041, 0x0000006a, 0x0000006b,
+    0x00000068, 0x0000005d, 0x0000005b, 0x0004003d, 0x00000006, 0x0000006c, 0x0000006b, 0x000300f7,
+    0x000000cf, 0x00000000, 0x000300fb, 0x00000014, 0x000000a1, 0x000200f8, 0x000000a1, 0x00050041,
+    0x00000011, 0x000000a2, 0x0000000e, 0x00000010, 0x0004003d, 0x00000006, 0x000000a3, 0x000000a2,
+    0x000500aa, 0x00000015, 0x000000a4, 0x000000a3, 0x00000014, 0x000300f7, 0x000000a6, 0x00000000,
+    0x000400fa, 0x000000a4, 0x000000a5, 0x000000a6, 0x000200f8, 0x000000a5, 0x000200f9, 0x000000cf,
+    0x000200f8, 0x000000a6, 0x000500aa, 0x00000015, 0x000000a9, 0x000000a3, 0x0000001c, 0x000300f7,
+    0x000000ab, 0x00000000, 0x000400fa, 0x000000a9, 0x000000aa, 0x000000ab, 0x000200f8, 0x000000aa,
+    0x000200f9, 0x000000cf, 0x000200f8, 0x000000ab, 0x000500aa, 0x00000015, 0x000000ae, 0x000000a3,
+    0x00000024, 0x000300f7, 0x000000b0, 0x00000000, 0x000400fa, 0x000000ae, 0x000000af, 0x000000b0,
+    0x000200f8, 0x000000af, 0x000200f9, 0x000000cf, 0x000200f8, 0x000000b0, 0x000500aa, 0x00000015,
+    0x000000b3, 0x000000a3, 0x0000002c, 0x000300f7, 0x000000b5, 0x00000000, 0x000400fa, 0x000000b3,
+    0x000000b4, 0x000000b5, 0x000200f8, 0x000000b4, 0x000200f9, 0x000000cf, 0x000200f8, 0x000000b5,
+    0x000500aa, 0x00000015, 0x000000b8, 0x000000a3, 0x00000034, 0x000300f7, 0x000000be, 0x00000000,
+    0x000400fa, 0x000000b8, 0x000000b9, 0x000000be, 0x000200f8, 0x000000b9, 0x00050041, 0x00000011,
+    0x000000ba, 0x0000000e, 0x00000038, 0x0004003d, 0x00000006, 0x000000bb, 0x000000ba, 0x000500c7,
+    0x00000006, 0x000000bc, 0x000000bb, 0x0000003b, 0x000500c4, 0x00000006, 0x000000bd, 0x0000001c,
+    0x000000bc, 0x000200f9, 0x000000cf, 0x000200f8, 0x000000be, 0x000500aa, 0x00000015, 0x000000c1,
+    0x000000a3, 0x00000041, 0x000300f7, 0x000000c8, 0x00000000, 0x000400fa, 0x000000c1, 0x000000c2,
+    0x000000c8, 0x000200f8, 0x000000c2, 0x00050041, 0x00000011, 0x000000c3, 0x0000000e, 0x00000038,
+    0x0004003d, 0x00000006, 0x000000c4, 0x000000c3, 0x000500c7, 0x00000006, 0x000000c5, 0x000000c4,
+    0x0000003b, 0x000500c4, 0x00000006, 0x000000c6, 0x0000001c, 0x000000c5, 0x000400c8, 0x00000006,
+    0x000000c7, 0x000000c6, 0x000200f9, 0x000000cf, 0x000200f8, 0x000000c8, 0x000500aa, 0x00000015,
+    0x000000cb, 0x000000a3, 0x0000004d, 0x000300f7, 0x000000ce, 0x00000000, 0x000400fa, 0x000000cb,
+    0x000000cc, 0x000000ce, 0x000200f8, 0x000000cc, 0x000200f9, 0x000000cf, 0x000200f8, 0x000000ce,
+    0x000200f9, 0x000000cf, 0x000200f8, 0x000000cf, 0x001300f5, 0x00000006, 0x000000d1, 0x00000014,
+    0x000000a5, 0x00000020, 0x000000aa, 0x00000028, 0x000000af, 0x00000030, 0x000000b4, 0x000000bd,
+    0x000000b9, 0x000000c7, 0x000000c2, 0x0000005b, 0x000000cc, 0x00000014, 0x000000ce, 0x000500ab,
+    0x00000015, 0x00000073, 0x0000006c, 0x000000d1, 0x000300f7, 0x00000075, 0x00000000, 0x000400fa,
+    0x00000073, 0x00000074, 0x00000075, 0x000200f8, 0x00000074, 0x00050041, 0x0000006a, 0x0000007b,
+    0x0000007a, 0x0000005d, 0x000700ea, 0x00000006, 0x0000007c, 0x0000007b, 0x0000001c, 0x00000014,
+    0x0000001c, 0x000500b0, 0x00000015, 0x0000007f, 0x0000007c, 0x0000007e, 0x000300f7, 0x00000081,
+    0x00000000, 0x000400fa, 0x0000007f, 0x00000080, 0x00000081, 0x000200f8, 0x00000080, 0x00050084,
+    0x00000006, 0x00000083, 0x0000007c, 0x0000002c, 0x00060041, 0x0000006a, 0x00000086, 0x0000007a,
+    0x00000010, 0x00000083, 0x0003003e, 0x00000086, 0x0000005b, 0x00050080, 0x00000006, 0x00000089,
+    0x00000083, 0x0000001c, 0x00060041, 0x0000006a, 0x0000008b, 0x0000007a, 0x00000010, 0x00000089,
+    0x0003003e, 0x0000008b, 0x000000d1, 0x00050080, 0x00000006, 0x0000008e, 0x00000083, 0x00000024,
+    0x00060041, 0x0000006a, 0x00000090, 0x0000007a, 0x00000010, 0x0000008e, 0x0003003e, 0x00000090,
+    0x0000006c, 0x000200f9, 0x00000081, 0x000200f8, 0x00000081, 0x000200f9, 0x00000075, 0x000200f8,
+    0x00000075, 0x000200f9, 0x00000092, 0x000200f8, 0x00000092, 0x000100fd, 0x00010038,
+};
+static const size_t g_vramVerifySPIRVSize = 2524;
+
+// Pre-heat the GPU before VRAM scan to expose thermal-dependent errors.
+// Runs continuous buffer-copy traffic on the bench device for the configured
+// duration so the silicon reaches operating temperature before measurement.
+bool PreheatGPUForVRAMScan(int durationSeconds) {
+    if (durationSeconds <= 0) return true;
+    Log("Pre-heating GPU for " + std::to_string(durationSeconds) + " seconds...");
+    g_app.vramTestCurrentPattern = "Pre-heat (warming GPU)";
+
+    const size_t SCRATCH = 64ull * 1024 * 1024;
+    auto srcBuf = CreateBuffer(VkBufferType::DeviceLocal, SCRATCH);
+    auto dstBuf = CreateBuffer(VkBufferType::DeviceLocal, SCRATCH);
+    if (!srcBuf || !dstBuf) {
+        Log("[WARNING] Could not allocate pre-heat scratch buffers; skipping pre-heat");
+        srcBuf.Destroy(g_app.benchDevice);
+        dstBuf.Destroy(g_app.benchDevice);
+        return true;
+    }
+
+    auto startTime = std::chrono::steady_clock::now();
+    int copiesDone = 0;
+    int lastReportedSec = -1;
+    while (!g_app.vramTestCancelRequested) {
+        auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+        if (elapsed >= durationSeconds) break;
+
+        BeginBenchCommandBuffer();
+        VkBufferCopy copy = {};
+        copy.size = SCRATCH;
+        for (int i = 0; i < 4; ++i) {
+            if (i & 1) vkCmdCopyBuffer(g_app.benchCommandBuffer, srcBuf.buffer, dstBuf.buffer, 1, &copy);
+            else       vkCmdCopyBuffer(g_app.benchCommandBuffer, dstBuf.buffer, srcBuf.buffer, 1, &copy);
+        }
+        if (EndAndSubmitBenchCommandBuffer() != FenceWaitResult::Success) {
+            Log("[WARNING] Pre-heat fence wait failed; ending pre-heat early");
+            break;
+        }
+        copiesDone += 4;
+
+        int sec = static_cast<int>(elapsed);
+        if (sec != lastReportedSec) {
+            lastReportedSec = sec;
+            g_app.vramTestProgress = static_cast<float>(elapsed / durationSeconds);
+        }
+    }
+
+    srcBuf.Destroy(g_app.benchDevice);
+    dstBuf.Destroy(g_app.benchDevice);
+    Log("Pre-heat done (" + std::to_string(copiesDone) + " copies of "
+        + FormatSize(SCRATCH) + ")");
+    g_app.vramTestProgress = 0.0f;
+    return true;
+}
+
+// GPU verify state owned by the scan thread. Compiled/created once per scan.
+struct VRAMGpuVerifyState {
+    VkShaderModule           shaderModule       = VK_NULL_HANDLE;
+    VkDescriptorSetLayout    descSetLayout      = VK_NULL_HANDLE;
+    VkPipelineLayout         pipelineLayout     = VK_NULL_HANDLE;
+    VkPipeline               pipeline           = VK_NULL_HANDLE;
+    VkDescriptorPool         descPool           = VK_NULL_HANDLE;
+    VkDescriptorSet          descSet            = VK_NULL_HANDLE;
+    VkBufferAllocation       errorBuf           = {};   // device-local, 1 + 256*3 uints
+    VkBufferAllocation       errorRb            = {};   // host-visible readback
+    bool ready = false;
+};
+
+void DestroyGpuVerifyState(VRAMGpuVerifyState& s) {
+    if (s.pipeline)        vkDestroyPipeline(g_app.benchDevice, s.pipeline, nullptr);
+    if (s.pipelineLayout)  vkDestroyPipelineLayout(g_app.benchDevice, s.pipelineLayout, nullptr);
+    if (s.descSetLayout)   vkDestroyDescriptorSetLayout(g_app.benchDevice, s.descSetLayout, nullptr);
+    if (s.descPool)        vkDestroyDescriptorPool(g_app.benchDevice, s.descPool, nullptr);
+    if (s.shaderModule)    vkDestroyShaderModule(g_app.benchDevice, s.shaderModule, nullptr);
+    s.errorBuf.Destroy(g_app.benchDevice);
+    s.errorRb.Destroy(g_app.benchDevice);
+    s = {};
+}
+
+bool InitGpuVerifyState(VRAMGpuVerifyState& s) {
+    s = {};
+    // Shader module
+    VkShaderModuleCreateInfo smci = {};
+    smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    smci.codeSize = g_vramVerifySPIRVSize;
+    smci.pCode = g_vramVerifySPIRV;
+    if (vkCreateShaderModule(g_app.benchDevice, &smci, nullptr, &s.shaderModule) != VK_SUCCESS) {
+        Log("[ERROR] GPU verify shader module creation failed");
+        return false;
+    }
+
+    // Descriptor set layout: 2 storage buffers
+    VkDescriptorSetLayoutBinding b[2] = {};
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1;
+    b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[1].descriptorCount = 1;
+    b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo dslci = {};
+    dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslci.bindingCount = 2;
+    dslci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(g_app.benchDevice, &dslci, nullptr, &s.descSetLayout) != VK_SUCCESS) {
+        Log("[ERROR] GPU verify descriptor set layout creation failed");
+        DestroyGpuVerifyState(s);
+        return false;
+    }
+
+    // Pipeline layout with push constants
+    VkPushConstantRange pcr = {};
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0;
+    pcr.size = 16;  // 4 x uint32
+    VkPipelineLayoutCreateInfo plci = {};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &s.descSetLayout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(g_app.benchDevice, &plci, nullptr, &s.pipelineLayout) != VK_SUCCESS) {
+        Log("[ERROR] GPU verify pipeline layout creation failed");
+        DestroyGpuVerifyState(s);
+        return false;
+    }
+
+    // Compute pipeline
+    VkComputePipelineCreateInfo cpci = {};
+    cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = s.shaderModule;
+    cpci.stage.pName = "main";
+    cpci.layout = s.pipelineLayout;
+    if (vkCreateComputePipelines(g_app.benchDevice, VK_NULL_HANDLE, 1, &cpci, nullptr, &s.pipeline) != VK_SUCCESS) {
+        Log("[ERROR] GPU verify pipeline creation failed");
+        DestroyGpuVerifyState(s);
+        return false;
+    }
+
+    // Descriptor pool + set
+    VkDescriptorPoolSize dps = {};
+    dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    dps.descriptorCount = 2;
+    VkDescriptorPoolCreateInfo dpci = {};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.maxSets = 1;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &dps;
+    if (vkCreateDescriptorPool(g_app.benchDevice, &dpci, nullptr, &s.descPool) != VK_SUCCESS) {
+        Log("[ERROR] GPU verify descriptor pool creation failed");
+        DestroyGpuVerifyState(s);
+        return false;
+    }
+    VkDescriptorSetAllocateInfo dsai = {};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = s.descPool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &s.descSetLayout;
+    if (vkAllocateDescriptorSets(g_app.benchDevice, &dsai, &s.descSet) != VK_SUCCESS) {
+        Log("[ERROR] GPU verify descriptor set allocation failed");
+        DestroyGpuVerifyState(s);
+        return false;
+    }
+
+    // Error buffer (device-local + host-visible readback)
+    const size_t errBufBytes = (1 + 256 * 3) * sizeof(uint32_t);
+    s.errorBuf = CreateBuffer(VkBufferType::DeviceLocal, errBufBytes);
+    s.errorRb  = CreateBuffer(VkBufferType::Readback,    errBufBytes);
+    if (!s.errorBuf || !s.errorRb) {
+        Log("[ERROR] GPU verify error buffer allocation failed");
+        DestroyGpuVerifyState(s);
+        return false;
+    }
+
+    s.ready = true;
+    return true;
+}
+
+// Bind chain buffer + error buffer to the descriptor set, zero the error
+// counter, dispatch the verify shader, read back results, classify errors.
+bool VerifyChunkOnGPU_Vulkan(VRAMGpuVerifyState& s,
+                             VkBufferAllocation& chainBuffer, size_t chainBytes,
+                             VRAMTestPattern pattern, int iteration,
+                             size_t baseOffset,
+                             std::vector<VRAMError>& errors, size_t& patternErrors)
+{
+    if (!s.ready) return false;
+    if (pattern == VRAMTestPattern::Random) return false;
+
+    size_t dwordCount = chainBytes / sizeof(uint32_t);
+    const size_t errBufBytes = (1 + 256 * 3) * sizeof(uint32_t);
+
+    // Update descriptor set to bind chain at 0, error at 1
+    VkDescriptorBufferInfo bi[2] = {};
+    bi[0].buffer = chainBuffer.buffer;
+    bi[0].offset = 0;
+    bi[0].range  = chainBytes;
+    bi[1].buffer = s.errorBuf.buffer;
+    bi[1].offset = 0;
+    bi[1].range  = errBufBytes;
+    VkWriteDescriptorSet ws[2] = {};
+    ws[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    ws[0].dstSet = s.descSet;
+    ws[0].dstBinding = 0;
+    ws[0].descriptorCount = 1;
+    ws[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ws[0].pBufferInfo = &bi[0];
+    ws[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    ws[1].dstSet = s.descSet;
+    ws[1].dstBinding = 1;
+    ws[1].descriptorCount = 1;
+    ws[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ws[1].pBufferInfo = &bi[1];
+    vkUpdateDescriptorSets(g_app.benchDevice, 2, ws, 0, nullptr);
+
+    // Zero the error counter via vkCmdFillBuffer
+    {
+        BeginBenchCommandBuffer();
+        vkCmdFillBuffer(g_app.benchCommandBuffer, s.errorBuf.buffer, 0, errBufBytes, 0);
+        VkMemoryBarrier mb = {};
+        mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(g_app.benchCommandBuffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &mb, 0, nullptr, 0, nullptr);
+
+        // Dispatch verify shader
+        vkCmdBindPipeline(g_app.benchCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeline);
+        vkCmdBindDescriptorSets(g_app.benchCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                s.pipelineLayout, 0, 1, &s.descSet, 0, nullptr);
+        uint32_t pc[4] = {
+            static_cast<uint32_t>(dwordCount),
+            static_cast<uint32_t>(pattern),
+            static_cast<uint32_t>(iteration),
+            0
+        };
+        vkCmdPushConstants(g_app.benchCommandBuffer, s.pipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        uint32_t groups = static_cast<uint32_t>((dwordCount + 255) / 256);
+        vkCmdDispatch(g_app.benchCommandBuffer, groups, 1, 1);
+
+        // Barrier: shader writes -> transfer reads (readback copy)
+        VkMemoryBarrier mb2 = {};
+        mb2.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb2.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb2.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(g_app.benchCommandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &mb2, 0, nullptr, 0, nullptr);
+
+        // Copy error buf -> readback
+        VkBufferCopy cp = {};
+        cp.size = errBufBytes;
+        vkCmdCopyBuffer(g_app.benchCommandBuffer, s.errorBuf.buffer, s.errorRb.buffer, 1, &cp);
+
+        if (EndAndSubmitBenchCommandBuffer() != FenceWaitResult::Success) {
+            Log("[ERROR] GPU verify dispatch fence wait failed");
+            return false;
+        }
+    }
+
+    // Read back
+    uint32_t errCount = 0;
+    std::vector<uint32_t> records(256 * 3, 0);
+    {
+        void* mapped = nullptr;
+        if (vkMapMemory(g_app.benchDevice, s.errorRb.memory, 0, errBufBytes, 0, &mapped) != VK_SUCCESS || !mapped) {
+            Log("[ERROR] GPU verify readback map failed");
+            return false;
+        }
+        VkMappedMemoryRange r = {};
+        r.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        r.memory = s.errorRb.memory;
+        r.offset = 0;
+        r.size = VK_WHOLE_SIZE;
+        vkInvalidateMappedMemoryRanges(g_app.benchDevice, 1, &r);
+        const uint32_t* p = static_cast<const uint32_t*>(mapped);
+        errCount = p[0];
+        memcpy(records.data(), p + 1, records.size() * sizeof(uint32_t));
+        vkUnmapMemory(g_app.benchDevice, s.errorRb.memory);
+    }
+
+    if (errCount == 0) return true;
+    patternErrors += errCount;
+    size_t recordedCount = std::min<uint32_t>(errCount, 256u);
+
+    std::vector<std::tuple<uint32_t,uint32_t,uint32_t>> sortedRecs;
+    sortedRecs.reserve(recordedCount);
+    for (size_t i = 0; i < recordedCount; ++i) {
+        sortedRecs.emplace_back(records[i*3+0], records[i*3+1], records[i*3+2]);
+    }
+    std::sort(sortedRecs.begin(), sortedRecs.end(),
+              [](const auto& a, const auto& b){ return std::get<0>(a) < std::get<0>(b); });
+
+    const size_t CLUSTER_THRESHOLD = 256u;
+    VRAMError currentCluster;
+    bool inCluster = false;
+    for (auto& rec : sortedRecs) {
+        uint32_t dwordIdx = std::get<0>(rec);
+        uint32_t expVal   = std::get<1>(rec);
+        uint32_t actVal   = std::get<2>(rec);
+        size_t byteOffset = baseOffset + (size_t)dwordIdx * sizeof(uint32_t);
+        uint32_t flipMask = expVal ^ actVal;
+        uint32_t flipCount = PopCount32(flipMask);
+        int bitIdx = -1;
+        VRAMErrorKind kind = ClassifyError(expVal, actVal, flipMask, flipCount, &bitIdx);
+        for (int b = 0; b < 32; ++b) {
+            if (flipMask & (1u << b)) g_app.vramTestResult.bitFlipHistogram[b]++;
+        }
+        size_t kindIdx = static_cast<size_t>(kind);
+        if (kindIdx < g_app.vramTestResult.errorKindCounts.size()) {
+            g_app.vramTestResult.errorKindCounts[kindIdx]++;
+        }
+        if (!inCluster) {
+            currentCluster = {};
+            currentCluster.offsetStart = byteOffset;
+            currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+            currentCluster.expected = expVal;
+            currentCluster.actual = actVal;
+            currentCluster.pattern = pattern;
+            currentCluster.errorCount = 1;
+            currentCluster.bitFlipMask = flipMask;
+            currentCluster.bitFlipCount = flipCount;
+            currentCluster.bitIndex = bitIdx;
+            currentCluster.kind = kind;
+            inCluster = true;
+        } else if (byteOffset - currentCluster.offsetEnd <= CLUSTER_THRESHOLD * sizeof(uint32_t)) {
+            currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+            currentCluster.errorCount++;
+        } else {
+            errors.push_back(currentCluster);
+            currentCluster = {};
+            currentCluster.offsetStart = byteOffset;
+            currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+            currentCluster.expected = expVal;
+            currentCluster.actual = actVal;
+            currentCluster.pattern = pattern;
+            currentCluster.errorCount = 1;
+            currentCluster.bitFlipMask = flipMask;
+            currentCluster.bitFlipCount = flipCount;
+            currentCluster.bitIndex = bitIdx;
+            currentCluster.kind = kind;
+        }
+    }
+    if (inCluster) errors.push_back(currentCluster);
+
+    if (errCount > 256) {
+        Log("  GPU verify: " + std::to_string(errCount) + " errors found ("
+            + std::to_string(errCount - 256) + " beyond detail capture limit)");
+    }
+    return true;
+}
+
+// Run a single pattern test using GPU-side compute verification (no full
+// chunk readback). Random pattern unsupported.
+bool RunVRAMPatternTestGpu(VRAMTestPattern pattern, size_t regionSize, size_t regionOffset,
+                           VkBufferAllocation& uploadBuffer,
+                           VkBufferAllocation& gpuBuffer,
+                           VRAMGpuVerifyState& gpuVerify,
+                           std::vector<VRAMError>& errors,
+                           size_t& totalErrors, int iteration = 0)
+{
+    if (g_app.vramTestCancelRequested) return false;
+    if (pattern == VRAMTestPattern::Random) return false;
+
+    regionSize = regionSize & ~3ULL;
+    if (regionSize == 0) return true;
+    size_t dwordCount = regionSize / sizeof(uint32_t);
+
+    // Step 1: generate pattern in upload buffer
+    void* mapped = nullptr;
+    if (vkMapMemory(g_app.benchDevice, uploadBuffer.memory, 0, regionSize, 0, &mapped) != VK_SUCCESS || !mapped) {
+        Log("[ERROR] GPU-verify: upload map failed");
+        return false;
+    }
+    GenerateTestPattern(pattern, static_cast<uint32_t*>(mapped), dwordCount, iteration);
+    vkUnmapMemory(g_app.benchDevice, uploadBuffer.memory);
+
+    // Step 2: copy upload -> gpu
+    BeginBenchCommandBuffer();
+    VkBufferCopy copy = {};
+    copy.size = regionSize;
+    vkCmdCopyBuffer(g_app.benchCommandBuffer, uploadBuffer.buffer, gpuBuffer.buffer, 1, &copy);
+    if (EndAndSubmitBenchCommandBuffer() != FenceWaitResult::Success) {
+        Log("[ERROR] GPU-verify: write fence wait failed");
+        return false;
+    }
+
+    // Step 3: dispatch verify shader, classify errors
+    size_t patternErrors = 0;
+    if (!VerifyChunkOnGPU_Vulkan(gpuVerify, gpuBuffer, regionSize, pattern, iteration,
+                                  regionOffset, errors, patternErrors)) {
+        return false;
+    }
+    totalErrors += patternErrors;
+    return true;
 }
 
 // Main VRAM test thread function
@@ -4707,7 +5223,38 @@ void VRAMTestThreadFunc() {
     std::vector<VRAMError> allErrors;
     bool hadCriticalFailure = false;
     size_t totalBytesTested = 0;
-    
+
+    // ========== PRE-HEAT PHASE ==========
+    if (g_app.config.vramPreheatEnabled && !g_app.vramTestCancelRequested) {
+        int sec = g_app.config.vramPreheatSeconds;
+        if (sec < 5) sec = 5;
+        if (sec > 600) sec = 600;
+        PreheatGPUForVRAMScan(sec);
+    }
+
+    // ========== GPU VERIFY STATE ==========
+    VRAMGpuVerifyState gpuVerify;
+    bool useGpuVerify = g_app.config.vramGpuVerify;
+    if (useGpuVerify) {
+        if (!InitGpuVerifyState(gpuVerify)) {
+            Log("[WARNING] GPU-verify init failed - falling back to CPU verification");
+            useGpuVerify = false;
+        } else {
+            Log("GPU-verify enabled: using compute shader to compare patterns "
+                "(skips full chunk readback; Random pattern still uses CPU)");
+        }
+    }
+
+    // ========== MARATHON OUTER LOOP ==========
+    int marathonPass = 0;
+    do {
+        marathonPass++;
+        if (g_app.config.vramMarathonMode) {
+            Log("");
+            Log("================ Marathon pass " + std::to_string(marathonPass) + " starting ================");
+            totalBytesTested = 0;
+        }
+
     for (size_t chunkNum = 0; chunkNum < numChunks && !g_app.vramTestCancelRequested && !hadCriticalFailure; ++chunkNum) {
         size_t chunkOffset = chunkNum * chunkSize;
         size_t thisChunkSize = std::min(chunkSize, targetTestSize - chunkOffset);
@@ -4729,29 +5276,39 @@ void VRAMTestThreadFunc() {
         
         size_t chunkErrors = 0;
         bool chunkFailed = false;
-        
+
+        // Lambda: dispatch the right verify path
+        auto runPattern = [&](VRAMTestPattern p, int iter, size_t& patErrors) -> bool {
+            if (useGpuVerify && p != VRAMTestPattern::Random) {
+                return RunVRAMPatternTestGpu(p, thisChunkSize, chunkOffset,
+                                             uploadBuffer, gpuBuffer, gpuVerify,
+                                             allErrors, patErrors, iter);
+            }
+            return RunVRAMPatternTest(p, thisChunkSize, chunkOffset,
+                                      uploadBuffer, gpuBuffer, readbackBuffer,
+                                      allErrors, patErrors, iter);
+        };
+
         for (const auto& pattern : patterns) {
             if (g_app.vramTestCancelRequested || chunkFailed) break;
-            
+
             std::string patternName = GetPatternName(pattern);
             g_app.vramTestCurrentPattern = patternName + " [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
-            
+
             g_app.fenceTimeoutCount = 0;
             size_t patternErrors = 0;
-            
-            if (!RunVRAMPatternTest(pattern, thisChunkSize, chunkOffset,
-                                    uploadBuffer, gpuBuffer, readbackBuffer,
-                                    allErrors, patternErrors)) {
+
+            if (!runPattern(pattern, 0, patternErrors)) {
                 if (!g_app.vramTestCancelRequested) {
                     Log("  [WARNING] " + patternName + " failed");
                     chunkFailed = true;
                 }
                 break;
             }
-            
+
             chunkErrors += patternErrors;
         }
-        
+
         // Run marching ones if enabled
         if (useMarchingOnes && !g_app.vramTestCancelRequested && !chunkFailed) {
             g_app.vramTestCurrentPattern = "Marching ones [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
@@ -4759,9 +5316,7 @@ void VRAMTestThreadFunc() {
 
             for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
                 size_t marchErrors = 0;
-                if (!RunVRAMPatternTest(VRAMTestPattern::MarchingOnes, thisChunkSize, chunkOffset,
-                                  uploadBuffer, gpuBuffer, readbackBuffer,
-                                  allErrors, marchErrors, iter)) {
+                if (!runPattern(VRAMTestPattern::MarchingOnes, iter, marchErrors)) {
                     chunkFailed = true;
                     break;
                 }
@@ -4776,9 +5331,7 @@ void VRAMTestThreadFunc() {
 
             for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
                 size_t marchErrors = 0;
-                if (!RunVRAMPatternTest(VRAMTestPattern::MarchingZeros, thisChunkSize, chunkOffset,
-                                  uploadBuffer, gpuBuffer, readbackBuffer,
-                                  allErrors, marchErrors, iter)) {
+                if (!runPattern(VRAMTestPattern::MarchingZeros, iter, marchErrors)) {
                     chunkFailed = true;
                     break;
                 }
@@ -4888,8 +5441,18 @@ void VRAMTestThreadFunc() {
         if (chunkNum < numChunks - 1 && !g_app.vramTestCancelRequested) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-    }
-    
+    }  // end chunk loop
+
+        if (g_app.config.vramMarathonMode && !g_app.vramTestCancelRequested && !hadCriticalFailure) {
+            Log("================ Marathon pass " + std::to_string(marathonPass) +
+                " complete (" + std::to_string(totalErrors) + " errors so far) ================");
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    } while (g_app.config.vramMarathonMode && !g_app.vramTestCancelRequested && !hadCriticalFailure);  // end Marathon outer loop
+
+    // Tear down GPU-verify resources before exiting
+    if (gpuVerify.ready) DestroyGpuVerifyState(gpuVerify);
+
     double coveragePercent = (static_cast<double>(totalBytesTested) / gpu.dedicatedVRAM) * 100.0;
     snprintf(percentBuf, sizeof(percentBuf), "%.1f%%", coveragePercent);
     g_app.vramTestResult.patternResults.push_back(
@@ -5992,9 +6555,9 @@ void RenderGUI() {
     // VRAM scan options (only when not running and not iGPU)
     if (!g_app.vramTestRunning && !isIntegratedGPU) {
         // ----- Preset dropdown -----
-        static const char* PRESET_NAMES[] = { "Quick", "Standard", "Deep", "Thorough", "Custom" };
+        static const char* PRESET_NAMES[] = { "Quick", "Standard", "Deep", "Thorough", "Marathon", "Custom" };
         int presetIdx = static_cast<int>(g_app.config.vramScanPreset);
-        if (presetIdx < 0 || presetIdx > 4) presetIdx = 1;
+        if (presetIdx < 0 || presetIdx > 5) presetIdx = 1;
         ImGui::Text("Scan preset:");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(140);
@@ -6004,8 +6567,9 @@ void RenderGUI() {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Quick: 4 patterns, 50%% coverage (~30s)\n"
                              "Standard: 8 patterns, 80%% coverage (~2-3min) - default\n"
-                             "Deep: 8 patterns + refresh + address-bus checks, 90%% (~5min)\n"
-                             "Thorough: same as Deep with 10x re-reads, 95%% (~12-15min)\n"
+                             "Deep: 8 patterns + refresh + non-seq + pre-heat 30s + GPU verify, 90%% (~5min)\n"
+                             "Thorough: same as Deep with 10x re-reads + 60s pre-heat, 95%% (~12-15min)\n"
+                             "Marathon: same as Thorough but loops forever (cancel to stop)\n"
                              "Custom: whatever you set individually below");
         }
 
@@ -6083,6 +6647,42 @@ void RenderGUI() {
                 }
                 ImGui::Unindent();
             }
+
+            // Pre-heat phase
+            bool ph = g_app.config.vramPreheatEnabled;
+            if (ImGui::Checkbox("Pre-heat GPU before scan", &ph)) {
+                g_app.config.vramPreheatEnabled = ph;
+                markCustomIfChanged(true);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Run continuous GPU memory traffic before the scan starts\n"
+                                 "so the silicon reaches operating temperature.\n"
+                                 "Exposes thermal-dependent errors that pass on a cold GPU.");
+            }
+            if (g_app.config.vramPreheatEnabled) {
+                int psec = g_app.config.vramPreheatSeconds;
+                ImGui::Indent();
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::SliderInt("Pre-heat seconds", &psec, 10, 120)) {
+                    g_app.config.vramPreheatSeconds = psec;
+                    markCustomIfChanged(true);
+                }
+                ImGui::Unindent();
+            }
+
+            // GPU compute-shader verification
+            bool gv = g_app.config.vramGpuVerify;
+            if (ImGui::Checkbox("GPU verify (compute shader)", &gv)) {
+                g_app.config.vramGpuVerify = gv;
+                markCustomIfChanged(true);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Use a compute shader to compare patterns on the GPU\n"
+                                 "instead of reading back to CPU. Much higher throughput\n"
+                                 "(no PCIe round-trip on every chunk). Random pattern still\n"
+                                 "uses CPU verify since its RNG cannot be replicated in GLSL.");
+            }
+
             ImGui::TreePop();
         }
 

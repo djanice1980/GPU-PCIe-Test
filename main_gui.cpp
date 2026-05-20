@@ -400,8 +400,9 @@ struct BenchmarkResult {
 enum class VRAMScanPreset {
     Quick,      // 4 patterns, no re-read, no non-sequential, 50% coverage (~30s on 8GB)
     Standard,   // All 8 patterns, no re-read, no non-sequential, 80% coverage (~2-3min) - default
-    Deep,       // All 8 + re-read x4 + non-sequential 64KB, 90% coverage (~5min)
-    Thorough,   // All 8 + re-read x10 + non-sequential 64KB, 95% coverage (~12-15min)
+    Deep,       // All 8 + re-read x4 + non-sequential 64KB + pre-heat 30s + GPU verify, 90% (~5min)
+    Thorough,   // All 8 + re-read x10 + non-sequential 64KB + pre-heat 60s + GPU verify, 95% (~12-15min)
+    Marathon,   // Same as Thorough but loops indefinitely until cancelled
     Custom      // User has manually edited individual options
 };
 
@@ -431,6 +432,10 @@ struct BenchmarkConfig {
     bool   vramNonSequentialEnabled = false;         // Shuffle block read order to defeat row buffer caching
     int    vramNonSequentialBlockSize = 65536;       // 16384 / 65536 / 262144 (16/64/256 KB)
     int    vramCoveragePercent = 80;                 // 50 / 80 / 90 / 95
+    bool   vramPreheatEnabled = false;               // Run GPU heat-up load before scan to catch thermal errors
+    int    vramPreheatSeconds = 30;                  // Pre-heat duration (10-120s)
+    bool   vramMarathonMode = false;                 // Loop forever until cancelled (set by Marathon preset)
+    bool   vramGpuVerify = false;                    // Use GPU compute shader for verification instead of CPU readback
 };
 
 struct InterfaceSpeed {
@@ -3840,6 +3845,11 @@ bool RunVRAMPatternTest(VRAMTestPattern pattern, size_t regionSize, size_t regio
 // values. Selecting "Custom" leaves current values unchanged.
 void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
     cfg.vramScanPreset = preset;
+    // Reset extras to defaults; each preset enables what it needs below.
+    cfg.vramPreheatEnabled = false;
+    cfg.vramPreheatSeconds = 30;
+    cfg.vramMarathonMode = false;
+    cfg.vramGpuVerify = false;
     switch (preset) {
         case VRAMScanPreset::Quick:
             // 4 patterns: zeros, ones, checker, random
@@ -3865,6 +3875,9 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramNonSequentialEnabled = true;
             cfg.vramNonSequentialBlockSize = 65536;
             cfg.vramCoveragePercent = 90;
+            cfg.vramPreheatEnabled = true;
+            cfg.vramPreheatSeconds = 30;
+            cfg.vramGpuVerify = true;
             break;
         case VRAMScanPreset::Thorough:
             cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
@@ -3873,6 +3886,21 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramNonSequentialEnabled = true;
             cfg.vramNonSequentialBlockSize = 65536;
             cfg.vramCoveragePercent = 95;
+            cfg.vramPreheatEnabled = true;
+            cfg.vramPreheatSeconds = 60;
+            cfg.vramGpuVerify = true;
+            break;
+        case VRAMScanPreset::Marathon:
+            cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
+            cfg.vramRereadEnabled = true;
+            cfg.vramRereadIterations = 10;
+            cfg.vramNonSequentialEnabled = true;
+            cfg.vramNonSequentialBlockSize = 65536;
+            cfg.vramCoveragePercent = 95;
+            cfg.vramPreheatEnabled = true;
+            cfg.vramPreheatSeconds = 30;
+            cfg.vramGpuVerify = true;
+            cfg.vramMarathonMode = true;
             break;
         case VRAMScanPreset::Custom:
         default:
@@ -3891,15 +3919,458 @@ VRAMScanPreset DetectVRAMScanPreset(const BenchmarkConfig& cfg) {
             && tmp.vramRereadIterations == cfg.vramRereadIterations
             && tmp.vramNonSequentialEnabled == cfg.vramNonSequentialEnabled
             && tmp.vramNonSequentialBlockSize == cfg.vramNonSequentialBlockSize
-            && tmp.vramCoveragePercent == cfg.vramCoveragePercent;
+            && tmp.vramCoveragePercent == cfg.vramCoveragePercent
+            && tmp.vramPreheatEnabled == cfg.vramPreheatEnabled
+            && tmp.vramPreheatSeconds == cfg.vramPreheatSeconds
+            && tmp.vramMarathonMode == cfg.vramMarathonMode
+            && tmp.vramGpuVerify == cfg.vramGpuVerify;
     };
     for (auto p : { VRAMScanPreset::Quick, VRAMScanPreset::Standard,
-                    VRAMScanPreset::Deep, VRAMScanPreset::Thorough }) {
+                    VRAMScanPreset::Deep, VRAMScanPreset::Thorough,
+                    VRAMScanPreset::Marathon }) {
         BenchmarkConfig tmp;
         ApplyVRAMScanPreset(p, tmp);
         if (matches(tmp)) return p;
     }
     return VRAMScanPreset::Custom;
+}
+
+// Forward declarations for GPU verify
+struct VRAMGpuVerifyState;
+bool VerifyChunkOnGPU(VRAMGpuVerifyState& gpuState,
+                     ComPtr<ID3D12Resource>& chainBuffer, size_t chainBytes,
+                     VRAMTestPattern pattern, int iteration,
+                     size_t baseOffset,
+                     std::vector<VRAMError>& errors, size_t& patternErrors);
+
+// Run a single pattern test using GPU-side compute verification (no full
+// chunk readback). Writes pattern to GPU buffer, then dispatches verify
+// shader; only the error counter + first 256 error records are read back.
+// Returns false on failure or cancellation. Falls back to true if the
+// pattern is Random (caller should use CPU path).
+bool RunVRAMPatternTestGpu(VRAMTestPattern pattern, size_t regionSize, size_t regionOffset,
+                           ComPtr<ID3D12Resource>& uploadBuffer,
+                           ComPtr<ID3D12Resource>& gpuBuffer,
+                           VRAMGpuVerifyState& gpuVerify,
+                           std::vector<VRAMError>& errors,
+                           size_t& totalErrors, int iteration = 0)
+{
+    if (g_app.vramTestCancelRequested) return false;
+    if (pattern == VRAMTestPattern::Random) return false;  // Random unsupported in shader
+
+    regionSize = regionSize & ~3ULL;
+    if (regionSize == 0) return true;
+    size_t dwordCount = regionSize / sizeof(uint32_t);
+
+    // Step 1: write pattern to upload buffer (CPU-side gen of pattern)
+    void* mapped = nullptr;
+    D3D12_RANGE rr = {0,0};
+    if (FAILED(uploadBuffer->Map(0, &rr, &mapped)) || !mapped) {
+        Log("[ERROR] GPU-verify: upload map failed");
+        return false;
+    }
+    GenerateTestPattern(pattern, static_cast<uint32_t*>(mapped), dwordCount, iteration);
+    D3D12_RANGE wr = {0, regionSize};
+    uploadBuffer->Unmap(0, &wr);
+
+    // Step 2: copy upload → gpuBuffer
+    g_app.benchAllocator->Reset();
+    g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+    g_app.benchList->CopyResource(gpuBuffer.Get(), uploadBuffer.Get());
+    g_app.benchList->Close();
+    ID3D12CommandList* lists[] = { g_app.benchList.Get() };
+    g_app.benchQueue->ExecuteCommandLists(1, lists);
+    if (WaitForBenchFenceEx() != FenceWaitResult::Success) {
+        Log("[ERROR] GPU-verify: write fence wait failed");
+        return false;
+    }
+
+    // Step 3: dispatch verify shader, classify errors
+    size_t patternErrors = 0;
+    if (!VerifyChunkOnGPU(gpuVerify, gpuBuffer, regionSize, pattern, iteration,
+                          regionOffset, errors, patternErrors)) {
+        return false;
+    }
+    totalErrors += patternErrors;
+    return true;
+}
+
+// Pre-heat the GPU before scanning to expose thermal-dependent errors.
+// Runs continuous buffer-copy traffic for the configured duration, exercising
+// memory controller + chips so they reach steady-state operating temperature
+// before measurement begins. memtest_vulkan relies on its first ~6 minutes of
+// runtime to do the same thing implicitly; we do it explicitly so the user
+// gets clean signal once the actual scan starts.
+bool PreheatGPUForVRAMScan(int durationSeconds) {
+    if (durationSeconds <= 0) return true;
+    Log("Pre-heating GPU for " + std::to_string(durationSeconds) + " seconds...");
+    g_app.vramTestCurrentPattern = "Pre-heat (warming GPU)";
+
+    // 64 MB scratch buffer pair - small enough to fit alongside scan chunks,
+    // large enough to keep the copy engine + memory chips busy.
+    const size_t SCRATCH = 64ull * 1024 * 1024;
+    ComPtr<ID3D12Resource> srcBuf = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, SCRATCH, D3D12_RESOURCE_STATE_COMMON);
+    ComPtr<ID3D12Resource> dstBuf = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, SCRATCH, D3D12_RESOURCE_STATE_COMMON);
+    if (!srcBuf || !dstBuf) {
+        Log("[WARNING] Could not allocate pre-heat scratch buffers; skipping pre-heat");
+        return true;  // Non-fatal - just skip pre-heat
+    }
+
+    auto startTime = std::chrono::steady_clock::now();
+    int copiesDone = 0;
+    int lastReportedSec = -1;
+    while (!g_app.vramTestCancelRequested) {
+        auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+        if (elapsed >= durationSeconds) break;
+
+        // Batch 4 copies per submit to amortize fence overhead
+        g_app.benchAllocator->Reset();
+        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+        for (int i = 0; i < 4; ++i) {
+            // Alternate direction so both buffers get exercised symmetrically
+            if (i & 1) g_app.benchList->CopyResource(dstBuf.Get(), srcBuf.Get());
+            else       g_app.benchList->CopyResource(srcBuf.Get(), dstBuf.Get());
+        }
+        g_app.benchList->Close();
+        ID3D12CommandList* lists[] = { g_app.benchList.Get() };
+        g_app.benchQueue->ExecuteCommandLists(1, lists);
+        if (WaitForBenchFenceEx() != FenceWaitResult::Success) {
+            Log("[WARNING] Pre-heat fence wait failed; ending pre-heat early");
+            break;
+        }
+        copiesDone += 4;
+
+        // Update progress display once per second
+        int sec = static_cast<int>(elapsed);
+        if (sec != lastReportedSec) {
+            lastReportedSec = sec;
+            g_app.vramTestProgress = static_cast<float>(elapsed / durationSeconds);
+        }
+    }
+    Log("Pre-heat done (" + std::to_string(copiesDone) + " copies of "
+        + FormatSize(SCRATCH) + ")");
+    g_app.vramTestProgress = 0.0f;
+    return true;
+}
+
+// HLSL compute shader for GPU-side verification of the pattern in the chunk
+// buffer. Each thread reads one dword from the chunk, regenerates the expected
+// value (deterministic patterns only), and on mismatch atomically increments
+// the error counter + records the first 256 error details.
+//
+// Pattern type values match VRAMTestPattern enum order:
+//   0=AllZeros, 1=AllOnes, 2=Checkerboard, 3=InverseCheckerboard,
+//   4=Random (NOT SUPPORTED - falls back to CPU), 5=MarchingOnes,
+//   6=MarchingZeros, 7=AddressPattern
+//
+// ErrorBuf layout (uints):
+//   [0]      : atomic error count
+//   [1..256] : (offset, expected, actual) triples, 768 uints / 256 records
+static const char* g_vramVerifyHLSL = R"HLSL(
+RWStructuredBuffer<uint> ChainBuf : register(u0);
+RWStructuredBuffer<uint> ErrorBuf : register(u1);
+
+cbuffer Params : register(b0) {
+    uint dwordCount;
+    uint patternType;
+    uint patternIter;
+    uint pad;
+};
+
+uint GenerateExpected(uint i) {
+    if (patternType == 0) return 0u;
+    if (patternType == 1) return 0xFFFFFFFFu;
+    if (patternType == 2) return 0xAAAAAAAAu;
+    if (patternType == 3) return 0x55555555u;
+    if (patternType == 5) return 1u << (patternIter & 31u);
+    if (patternType == 6) return ~(1u << (patternIter & 31u));
+    if (patternType == 7) return i;
+    return 0u;  // Unsupported (Random) - shader shouldn't be dispatched
+}
+
+[numthreads(256, 1, 1)]
+void CSMain(uint3 dtid : SV_DispatchThreadID) {
+    uint i = dtid.x;
+    if (i >= dwordCount) return;
+    uint actual = ChainBuf[i];
+    uint expected = GenerateExpected(i);
+    if (actual != expected) {
+        uint slot = 0u;
+        InterlockedAdd(ErrorBuf[0], 1u, slot);
+        if (slot < 256u) {
+            uint base = 1u + slot * 3u;
+            ErrorBuf[base + 0u] = i;
+            ErrorBuf[base + 1u] = expected;
+            ErrorBuf[base + 2u] = actual;
+        }
+    }
+}
+)HLSL";
+
+// GPU verify state owned by the scan thread. Compiled/created once at the
+// start of VRAMTestThreadFunc, destroyed at end.
+struct VRAMGpuVerifyState {
+    ComPtr<ID3D12RootSignature>  rootSig;
+    ComPtr<ID3D12PipelineState>  pso;
+    ComPtr<ID3D12DescriptorHeap> heap;        // 2 UAVs: chain (u0), error (u1)
+    UINT                          uavStride = 0;
+    ComPtr<ID3D12Resource>        errorBuf;   // 1 + 256*3 uints = 1028 uints = 4112 bytes
+    ComPtr<ID3D12Resource>        errorRb;    // host-visible readback for errorBuf
+    bool ready = false;
+};
+
+// Helper: create the compute pipeline + descriptor heap + error/readback buffers.
+bool InitGpuVerifyState(VRAMGpuVerifyState& s) {
+    s = {};
+    ComPtr<ID3DBlob> code, errBlob;
+    HRESULT hr = D3DCompile(g_vramVerifyHLSL, strlen(g_vramVerifyHLSL),
+        "VRAMVerify", nullptr, nullptr, "CSMain", "cs_5_0",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errBlob);
+    if (FAILED(hr)) {
+        std::string m = "GPU verify shader compile failed";
+        if (errBlob) m += ": " + std::string((char*)errBlob->GetBufferPointer(), errBlob->GetBufferSize());
+        Log("[ERROR] " + m);
+        return false;
+    }
+
+    // Root signature: 1 descriptor table (2 UAVs at u0,u1) + 1 root-constant
+    D3D12_DESCRIPTOR_RANGE uavRange = {};
+    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uavRange.NumDescriptors = 2;
+    uavRange.BaseShaderRegister = 0;
+
+    D3D12_ROOT_PARAMETER rp[2] = {};
+    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rp[0].DescriptorTable.NumDescriptorRanges = 1;
+    rp[0].DescriptorTable.pDescriptorRanges = &uavRange;
+    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rp[1].Constants.ShaderRegister = 0;
+    rp[1].Constants.Num32BitValues = 4;
+    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsd = {};
+    rsd.NumParameters = 2;
+    rsd.pParameters = rp;
+    ComPtr<ID3DBlob> sig, sigErr;
+    hr = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &sigErr);
+    if (FAILED(hr)) { Log("[ERROR] GPU verify root sig serialize failed"); return false; }
+    hr = g_app.benchDevice->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&s.rootSig));
+    if (FAILED(hr)) { Log("[ERROR] GPU verify CreateRootSignature failed"); return false; }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = s.rootSig.Get();
+    psoDesc.CS.pShaderBytecode = code->GetBufferPointer();
+    psoDesc.CS.BytecodeLength = code->GetBufferSize();
+    hr = g_app.benchDevice->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&s.pso));
+    if (FAILED(hr)) { Log("[ERROR] GPU verify CreateComputePipelineState failed"); return false; }
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 2;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = g_app.benchDevice->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.heap));
+    if (FAILED(hr)) { Log("[ERROR] GPU verify CreateDescriptorHeap failed"); return false; }
+    s.uavStride = g_app.benchDevice->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    const size_t errBufBytes = (1 + 256 * 3) * sizeof(uint32_t);  // 1028 uints
+    s.errorBuf = CreateBufferWithFlags(D3D12_HEAP_TYPE_DEFAULT, errBufBytes,
+                                       D3D12_RESOURCE_STATE_COMMON,
+                                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    s.errorRb  = CreateBuffer(D3D12_HEAP_TYPE_READBACK, errBufBytes, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!s.errorBuf || !s.errorRb) { Log("[ERROR] GPU verify error buffer alloc failed"); return false; }
+
+    s.ready = true;
+    return true;
+}
+
+// Verify a chunk on the GPU. Returns true on completion (whether errors found or not).
+// Writes any classified errors into `errors` + updates aggregate stats in g_app.vramTestResult.
+bool VerifyChunkOnGPU(VRAMGpuVerifyState& gpuState,
+                     ComPtr<ID3D12Resource>& chainBuffer, size_t chainBytes,
+                     VRAMTestPattern pattern, int iteration,
+                     size_t baseOffset,
+                     std::vector<VRAMError>& errors, size_t& patternErrors)
+{
+    if (!gpuState.ready) return false;
+    if (pattern == VRAMTestPattern::Random) return false;  // Random not supported - caller should use CPU path
+
+    size_t dwordCount = chainBytes / sizeof(uint32_t);
+
+    // Create UAVs in heap: chain at slot 0, error at slot 1
+    {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavChain = {};
+        uavChain.Format = DXGI_FORMAT_UNKNOWN;
+        uavChain.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavChain.Buffer.NumElements = static_cast<UINT>(dwordCount);
+        uavChain.Buffer.StructureByteStride = sizeof(uint32_t);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE h = gpuState.heap->GetCPUDescriptorHandleForHeapStart();
+        g_app.benchDevice->CreateUnorderedAccessView(chainBuffer.Get(), nullptr, &uavChain, h);
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavErr = {};
+        uavErr.Format = DXGI_FORMAT_UNKNOWN;
+        uavErr.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        uavErr.Buffer.NumElements = 1 + 256 * 3;
+        uavErr.Buffer.StructureByteStride = sizeof(uint32_t);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE h2 = h;
+        h2.ptr += gpuState.uavStride;
+        g_app.benchDevice->CreateUnorderedAccessView(gpuState.errorBuf.Get(), nullptr, &uavErr, h2);
+    }
+
+    // Zero the error buffer via discard-style copy from an upload-mapped staging.
+    // Simpler: use ClearUnorderedAccessViewUint - but that needs a non-shader-visible
+    // descriptor too. Easiest: copy zeros from a small upload buffer.
+    {
+        const size_t errBufBytes = (1 + 256 * 3) * sizeof(uint32_t);
+        ComPtr<ID3D12Resource> zeros = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, errBufBytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (zeros) {
+            void* m = nullptr; D3D12_RANGE r = {0,0};
+            if (SUCCEEDED(zeros->Map(0, &r, &m)) && m) {
+                memset(m, 0, errBufBytes);
+                D3D12_RANGE wr = {0, errBufBytes};
+                zeros->Unmap(0, &wr);
+            }
+            g_app.benchAllocator->Reset();
+            g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+            g_app.benchList->CopyResource(gpuState.errorBuf.Get(), zeros.Get());
+            g_app.benchList->Close();
+            ID3D12CommandList* l1[] = { g_app.benchList.Get() };
+            g_app.benchQueue->ExecuteCommandLists(1, l1);
+            if (WaitForBenchFenceEx() != FenceWaitResult::Success) {
+                Log("[ERROR] GPU verify error-buf zero-init fence wait failed");
+                return false;
+            }
+        }
+    }
+
+    // Dispatch the verify shader
+    {
+        g_app.benchAllocator->Reset();
+        g_app.benchList->Reset(g_app.benchAllocator.Get(), nullptr);
+        ID3D12DescriptorHeap* heaps[] = { gpuState.heap.Get() };
+        g_app.benchList->SetDescriptorHeaps(1, heaps);
+        g_app.benchList->SetComputeRootSignature(gpuState.rootSig.Get());
+        g_app.benchList->SetPipelineState(gpuState.pso.Get());
+        g_app.benchList->SetComputeRootDescriptorTable(0, gpuState.heap->GetGPUDescriptorHandleForHeapStart());
+        uint32_t params[4] = {
+            static_cast<uint32_t>(dwordCount),
+            static_cast<uint32_t>(pattern),
+            static_cast<uint32_t>(iteration),
+            0
+        };
+        g_app.benchList->SetComputeRoot32BitConstants(1, 4, params, 0);
+        UINT groups = static_cast<UINT>((dwordCount + 255) / 256);
+        g_app.benchList->Dispatch(groups, 1, 1);
+
+        // Resolve error buffer to readback
+        g_app.benchList->CopyResource(gpuState.errorRb.Get(), gpuState.errorBuf.Get());
+        g_app.benchList->Close();
+        ID3D12CommandList* l2[] = { g_app.benchList.Get() };
+        g_app.benchQueue->ExecuteCommandLists(1, l2);
+        if (WaitForBenchFenceEx() != FenceWaitResult::Success) {
+            Log("[ERROR] GPU verify dispatch fence wait failed");
+            return false;
+        }
+    }
+
+    // Read back error count + records
+    uint32_t errCount = 0;
+    std::vector<uint32_t> records(256 * 3, 0);
+    {
+        void* mapped = nullptr;
+        D3D12_RANGE rr = { 0, (1 + 256 * 3) * sizeof(uint32_t) };
+        if (FAILED(gpuState.errorRb->Map(0, &rr, &mapped)) || !mapped) {
+            Log("[ERROR] GPU verify readback map failed");
+            return false;
+        }
+        const uint32_t* p = static_cast<const uint32_t*>(mapped);
+        errCount = p[0];
+        memcpy(records.data(), p + 1, records.size() * sizeof(uint32_t));
+        D3D12_RANGE wr = { 0, 0 };
+        gpuState.errorRb->Unmap(0, &wr);
+    }
+
+    if (errCount == 0) return true;
+
+    // Convert the captured error records into VRAMError clusters using the same
+    // classification + clustering logic as CompareBuffers (sequential traversal
+    // of just the recorded errors, which are already in dispatch-order).
+    patternErrors += errCount;
+    size_t recordedCount = std::min<uint32_t>(errCount, 256u);
+
+    // Sort records by offset so clustering merges nearby errors
+    std::vector<std::tuple<uint32_t,uint32_t,uint32_t>> sortedRecs;
+    sortedRecs.reserve(recordedCount);
+    for (size_t i = 0; i < recordedCount; ++i) {
+        sortedRecs.emplace_back(records[i*3+0], records[i*3+1], records[i*3+2]);
+    }
+    std::sort(sortedRecs.begin(), sortedRecs.end(),
+              [](const auto& a, const auto& b){ return std::get<0>(a) < std::get<0>(b); });
+
+    const size_t CLUSTER_THRESHOLD = 256u;
+    VRAMError currentCluster;
+    bool inCluster = false;
+    for (auto& rec : sortedRecs) {
+        uint32_t dwordIdx = std::get<0>(rec);
+        uint32_t expVal   = std::get<1>(rec);
+        uint32_t actVal   = std::get<2>(rec);
+        size_t byteOffset = baseOffset + (size_t)dwordIdx * sizeof(uint32_t);
+        // Re-use the existing recorder
+        // (forceKind=false so it gets classified normally)
+        // We can't call RecordDwordError directly because of file order, but we
+        // can inline the same logic.
+        uint32_t flipMask = expVal ^ actVal;
+        uint32_t flipCount = PopCount32(flipMask);
+        int bitIdx = -1;
+        VRAMErrorKind kind = ClassifyError(expVal, actVal, flipMask, flipCount, &bitIdx);
+        // Update aggregate stats
+        for (int b = 0; b < 32; ++b) {
+            if (flipMask & (1u << b)) g_app.vramTestResult.bitFlipHistogram[b]++;
+        }
+        size_t kindIdx = static_cast<size_t>(kind);
+        if (kindIdx < g_app.vramTestResult.errorKindCounts.size()) {
+            g_app.vramTestResult.errorKindCounts[kindIdx]++;
+        }
+        if (!inCluster) {
+            currentCluster = {};
+            currentCluster.offsetStart = byteOffset;
+            currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+            currentCluster.expected = expVal;
+            currentCluster.actual = actVal;
+            currentCluster.pattern = pattern;
+            currentCluster.errorCount = 1;
+            currentCluster.bitFlipMask = flipMask;
+            currentCluster.bitFlipCount = flipCount;
+            currentCluster.bitIndex = bitIdx;
+            currentCluster.kind = kind;
+            inCluster = true;
+        } else if (byteOffset - currentCluster.offsetEnd <= CLUSTER_THRESHOLD * sizeof(uint32_t)) {
+            currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+            currentCluster.errorCount++;
+        } else {
+            errors.push_back(currentCluster);
+            currentCluster = {};
+            currentCluster.offsetStart = byteOffset;
+            currentCluster.offsetEnd = byteOffset + sizeof(uint32_t);
+            currentCluster.expected = expVal;
+            currentCluster.actual = actVal;
+            currentCluster.pattern = pattern;
+            currentCluster.errorCount = 1;
+            currentCluster.bitFlipMask = flipMask;
+            currentCluster.bitFlipCount = flipCount;
+            currentCluster.bitIndex = bitIdx;
+            currentCluster.kind = kind;
+        }
+    }
+    if (inCluster) errors.push_back(currentCluster);
+
+    if (errCount > 256) {
+        Log("  GPU verify: " + std::to_string(errCount) + " errors found ("
+            + std::to_string(errCount - 256) + " beyond detail capture limit)");
+    }
+    return true;
 }
 
 // Main VRAM test thread function
@@ -4071,7 +4542,48 @@ void VRAMTestThreadFunc() {
     std::vector<VRAMError> allErrors;
     bool hadCriticalFailure = false;
     size_t totalBytesTested = 0;
-    
+
+    // ========== PRE-HEAT PHASE ==========
+    // If enabled, run a continuous GPU memory load before the scan to bring
+    // the silicon to operating temperature. Catches thermal-dependent errors
+    // that pass when the chip is cold.
+    if (g_app.config.vramPreheatEnabled && !g_app.vramTestCancelRequested) {
+        int sec = g_app.config.vramPreheatSeconds;
+        if (sec < 5) sec = 5;
+        if (sec > 600) sec = 600;
+        PreheatGPUForVRAMScan(sec);
+    }
+
+    // ========== GPU VERIFY STATE ==========
+    // If enabled, set up the compute shader + descriptor heap + error buffers
+    // used for all GPU-side pattern verification. Falls back to CPU verify
+    // automatically if init fails.
+    VRAMGpuVerifyState gpuVerify;
+    bool useGpuVerify = g_app.config.vramGpuVerify;
+    if (useGpuVerify) {
+        if (!InitGpuVerifyState(gpuVerify)) {
+            Log("[WARNING] GPU-verify init failed - falling back to CPU verification");
+            useGpuVerify = false;
+        } else {
+            Log("GPU-verify enabled: using compute shader to compare patterns "
+                "(skips full chunk readback; Random pattern still uses CPU)");
+        }
+    }
+
+    // ========== MARATHON OUTER LOOP ==========
+    // In Marathon mode, the whole chunk loop repeats indefinitely. Each
+    // iteration is a "pass". The user cancels when they've heard enough.
+    int marathonPass = 0;
+    do {
+        marathonPass++;
+        if (g_app.config.vramMarathonMode) {
+            Log("");
+            Log("================ Marathon pass " + std::to_string(marathonPass) + " starting ================");
+            // Reset per-pass progress; aggregate stats persist
+            totalBytesTested = 0;
+            // Don't reset allErrors / totalErrors - we want to accumulate across passes
+        }
+
     // ========== MULTI-CHUNK TESTING LOOP ==========
     // Allocate fresh buffers for each chunk to potentially hit different physical VRAM regions
     for (size_t chunkNum = 0; chunkNum < numChunks && !g_app.vramTestCancelRequested && !hadCriticalFailure; ++chunkNum) {
@@ -4094,29 +4606,41 @@ void VRAMTestThreadFunc() {
         size_t chunkErrors = 0;
         bool chunkFailed = false;
         
+        // Helper lambda: pick the right verify path (GPU if enabled and pattern
+        // != Random, otherwise CPU). Returns false on actual failure (not
+        // counting found errors).
+        auto runPattern = [&](VRAMTestPattern p, int iter, size_t& patErrors) -> bool {
+            if (useGpuVerify && p != VRAMTestPattern::Random) {
+                return RunVRAMPatternTestGpu(p, thisChunkSize, chunkOffset,
+                                             uploadBuffer, gpuBuffer, gpuVerify,
+                                             allErrors, patErrors, iter);
+            }
+            return RunVRAMPatternTest(p, thisChunkSize, chunkOffset,
+                                      uploadBuffer, gpuBuffer, readbackBuffer,
+                                      allErrors, patErrors, iter);
+        };
+
         // Run basic patterns on this chunk
         for (const auto& pattern : patterns) {
             if (g_app.vramTestCancelRequested || chunkFailed) break;
-            
+
             std::string patternName = GetPatternName(pattern);
             g_app.vramTestCurrentPattern = patternName + " [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
-            
+
             g_app.fenceTimeoutCount = 0;
             size_t patternErrors = 0;
-            
-            if (!RunVRAMPatternTest(pattern, thisChunkSize, chunkOffset,
-                                    uploadBuffer, gpuBuffer, readbackBuffer,
-                                    allErrors, patternErrors)) {
+
+            if (!runPattern(pattern, 0, patternErrors)) {
                 if (!g_app.vramTestCancelRequested) {
                     Log("  [WARNING] " + patternName + " failed");
                     chunkFailed = true;
                 }
                 break;
             }
-            
+
             chunkErrors += patternErrors;
         }
-        
+
         // Run marching ones (condensed - 4 iterations per chunk) if enabled
         if (useMarchingOnes && !g_app.vramTestCancelRequested && !chunkFailed) {
             g_app.vramTestCurrentPattern = "Marching ones [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
@@ -4124,9 +4648,7 @@ void VRAMTestThreadFunc() {
 
             for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
                 size_t marchErrors = 0;
-                if (!RunVRAMPatternTest(VRAMTestPattern::MarchingOnes, thisChunkSize, chunkOffset,
-                                  uploadBuffer, gpuBuffer, readbackBuffer,
-                                  allErrors, marchErrors, iter)) {
+                if (!runPattern(VRAMTestPattern::MarchingOnes, iter, marchErrors)) {
                     chunkFailed = true;
                     break;
                 }
@@ -4141,9 +4663,7 @@ void VRAMTestThreadFunc() {
 
             for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
                 size_t marchErrors = 0;
-                if (!RunVRAMPatternTest(VRAMTestPattern::MarchingZeros, thisChunkSize, chunkOffset,
-                                  uploadBuffer, gpuBuffer, readbackBuffer,
-                                  allErrors, marchErrors, iter)) {
+                if (!runPattern(VRAMTestPattern::MarchingZeros, iter, marchErrors)) {
                     chunkFailed = true;
                     break;
                 }
@@ -4254,8 +4774,17 @@ void VRAMTestThreadFunc() {
         if (chunkNum < numChunks - 1 && !g_app.vramTestCancelRequested) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
-    }
-    
+    }  // end chunk loop
+
+        // End of one Marathon pass - log a summary and continue if not cancelled.
+        if (g_app.config.vramMarathonMode && !g_app.vramTestCancelRequested && !hadCriticalFailure) {
+            Log("================ Marathon pass " + std::to_string(marathonPass) +
+                " complete (" + std::to_string(totalErrors) + " errors so far) ================");
+            // Brief pause before next pass
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    } while (g_app.config.vramMarathonMode && !g_app.vramTestCancelRequested && !hadCriticalFailure);  // end Marathon outer loop
+
     // Store pattern results summary
     double coveragePercent = (static_cast<double>(totalBytesTested) / gpu.dedicatedVRAM) * 100.0;
     snprintf(percentBuf, sizeof(percentBuf), "%.1f%%", coveragePercent);
@@ -5341,9 +5870,9 @@ void RenderGUI() {
     // VRAM scan options (only when not running and not iGPU)
     if (!g_app.vramTestRunning && !isIntegratedGPU) {
         // ----- Preset dropdown -----
-        static const char* PRESET_NAMES[] = { "Quick", "Standard", "Deep", "Thorough", "Custom" };
+        static const char* PRESET_NAMES[] = { "Quick", "Standard", "Deep", "Thorough", "Marathon", "Custom" };
         int presetIdx = static_cast<int>(g_app.config.vramScanPreset);
-        if (presetIdx < 0 || presetIdx > 4) presetIdx = 1;
+        if (presetIdx < 0 || presetIdx > 5) presetIdx = 1;
         ImGui::Text("Scan preset:");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(140);
@@ -5353,8 +5882,9 @@ void RenderGUI() {
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Quick: 4 patterns, 50%% coverage (~30s)\n"
                              "Standard: 8 patterns, 80%% coverage (~2-3min) - default\n"
-                             "Deep: 8 patterns + refresh + address-bus checks, 90%% (~5min)\n"
-                             "Thorough: same as Deep with 10x re-reads, 95%% (~12-15min)\n"
+                             "Deep: 8 patterns + refresh + non-seq + pre-heat 30s + GPU verify, 90%% (~5min)\n"
+                             "Thorough: same as Deep with 10x re-reads + 60s pre-heat, 95%% (~12-15min)\n"
+                             "Marathon: same as Thorough but loops forever (cancel to stop)\n"
                              "Custom: whatever you set individually below");
         }
 
@@ -5436,6 +5966,42 @@ void RenderGUI() {
                 }
                 ImGui::Unindent();
             }
+
+            // Pre-heat phase
+            bool ph = g_app.config.vramPreheatEnabled;
+            if (ImGui::Checkbox("Pre-heat GPU before scan", &ph)) {
+                g_app.config.vramPreheatEnabled = ph;
+                markCustomIfChanged(true);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Run continuous GPU memory traffic before the scan starts\n"
+                                 "so the silicon reaches operating temperature.\n"
+                                 "Exposes thermal-dependent errors that pass on a cold GPU.");
+            }
+            if (g_app.config.vramPreheatEnabled) {
+                int psec = g_app.config.vramPreheatSeconds;
+                ImGui::Indent();
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::SliderInt("Pre-heat seconds", &psec, 10, 120)) {
+                    g_app.config.vramPreheatSeconds = psec;
+                    markCustomIfChanged(true);
+                }
+                ImGui::Unindent();
+            }
+
+            // GPU compute-shader verification
+            bool gv = g_app.config.vramGpuVerify;
+            if (ImGui::Checkbox("GPU verify (compute shader)", &gv)) {
+                g_app.config.vramGpuVerify = gv;
+                markCustomIfChanged(true);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Use a compute shader to compare patterns on the GPU\n"
+                                 "instead of reading back to CPU. Much higher throughput\n"
+                                 "(no PCIe round-trip on every chunk). Random pattern still\n"
+                                 "uses CPU verify since its RNG cannot be replicated in HLSL.");
+            }
+
             ImGui::TreePop();
         }
 
