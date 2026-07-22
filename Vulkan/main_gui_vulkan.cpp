@@ -942,20 +942,14 @@ SystemMemoryInfo DetectSystemMemory() {
     pLoc->Release();
     if (weInitializedCom) CoUninitialize();
     
-    // Fill in the info
-    // DDR5, LPDDR5, LPDDR5X (SMBIOS types 34, 35, 36) and later report speed directly in MT/s
-    // DDR4 and earlier report speed in MHz, which needs to be doubled for MT/s
-    bool isDDR5orLater = (detectedMemoryType >= 34);
-    
-    if (isDDR5orLater) {
-        // DDR5/LPDDR5: WMI already reports MT/s
-        info.speedMT = maxSpeed;
-        info.configuredSpeedMT = maxConfiguredSpeed;
-    } else {
-        // DDR4 and earlier: WMI reports MHz, double for MT/s
-        info.speedMT = maxSpeed * 2;
-        info.configuredSpeedMT = maxConfiguredSpeed * 2;
-    }
+    // Fill in the info.
+    // WMI Win32_PhysicalMemory.Speed reports the memory data rate directly in
+    // MT/s (e.g. DDR4-3200 -> 3200) for all DDR generations, so no doubling is
+    // applied. (Previously DDR4 and earlier were doubled on the assumption WMI
+    // reported the I/O clock; on tested hardware it does not, which inflated
+    // DDR4 speeds to 2x and skewed the theoretical-bandwidth comparison.)
+    info.speedMT = maxSpeed;
+    info.configuredSpeedMT = maxConfiguredSpeed;
     
     info.totalSticks = static_cast<uint32_t>(stickCount);
     info.totalCapacityGB = totalCapacity / (1024 * 1024 * 1024);

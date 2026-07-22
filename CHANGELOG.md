@@ -2,6 +2,18 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.0.6] - 2026-07-21
+
+### Fixed
+- **DDR4/earlier RAM speed reported at 2x** - System RAM speed for DDR4 and
+  earlier was doubled on the assumption that WMI (`Win32_PhysicalMemory.Speed`)
+  and `dmidecode` report the I/O clock in MHz. In practice both report the
+  memory data rate directly in MT/s (e.g. DDR4-3200 -> 3200), so the doubling
+  inflated DDR4/earlier speeds to 2x, doubled the theoretical-bandwidth baseline
+  for the iGPU comparison, and could trigger a spurious "XMP/EXPO may not be
+  enabled" warning. Now no doubling is applied for any memory type. Affected all
+  three variants (DDR5+ was already correct).
+
 ## [3.0.5] - 2026-07-21
 
 ### Fixed

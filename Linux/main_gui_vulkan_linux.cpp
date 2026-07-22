@@ -827,7 +827,6 @@ SystemMemoryInfo DetectSystemMemory() {
     int stickCount = 0;
     uint64_t dmidecodeCapacity = 0;
     std::set<std::string> uniqueLocators;  // For channel counting
-    bool isDDR5orLater = false;
 
     // Split output into lines and parse Memory Device sections
     std::istringstream dmiStream(dmidecodeOutput);
@@ -912,13 +911,6 @@ SystemMemoryInfo DetectSystemMemory() {
         if (field == "Type" && slotHasModule) {
             if (value != "Unknown" && !value.empty()) {
                 detectedType = value;
-                // Check if DDR5/LPDDR5/LPDDR5X/DDR6 or later for speed interpretation
-                // These report speed directly in MT/s, not MHz
-                if (value.find("DDR5") != std::string::npos ||
-                    value.find("DDR6") != std::string::npos ||
-                    value.find("LPDDR5") != std::string::npos) {
-                    isDDR5orLater = true;
-                }
             }
         }
 
@@ -952,20 +944,14 @@ SystemMemoryInfo DetectSystemMemory() {
         info.totalCapacityGB = dmidecodeCapacity / 1024;  // MB to GB
     }
 
-    // Determine speed in MT/s
-    // DDR5, LPDDR5, LPDDR5X, DDR6 and later: dmidecode reports speed directly in MT/s
-    // DDR4 and earlier: dmidecode reports MHz, needs doubling for MT/s
-    // Note: Some dmidecode versions report "MT/s" in the unit, some report "MHz"
-    // We detect DDR5+ from the Type field rather than relying on the unit string
-    if (isDDR5orLater) {
-        // DDR5/LPDDR5/LPDDR5X/DDR6: speed values are already in MT/s
-        info.speedMT = maxSpeed;
-        info.configuredSpeedMT = maxConfiguredSpeed;
-    } else {
-        // DDR4 and earlier: reported in MHz, double for MT/s
-        info.speedMT = maxSpeed * 2;
-        info.configuredSpeedMT = maxConfiguredSpeed * 2;
-    }
+    // Determine speed in MT/s.
+    // dmidecode reports the SMBIOS Type-17 Speed field, which is defined in
+    // MT/s (e.g. DDR4-3200 -> "3200 MT/s"; older builds print "3200 MHz" but
+    // still the MT/s value), so no doubling is applied for any type.
+    // (Previously DDR4 and earlier were doubled, inflating their speed to 2x
+    // and skewing the theoretical-bandwidth comparison.)
+    info.speedMT = maxSpeed;
+    info.configuredSpeedMT = maxConfiguredSpeed;
 
     info.totalSticks = static_cast<uint32_t>(stickCount);
     info.type = detectedType;
