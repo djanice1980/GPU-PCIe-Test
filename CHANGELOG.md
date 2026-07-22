@@ -2,6 +2,23 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.0.5] - 2026-07-21
+
+### Fixed
+- **Data race on status strings (UI crash)** - `currentTest` and
+  `vramTestCurrentPattern` were written by the benchmark/scan worker threads and
+  read unsynchronized by the UI thread (`ImGui::Text("%s", ...c_str())`). A read
+  racing a reassignment (which frees the old buffer) could hand a dangling
+  pointer to `%s`, causing garbage output or a crash. All access now routes
+  through mutex-guarded setter/getter helpers. Affected all three variants.
+- **Warm-up / latency fence waits ignored Cancel and could hang forever** - The
+  bidirectional warm-up (all variants) and the memory-latency chain upload
+  (Vulkan/Linux) waited on GPU fences with an unbounded timeout (`INFINITE` /
+  `UINT64_MAX`), so a GPU stall froze the worker thread and the Cancel button did
+  nothing. These now poll on the same bounded timeout the measured loops use and
+  bail on abort, matching existing measured-loop behavior. (Render-path frame
+  fences are intentionally left unbounded.)
+
 ## [3.0.4] - 2026-07-21
 
 ### Fixed

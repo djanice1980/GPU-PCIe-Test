@@ -663,6 +663,27 @@ void ClearLog() {
     g_app.logLines.clear();
 }
 
+// currentTest and vramTestCurrentPattern are written by the benchmark/scan
+// worker threads and read by the UI thread. Route every access through these
+// helpers so the UI never observes a torn std::string (reallocation mid-read).
+static std::mutex g_statusMutex;
+void SetCurrentTest(const std::string& s) {
+    std::lock_guard<std::mutex> lock(g_statusMutex);
+    g_app.currentTest = s;
+}
+std::string GetCurrentTest() {
+    std::lock_guard<std::mutex> lock(g_statusMutex);
+    return g_app.currentTest;
+}
+void SetVramPattern(const std::string& s) {
+    std::lock_guard<std::mutex> lock(g_statusMutex);
+    g_app.vramTestCurrentPattern = s;
+}
+std::string GetVramPattern() {
+    std::lock_guard<std::mutex> lock(g_statusMutex);
+    return g_app.vramTestCurrentPattern;
+}
+
 // ============================================================================
 // UNICODE HELPER FUNCTIONS (Full UTF-8 Support)
 // ============================================================================
@@ -2369,7 +2390,7 @@ bool ShouldAbortBenchmark() {
 //   upload_speed = size / upload_time
 //
 BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, size_t size, int copies, int batches, bool useCpuTiming = false, double measuredDownloadGB = 0.0) {
-    g_app.currentTest = name;
+    SetCurrentTest(name);
     BenchmarkResult result;
     result.testName = name;
     result.unit = "GB/s";
@@ -2622,7 +2643,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
 }
 
 BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> src, ComPtr<ID3D12Resource> dst, int iterations) {
-    g_app.currentTest = name;
+    SetCurrentTest(name);
     BenchmarkResult result;
     result.testName = name;
     result.unit = "us";
@@ -2738,7 +2759,7 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
 }
 
 BenchmarkResult RunCommandLatencyTest(int iterations) {
-    g_app.currentTest = "Command Latency";
+    SetCurrentTest("Command Latency");
     BenchmarkResult result;
     result.testName = "Command Latency";
     result.unit = "us";
@@ -2894,7 +2915,7 @@ BenchmarkResult RunMemoryLatencyTest() {
     result.testName = "GPU Memory Latency";
     result.unit = "ns";
 
-    g_app.currentTest = "GPU Memory Latency";
+    SetCurrentTest("GPU Memory Latency");
     g_app.progress = 0;
 
     // ===== 1. Compile HLSL compute shader =====
@@ -3225,9 +3246,9 @@ BenchmarkResult RunMemoryLatencyTest() {
 }
 
 BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
-    g_app.currentTest = "Bidirectional " + FormatSize(size);
+    SetCurrentTest("Bidirectional " + FormatSize(size));
     BenchmarkResult result;
-    result.testName = g_app.currentTest;
+    result.testName = GetCurrentTest();
     result.unit = "GB/s";
 
     auto cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
@@ -3273,7 +3294,16 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
             g_app.benchFence->SetEventOnCompletion(g_app.benchFenceValue, g_app.benchFenceEvent);
             g_app.benchFence2->SetEventOnCompletion(g_app.benchFenceValue2, g_app.benchFenceEvent2);
             HANDLE warmupEvents[2] = { g_app.benchFenceEvent, g_app.benchFenceEvent2 };
-            WaitForMultipleObjects(2, warmupEvents, TRUE, INFINITE);
+            // Bounded, cancel-aware wait. A raw INFINITE wait would hang the
+            // worker on a GPU stall and ignore the Cancel button; poll on the
+            // same timeout the measured loop uses and bail on abort.
+            int warmupRetries = 0;
+            while (WaitForMultipleObjects(2, warmupEvents, TRUE, Constants::FENCE_WAIT_TIMEOUT_MS) == WAIT_TIMEOUT) {
+                if (ShouldAbortBenchmark() || ++warmupRetries >= Constants::MAX_FENCE_RETRIES) {
+                    g_app.benchmarkAborted = true;
+                    break;
+                }
+            }
             g_app.benchFenceValue++;
             g_app.benchFenceValue2++;
         }
@@ -4004,7 +4034,7 @@ bool RunVRAMPatternTestGpu(VRAMTestPattern pattern, size_t regionSize, size_t re
 bool PreheatGPUForVRAMScan(int durationSeconds) {
     if (durationSeconds <= 0) return true;
     Log("Pre-heating GPU for " + std::to_string(durationSeconds) + " seconds...");
-    g_app.vramTestCurrentPattern = "Pre-heat (warming GPU)";
+    SetVramPattern("Pre-heat (warming GPU)");
 
     // 64 MB scratch buffer pair - small enough to fit alongside scan chunks,
     // large enough to keep the copy engine + memory chips busy.
@@ -4641,7 +4671,7 @@ void VRAMTestThreadFunc() {
             if (g_app.vramTestCancelRequested || chunkFailed) break;
 
             std::string patternName = GetPatternName(pattern);
-            g_app.vramTestCurrentPattern = patternName + " [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+            SetVramPattern(patternName + " [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]");
 
             g_app.fenceTimeoutCount = 0;
             size_t patternErrors = 0;
@@ -4659,7 +4689,7 @@ void VRAMTestThreadFunc() {
 
         // Run marching ones (condensed - 4 iterations per chunk) if enabled
         if (useMarchingOnes && !g_app.vramTestCancelRequested && !chunkFailed) {
-            g_app.vramTestCurrentPattern = "Marching ones [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+            SetVramPattern("Marching ones [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]");
             g_app.fenceTimeoutCount = 0;
 
             for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
@@ -4674,7 +4704,7 @@ void VRAMTestThreadFunc() {
 
         // Run marching zeros if enabled
         if (useMarchingZeros && !g_app.vramTestCancelRequested && !chunkFailed) {
-            g_app.vramTestCurrentPattern = "Marching zeros [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+            SetVramPattern("Marching zeros [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]");
             g_app.fenceTimeoutCount = 0;
 
             for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
@@ -4696,7 +4726,7 @@ void VRAMTestThreadFunc() {
             if (rereadIters < 1) rereadIters = 1;
             if (rereadIters > 20) rereadIters = 20;
 
-            g_app.vramTestCurrentPattern = "Refresh check [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]";
+            SetVramPattern("Refresh check [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]");
             g_app.fenceTimeoutCount = 0;
 
             // Step 1: write a fixed random pattern to GPU memory (one time)
@@ -5750,7 +5780,7 @@ void RenderGUI() {
         g_app.completedTests = 0;
         g_app.totalTests = 0;
         g_app.currentRun = 0;
-        g_app.currentTest = "Initializing...";
+        SetCurrentTest("Initializing...");
         g_app.cancelRequested = false;
         g_app.benchmarkAborted = false;
         g_app.possibleEGPU = false;
@@ -6050,7 +6080,7 @@ void RenderGUI() {
         if (!g_app.vramTestRunning && !g_app.benchmarkThreadRunning) {
             // Clear any previous results immediately
             g_app.vramTestResult = {};
-            g_app.vramTestCurrentPattern.clear();
+            SetVramPattern(std::string());
             
             g_app.vramTestCancelRequested = false;
             g_app.vramTestRunning = true;
@@ -6087,7 +6117,7 @@ void RenderGUI() {
         ImGui::Spacing();
         ImGui::ProgressBar(g_app.vramTestProgress, ImVec2(-1, 20));
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern: %s", 
-                          g_app.vramTestCurrentPattern.c_str());
+                          GetVramPattern().c_str());
     }
     
     // Show VRAM test results button if test completed
@@ -6167,7 +6197,7 @@ void RenderGUI() {
     ImGui::Begin("Progress", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoTitleBar);
 
     if (g_app.state == AppState::Running) {
-        ImGui::Text("Current: %s", g_app.currentTest.c_str());
+        ImGui::Text("Current: %s", GetCurrentTest().c_str());
 
         // Overall progress bar
         char overlayBuf[64];
