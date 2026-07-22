@@ -171,10 +171,16 @@ namespace Constants {
     constexpr double VRAM_SAFETY_MARGIN = 0.8;
     constexpr size_t MIN_BANDWIDTH_SIZE = 16ull * 1024 * 1024;  // 16 MB minimum
     
+    // Bandwidth is reported in decimal GB/s (1 GB = 1e9 bytes) to match how
+    // PCIe/TB/USB4 interface standards are specified. (Was 1024^3, which
+    // under-reported by ~7.4% against every standard in the table.)
+    constexpr double BYTES_PER_GB = 1e9;
+
     // eGPU detection thresholds
     constexpr double EGPU_BANDWIDTH_THRESHOLD = 5.0;  // GB/s - below this suggests external connection
     constexpr double TB3_MAX_BANDWIDTH = 3.5;         // Thunderbolt 3 typical max
-    constexpr double TB4_MAX_BANDWIDTH = 4.5;         // Thunderbolt 4 typical max
+    constexpr double TB4_MAX_BANDWIDTH = 4.5;         // Thunderbolt 4 / USB4 40Gbps typical max (32 Gbps PCIe tunnel)
+    constexpr double TB5_MAX_BANDWIDTH = 7.5;         // Thunderbolt 5 / USB4 80Gbps typical max (64 Gbps PCIe tunnel)
 
     // Log and UI limits
     constexpr int MAX_LOG_LINES = 500;
@@ -443,28 +449,30 @@ struct InterfaceSpeed {
     double      bandwidth;       // Realistic achievable bandwidth (with protocol overhead)
     double      theoretical;     // Raw theoretical bandwidth (encoding overhead only)
     const char* description;
+    bool        tunneledExternal; // true = TB/USB4 PCIe-tunneling tier (eGPU over TB/USB4)
 };
 
 // Updated interface standards with realistic achievable bandwidth
 // PCIe Gen3+ uses ~85% efficiency (128b/130b encoding + TLP/DLLP overhead)
-// Thunderbolt/USB4 values are based on real-world measurements
+// Thunderbolt/USB4 PCIe payload is capped by the PCIe *tunnel*, not the link
+// rate: 40 Gbps links tunnel at most 32 Gbps of PCIe (4.0 GB/s raw), 80 Gbps
+// links (TB5 / USB4v2) tunnel at most 64 Gbps (8.0 GB/s raw). TB5 and USB4
+// 80Gbps are indistinguishable from bandwidth alone, so they share one entry.
 static const InterfaceSpeed INTERFACE_SPEEDS[] = {
-    {"PCIe 3.0 x4",    3.40,   3.94,  "Entry-level GPU slot"},
-    {"PCIe 3.0 x8",    6.80,   7.88,  "Mid-range GPU slot"},
-    {"PCIe 3.0 x16",   13.60,  15.75, "Standard discrete GPU"},
-    {"PCIe 4.0 x4",    6.80,   7.88,  "NVMe / Entry eGPU"},
-    {"PCIe 4.0 x8",    13.60,  15.75, "Mid-range PCIe 4.0"},
-    {"PCIe 4.0 x16",   27.20,  31.51, "High-end discrete GPU"},
-    {"PCIe 5.0 x8",    27.20,  31.51, "PCIe 5.0 mid-range"},
-    {"PCIe 5.0 x16",   54.40,  63.02, "High-end PCIe 5.0 GPU slot"},
-    {"PCIe 6.0 x16",   108.80, 126.03, "Next-gen PCIe 6.0 GPU slot"},
-    {"OCuLink 1.0",    3.40,   3.94,  "PCIe 3.0 x4 external"},
-    {"OCuLink 2.0",    6.80,   7.88,  "PCIe 4.0 x4 external"},
-    {"Thunderbolt 3",  2.50,   2.80,  "40 Gbps (variable PCIe allocation)"},
-    {"Thunderbolt 4",  3.00,   3.50,  "40 Gbps (guaranteed PCIe bandwidth)"},
-    {"Thunderbolt 5",  10.00,  12.00, "80 Gbps bi-directional / 120 Gbps boost"},
-    {"USB4 40Gbps",    4.00,   5.00,  "40 Gbps external"},
-    {"USB4 80Gbps",    8.00,   10.00, "80 Gbps external"},
+    {"PCIe 3.0 x4",    3.40,   3.94,  "Entry-level GPU slot",                 false},
+    {"PCIe 3.0 x8",    6.80,   7.88,  "Mid-range GPU slot",                   false},
+    {"PCIe 3.0 x16",   13.60,  15.75, "Standard discrete GPU",                false},
+    {"PCIe 4.0 x4",    6.80,   7.88,  "NVMe / Entry eGPU",                    false},
+    {"PCIe 4.0 x8",    13.60,  15.75, "Mid-range PCIe 4.0",                   false},
+    {"PCIe 4.0 x16",   27.20,  31.51, "High-end discrete GPU",                false},
+    {"PCIe 5.0 x8",    27.20,  31.51, "PCIe 5.0 mid-range",                   false},
+    {"PCIe 5.0 x16",   54.40,  63.02, "High-end PCIe 5.0 GPU slot",           false},
+    {"PCIe 6.0 x16",   108.80, 126.03, "Next-gen PCIe 6.0 GPU slot",          false},
+    {"OCuLink 1.0",    3.40,   3.94,  "PCIe 3.0 x4 external",                 false},
+    {"OCuLink 2.0",    6.80,   7.88,  "PCIe 4.0 x4 external",                 false},
+    {"Thunderbolt 3",  2.50,   2.80,  "40 Gbps link (variable PCIe allocation)", true},
+    {"Thunderbolt 4 / USB4 40Gbps", 3.50, 4.00, "40 Gbps link (32 Gbps PCIe tunnel)", true},
+    {"Thunderbolt 5 / USB4 80Gbps", 6.50, 8.00, "80 Gbps link (64 Gbps PCIe tunnel)", true},
 };
 
 static const int NUM_INTERFACE_SPEEDS = sizeof(INTERFACE_SPEEDS) / sizeof(INTERFACE_SPEEDS[0]);
@@ -1087,12 +1095,46 @@ bool IsGlobalTimeoutExceeded() {
            Constants::GLOBAL_BENCHMARK_TIMEOUT_MS;
 }
 
-// Find closest interface standard and calculate percentage
-void FindClosestInterface(double measured, std::string& outName, double& outPercentage) {
+// Find the interface standard to compare a measurement against.
+//
+// tunneledExternal (GPU confirmed behind a TB/USB4 PCIe tunnel): only the
+// tunneling tiers are candidates, and we pick the SMALLEST tier the
+// measurement plausibly fits under (measured <= achievable * 1.15). A
+// measurement that exceeds a tier's achievable bandwidth by more than ~15%
+// physically disproves that tier - reporting "134% of USB4 40Gbps" for a
+// 5.35 GB/s link is wrong; that number is only possible on an 80 Gbps-class
+// link. If the measurement disproves every tier, compare against the largest.
+//
+// Internal GPUs: nearest non-tunneled standard by absolute difference
+// (original behavior, minus the nonsensical TB/USB4 candidates).
+void FindClosestInterface(double measured, bool tunneledExternal,
+                          std::string& outName, double& outPercentage) {
+    if (measured <= 0) { outName = "Unknown"; outPercentage = 0; return; }
+
+    if (tunneledExternal) {
+        const InterfaceSpeed* fit = nullptr;
+        const InterfaceSpeed* largest = nullptr;
+        for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
+            const InterfaceSpeed& e = INTERFACE_SPEEDS[i];
+            if (!e.tunneledExternal) continue;
+            if (!largest || e.bandwidth > largest->bandwidth) largest = &e;
+            if (measured <= e.bandwidth * 1.15) {
+                if (!fit || e.bandwidth < fit->bandwidth) fit = &e;
+            }
+        }
+        const InterfaceSpeed* best = fit ? fit : largest;
+        if (best) {
+            outName = best->name;
+            outPercentage = (measured / best->bandwidth) * 100.0;
+            return;
+        }
+        // No external entries in the table (shouldn't happen) - fall through
+    }
+
     const InterfaceSpeed* best = nullptr;
     double bestDiff = 1e9;
-
     for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
+        if (INTERFACE_SPEEDS[i].tunneledExternal) continue;
         double diff = std::abs(measured - INTERFACE_SPEEDS[i].bandwidth);
         double ratio = measured / INTERFACE_SPEEDS[i].bandwidth;
         // Only consider if within reasonable range (30% to 200% of standard)
@@ -1216,36 +1258,53 @@ void DetectInterface(double upload, double download, int gpuIndex) {
     
     // Discrete GPU - detect PCIe/Thunderbolt interface
     double measured = std::max(upload, download);
-    const InterfaceSpeed* best = nullptr;
-    double bestDiff = 1e9;
+    bool tunneled = gpu.isThunderbolt || gpu.isUSB4 || gpu.isUSB;
 
-    for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
-        double diff = std::abs(measured - INTERFACE_SPEEDS[i].bandwidth);
-        double ratio = measured / INTERFACE_SPEEDS[i].bandwidth;
-        // More restrictive for detection (50% to 120% of standard)
-        if (ratio >= 0.5 && ratio <= 1.2 && diff < bestDiff) {
-            best = &INTERFACE_SPEEDS[i];
-            bestDiff = diff;
+    if (tunneled) {
+        // Confirmed TB/USB4 PCIe tunnel: classify against tunneling tiers only,
+        // using the fit-under rule (a tier the measurement exceeds is disproven).
+        double pct = 0;
+        FindClosestInterface(measured, true, g_app.detectedInterface, pct);
+        g_app.detectedInterfaceDescription = "External GPU over TB/USB4 PCIe tunnel";
+        for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
+            if (g_app.detectedInterface == INTERFACE_SPEEDS[i].name) {
+                g_app.detectedInterfaceDescription = INTERFACE_SPEEDS[i].description;
+                break;
+            }
         }
-    }
-
-    if (best) {
-        g_app.detectedInterface = best->name;
-        g_app.detectedInterfaceDescription = best->description;
-    } else if (measured > 50) {
-        g_app.detectedInterface = "PCIe 5.0 x16 (or faster)";
-        g_app.detectedInterfaceDescription = "High-performance discrete GPU";
     } else {
-        g_app.detectedInterface = "Unknown";
-        g_app.detectedInterfaceDescription = "";
+        const InterfaceSpeed* best = nullptr;
+        double bestDiff = 1e9;
+
+        for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
+            if (INTERFACE_SPEEDS[i].tunneledExternal) continue;  // internal GPU: PCIe/OCuLink only
+            double diff = std::abs(measured - INTERFACE_SPEEDS[i].bandwidth);
+            double ratio = measured / INTERFACE_SPEEDS[i].bandwidth;
+            // More restrictive for detection (50% to 120% of standard)
+            if (ratio >= 0.5 && ratio <= 1.2 && diff < bestDiff) {
+                best = &INTERFACE_SPEEDS[i];
+                bestDiff = diff;
+            }
+        }
+
+        if (best) {
+            g_app.detectedInterface = best->name;
+            g_app.detectedInterfaceDescription = best->description;
+        } else if (measured > 50) {
+            g_app.detectedInterface = "PCIe 5.0 x16 (or faster)";
+            g_app.detectedInterfaceDescription = "High-performance discrete GPU";
+        } else {
+            g_app.detectedInterface = "Unknown";
+            g_app.detectedInterfaceDescription = "";
+        }
     }
 
     g_app.uploadBW = upload;
     g_app.downloadBW = download;
 
-    // Calculate percentages vs closest standards
-    FindClosestInterface(upload, g_app.closestUploadStandard, g_app.uploadPercentage);
-    FindClosestInterface(download, g_app.closestDownloadStandard, g_app.downloadPercentage);
+    // Calculate percentages vs closest standards (external tiers for eGPUs)
+    FindClosestInterface(upload, tunneled, g_app.closestUploadStandard, g_app.uploadPercentage);
+    FindClosestInterface(download, tunneled, g_app.closestDownloadStandard, g_app.downloadPercentage);
 }
 
 // Detect if this is an eGPU - prefer hardware detection, fall back to bandwidth heuristic
@@ -1260,27 +1319,38 @@ void DetectEGPU(double upload, double download, const GPUInfo& gpu) {
     if (gpu.isThunderbolt || gpu.isUSB4 || gpu.isUSB) {
         g_app.possibleEGPU = true;
         g_app.eGPUConnectionType = gpu.externalConnectionType;
+        // Windows exposes no per-router USB4 link-rate query, but measured
+        // bandwidth can disprove a 40 Gbps link: its PCIe tunnel caps at
+        // 32 Gbps (~3.5-4 GB/s real). Anything clearly above that is an
+        // 80 Gbps-class link (Thunderbolt 5 / USB4v2) - annotate so users see
+        // an accurate link class, not a generic tunnel label.
+        double maxBw = std::max(upload, download);
+        if (maxBw > Constants::TB4_MAX_BANDWIDTH) {
+            g_app.eGPUConnectionType += " - 80 Gbps-class (TB5/USB4v2, by measured bandwidth)";
+        }
         // Don't log here - it was already logged during enumeration
         return;
     }
-    
+
     // Fallback: Use bandwidth heuristic for cases where hardware detection failed
     double maxBandwidth = std::max(upload, download);
-    
+
     // If a discrete GPU has suspiciously low bandwidth, it might be external
     if (maxBandwidth < Constants::EGPU_BANDWIDTH_THRESHOLD) {
         g_app.possibleEGPU = true;
-        
+
         // Identify the connection type from bandwidth
         // Don't add "inferred" qualifier - the eGPU detection itself is the confirmation
         if (maxBandwidth <= Constants::TB3_MAX_BANDWIDTH) {
             g_app.eGPUConnectionType = "Thunderbolt 3 / USB4 40Gbps";
         } else if (maxBandwidth <= Constants::TB4_MAX_BANDWIDTH) {
-            g_app.eGPUConnectionType = "Thunderbolt 4 / USB4";
+            g_app.eGPUConnectionType = "Thunderbolt 4 / USB4 40Gbps";
+        } else if (maxBandwidth <= Constants::TB5_MAX_BANDWIDTH) {
+            g_app.eGPUConnectionType = "Thunderbolt 5 / USB4 80Gbps";
         } else {
-            g_app.eGPUConnectionType = "External (OCuLink / USB4 80Gbps)";
+            g_app.eGPUConnectionType = "External (OCuLink / beyond 80 Gbps-class)";
         }
-        
+
         Log("[INFO] eGPU detected - bandwidth indicates " + g_app.eGPUConnectionType);
     }
 }
@@ -2280,6 +2350,63 @@ void CleanupBenchmarkDevice() {
 //                         BENCHMARK ENGINE
 // ============================================================================
 
+// Format an HRESULT as readable hex plus a friendly name for the codes this
+// tool actually hits. (std::to_string(hr) printed signed decimal, producing
+// nonsense like "0x-2147024882" in bug reports.)
+std::string HResultToString(HRESULT hr) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "0x%08X", static_cast<unsigned int>(hr));
+    std::string s = buf;
+    switch (static_cast<unsigned int>(hr)) {
+        case 0x8007000EU: s += " (E_OUTOFMEMORY)"; break;
+        case 0x80070057U: s += " (E_INVALIDARG)"; break;
+        case 0x887A0005U: s += " (DXGI_ERROR_DEVICE_REMOVED)"; break;
+        case 0x887A0006U: s += " (DXGI_ERROR_DEVICE_HUNG)"; break;
+        case 0x887A0007U: s += " (DXGI_ERROR_DEVICE_RESET)"; break;
+        case 0x887A0020U: s += " (DXGI_ERROR_DRIVER_INTERNAL_ERROR)"; break;
+        default: break;
+    }
+    return s;
+}
+
+const char* HeapTypeName(D3D12_HEAP_TYPE t) {
+    switch (t) {
+        case D3D12_HEAP_TYPE_DEFAULT:  return "DEFAULT (VRAM)";
+        case D3D12_HEAP_TYPE_UPLOAD:   return "UPLOAD (system RAM)";
+        case D3D12_HEAP_TYPE_READBACK: return "READBACK (system RAM)";
+        default:                       return "OTHER";
+    }
+}
+
+// Log the OS-managed video memory budgets for the benchmark GPU. eGPUs over
+// Thunderbolt/USB4 often get far smaller budgets than the card's physical
+// VRAM/system RAM would suggest, which is how a 256 MB allocation can fail
+// with E_OUTOFMEMORY on a 16 GB card. Logging both segments turns that from a
+// mystery into a diagnosis.
+void LogVideoMemoryBudgets(const char* when) {
+    int idx = g_app.config.selectedGPU;
+    if (idx < 0 || idx >= static_cast<int>(g_app.gpuList.size())) return;
+    ComPtr<IDXGIAdapter3> adapter3;
+    if (!g_app.gpuList[idx].adapter ||
+        FAILED(g_app.gpuList[idx].adapter.As(&adapter3))) return;
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO local = {}, nonLocal = {};
+    bool haveLocal = SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+        0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local));
+    bool haveNonLocal = SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+        0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonLocal));
+    if (!haveLocal && !haveNonLocal) return;
+
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "[INFO] Memory budgets %s - local (VRAM): %.0f MB used / %.0f MB budget, "
+        "non-local (system): %.0f MB used / %.0f MB budget",
+        when,
+        local.CurrentUsage / (1024.0 * 1024.0), local.Budget / (1024.0 * 1024.0),
+        nonLocal.CurrentUsage / (1024.0 * 1024.0), nonLocal.Budget / (1024.0 * 1024.0));
+    Log(buf);
+}
+
 ComPtr<ID3D12Resource> CreateBuffer(D3D12_HEAP_TYPE heapType, size_t size, D3D12_RESOURCE_STATES state) {
     D3D12_HEAP_PROPERTIES heapProps = {};
     heapProps.Type = heapType;
@@ -2298,8 +2425,9 @@ ComPtr<ID3D12Resource> CreateBuffer(D3D12_HEAP_TYPE heapType, size_t size, D3D12
         &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource));
 
     if (FAILED(hr)) {
-        Log("[ERROR] CreateCommittedResource failed: HRESULT = 0x" + std::to_string(hr) + 
-            " (Size: " + FormatSize(size) + ")");
+        Log("[ERROR] CreateCommittedResource failed: HRESULT = " + HResultToString(hr) +
+            " (Size: " + FormatSize(size) + ", Heap: " + HeapTypeName(heapType) + ")");
+        LogVideoMemoryBudgets("at allocation failure");
         return nullptr;
     }
 
@@ -2484,7 +2612,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
 
                 double totalSeconds = std::chrono::duration<double>(endTime - startTime).count();
                 if (totalSeconds > 0) {
-                    double sizeGB = static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0);
+                    double sizeGB = static_cast<double>(size) * copies / Constants::BYTES_PER_GB;
                     
                     double uploadBw;
                     bool usedImprovedMethod = false;
@@ -2518,7 +2646,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
                         // This is appropriate for bandwidth-limited links like Thunderbolt/USB4
                         // where upload and download are naturally symmetric
                         double totalBytes = static_cast<double>(size) * copies * 2;  // up + down
-                        double roundtripBw = (totalBytes / (1024.0 * 1024.0 * 1024.0)) / totalSeconds;
+                        double roundtripBw = (totalBytes / Constants::BYTES_PER_GB) / totalSeconds;
                         uploadBw = roundtripBw / 2.0;
                     }
                     
@@ -2591,13 +2719,15 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
             UINT64* timestamps = nullptr;
             D3D12_RANGE readRange = { 0, sizeof(UINT64) * 2 };
             if (SUCCEEDED(queryReadback->Map(0, &readRange, reinterpret_cast<void**>(&timestamps)))) {
-                UINT64 delta = timestamps[1] - timestamps[0];
+                // Ordering guard: reordered timestamps would underflow the
+                // unsigned subtraction into a huge positive delta.
+                UINT64 delta = (timestamps[1] > timestamps[0]) ? (timestamps[1] - timestamps[0]) : 0;
                 queryReadback->Unmap(0, nullptr);
-                
+
                 if (delta > 0 && timestampFreq > 0) {
                     double seconds = static_cast<double>(delta) / static_cast<double>(timestampFreq);
                     if (seconds > 0) {
-                        double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                        double bw = (static_cast<double>(size) * copies / Constants::BYTES_PER_GB) / seconds;
                         bandwidths.push_back(bw);
                     } else {
                         failedBatches++;
@@ -2824,7 +2954,10 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
             for (int i = 0; i < opsThisBatch; ++i) {
                 UINT64 tStart = timestamps[i * 2 + 0];
                 UINT64 tEnd = timestamps[i * 2 + 1];
-                if (timestampFreq > 0) {
+                // tEnd > tStart guard: equal/reordered timestamps would
+                // underflow the unsigned subtraction into a ~1e10-scale
+                // bogus sample that poisons min/avg/max.
+                if (tEnd > tStart && timestampFreq > 0) {
                     double deltaSec = static_cast<double>(tEnd - tStart) / static_cast<double>(timestampFreq);
                     double us = deltaSec * 1'000'000.0;
                     latencies.push_back(us);
@@ -2893,8 +3026,9 @@ ComPtr<ID3D12Resource> CreateBufferWithFlags(D3D12_HEAP_TYPE heapType, size_t si
         &heapProps, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&resource));
 
     if (FAILED(hr)) {
-        Log("[ERROR] CreateBufferWithFlags failed: HRESULT = 0x" + std::to_string(hr) +
-            " (Size: " + FormatSize(size) + ")");
+        Log("[ERROR] CreateBufferWithFlags failed: HRESULT = " + HResultToString(hr) +
+            " (Size: " + FormatSize(size) + ", Heap: " + HeapTypeName(heapType) + ")");
+        LogVideoMemoryBudgets("at allocation failure");
         return nullptr;
     }
     return resource;
@@ -3245,14 +3379,39 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
     result.testName = GetCurrentTest();
     result.unit = "GB/s";
 
-    auto cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
-    auto gpuDefault = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, size, D3D12_RESOURCE_STATE_COMMON);
-    auto gpuSrc = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, size, D3D12_RESOURCE_STATE_COMMON);
-    auto cpuReadback = CreateBuffer(D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST);
+    // The bidirectional test needs 4 buffers of `size` at once (2x host, 2x
+    // device) - the largest simultaneous footprint of any test. On eGPUs over
+    // Thunderbolt/USB4 the OS grants conservative memory budgets, so the same
+    // 256 MB that worked for single-direction tests can fail here with
+    // E_OUTOFMEMORY despite ample physical VRAM. Rather than skipping the test,
+    // retry with progressively halved buffers; bandwidth math uses the actual
+    // size, so results stay valid (a clearly labeled smaller transfer beats no
+    // bidirectional measurement at all).
+    constexpr size_t MIN_BIDIR_SIZE = 32ull * 1024 * 1024;
+    const size_t requestedSize = size;
+    ComPtr<ID3D12Resource> cpuUpload, gpuDefault, gpuSrc, cpuReadback;
+    for (;;) {
+        cpuUpload = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, size, D3D12_RESOURCE_STATE_GENERIC_READ);
+        gpuDefault = cpuUpload ? CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, size, D3D12_RESOURCE_STATE_COMMON) : nullptr;
+        gpuSrc = gpuDefault ? CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, size, D3D12_RESOURCE_STATE_COMMON) : nullptr;
+        cpuReadback = gpuSrc ? CreateBuffer(D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_STATE_COPY_DEST) : nullptr;
+        if (cpuReadback) break;  // all four succeeded
 
-    if (!cpuUpload || !gpuDefault || !gpuSrc || !cpuReadback) {
-        Log("[ERROR] Failed to create resources for bidirectional test - likely out of VRAM");
-        return result;
+        cpuUpload.Reset(); gpuDefault.Reset(); gpuSrc.Reset(); cpuReadback.Reset();
+        if (size / 2 < MIN_BIDIR_SIZE) {
+            Log("[ERROR] Failed to create resources for bidirectional test even at " +
+                FormatSize(size) + " - skipping bidirectional measurement");
+            return result;
+        }
+        size /= 2;
+        Log("[WARNING] Bidirectional buffer allocation failed - retrying at " + FormatSize(size));
+    }
+    if (size != requestedSize) {
+        Log("[WARNING] Bidirectional test running with " + FormatSize(size) + " buffers instead of " +
+            FormatSize(requestedSize) + " (driver/OS refused the larger allocation - common for "
+            "Thunderbolt/USB4 eGPUs with constrained memory budgets). Results remain valid.");
+        SetCurrentTest("Bidirectional " + FormatSize(size));
+        result.testName = GetCurrentTest();
     }
 
     std::vector<double> bandwidths;
@@ -3362,7 +3521,7 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
             
             double seconds = std::chrono::duration<double>(endTime - startTime).count();
             if (seconds > 0) {
-                double bw = (static_cast<double>(size) * copies * 2 / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                double bw = (static_cast<double>(size) * copies * 2 / Constants::BYTES_PER_GB) / seconds;
                 bandwidths.push_back(bw);
             }
 
@@ -3415,7 +3574,7 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
 
             double seconds = std::chrono::duration<double>(endTime - startTime).count();
             if (seconds > 0) {
-                double bw = (static_cast<double>(size) * copies * 2 / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                double bw = (static_cast<double>(size) * copies * 2 / Constants::BYTES_PER_GB) / seconds;
                 bandwidths.push_back(bw);
             }
 
@@ -4926,10 +5085,14 @@ void BenchmarkThreadFunc() {
         Log("[INFO] System memory detection: " + g_app.systemMemory.errorMessage);
     }
     
+    // Log OS memory budgets up front - on eGPUs these are often the real
+    // allocation ceiling, not physical VRAM, and explain E_OUTOFMEMORY errors.
+    LogVideoMemoryBudgets("at start");
+
     // Validate and potentially cap bandwidth size based on VRAM
     size_t originalSize = g_app.config.bandwidthSize;
     g_app.config.bandwidthSize = ValidateBandwidthSize(originalSize, g_app.config.selectedGPU);
-    
+
     Log("Size: " + FormatSize(g_app.config.bandwidthSize));
     if (g_app.config.bandwidthSize != originalSize) {
         Log("[INFO] Size was reduced from " + FormatSize(originalSize) + " to fit VRAM");
@@ -7514,6 +7677,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     }
 
     // Cleanup - request cancellation and wait for benchmark thread
+    bool workerHung = false;
     g_app.cancelRequested = true;
     if (g_app.benchmarkThread.joinable()) {
         // Give the thread a moment to notice cancellation (max 5 seconds)
@@ -7522,17 +7686,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         threadStopped = !g_app.benchmarkThreadRunning;
-        
+
         if (threadStopped) {
             g_app.benchmarkThread.join();
         } else {
-            // Thread is hung - detach to allow clean exit
-            // (This leaks the thread but prevents app hang on exit)
+            // Thread is hung (GPU stall) - detach so exit isn't blocked
             g_app.benchmarkThread.detach();
+            workerHung = true;
         }
     }
-    
-    // Cleanup VRAM test thread  
+
+    // Cleanup VRAM test thread
     g_app.vramTestCancelRequested = true;
     if (g_app.vramTestThread.joinable()) {
         bool threadStopped = false;
@@ -7540,14 +7704,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         threadStopped = !g_app.vramTestRunning;
-        
+
         if (threadStopped) {
             g_app.vramTestThread.join();
         } else {
             g_app.vramTestThread.detach();
+            workerHung = true;
         }
     }
-    
+
+    if (workerHung) {
+        // A detached worker is still live and using g_app's D3D12 objects.
+        // Tearing down the device/ImGui underneath it is a use-after-free, so
+        // exit the process immediately instead - the OS reclaims everything.
+        ExitProcess(0);
+    }
+
     WaitForGPU();
 
     ImGui_ImplDX12_Shutdown();

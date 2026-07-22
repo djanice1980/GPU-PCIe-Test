@@ -183,9 +183,15 @@ namespace Constants {
     constexpr double VRAM_SAFETY_MARGIN = 0.8;
     constexpr size_t MIN_BANDWIDTH_SIZE = 16ull * 1024 * 1024;
     
+    // Bandwidth is reported in decimal GB/s (1 GB = 1e9 bytes) to match how
+    // PCIe/TB/USB4 interface standards are specified. (Was 1024^3, which
+    // under-reported by ~7.4% against every standard in the table.)
+    constexpr double BYTES_PER_GB = 1e9;
+
     constexpr double EGPU_BANDWIDTH_THRESHOLD = 5.0;
     constexpr double TB3_MAX_BANDWIDTH = 3.5;
-    constexpr double TB4_MAX_BANDWIDTH = 4.5;
+    constexpr double TB4_MAX_BANDWIDTH = 4.5;   // TB4 / USB4 40Gbps typical max (32 Gbps PCIe tunnel)
+    constexpr double TB5_MAX_BANDWIDTH = 7.5;   // TB5 / USB4 80Gbps typical max (64 Gbps PCIe tunnel)
 
     // Memory latency compute shader test
     constexpr size_t MEMORY_LATENCY_BUFFER_SIZE = 32ull * 1024 * 1024;
@@ -425,25 +431,28 @@ struct InterfaceSpeed {
     double      bandwidth;
     double      theoretical;
     const char* description;
+    bool        tunneledExternal; // true = TB/USB4 PCIe-tunneling tier (eGPU over TB/USB4)
 };
 
+// Thunderbolt/USB4 PCIe payload is capped by the PCIe *tunnel*, not the link
+// rate: 40 Gbps links tunnel at most 32 Gbps of PCIe (4.0 GB/s raw), 80 Gbps
+// links (TB5 / USB4v2) tunnel at most 64 Gbps (8.0 GB/s raw). TB5 and USB4
+// 80Gbps are indistinguishable from bandwidth alone, so they share one entry.
 static const InterfaceSpeed INTERFACE_SPEEDS[] = {
-    {"PCIe 3.0 x4",    3.40,   3.94,  "Entry-level GPU slot"},
-    {"PCIe 3.0 x8",    6.80,   7.88,  "Mid-range GPU slot"},
-    {"PCIe 3.0 x16",   13.60,  15.75, "Standard discrete GPU"},
-    {"PCIe 4.0 x4",    6.80,   7.88,  "NVMe / Entry eGPU"},
-    {"PCIe 4.0 x8",    13.60,  15.75, "Mid-range PCIe 4.0"},
-    {"PCIe 4.0 x16",   27.20,  31.51, "High-end discrete GPU"},
-    {"PCIe 5.0 x8",    27.20,  31.51, "PCIe 5.0 mid-range"},
-    {"PCIe 5.0 x16",   54.40,  63.02, "High-end PCIe 5.0 GPU slot"},
-    {"PCIe 6.0 x16",   108.80, 126.03, "Next-gen PCIe 6.0 GPU slot"},
-    {"OCuLink 1.0",    3.40,   3.94,  "PCIe 3.0 x4 external"},
-    {"OCuLink 2.0",    6.80,   7.88,  "PCIe 4.0 x4 external"},
-    {"Thunderbolt 3",  2.50,   2.80,  "40 Gbps (variable PCIe allocation)"},
-    {"Thunderbolt 4",  3.00,   3.50,  "40 Gbps (guaranteed PCIe bandwidth)"},
-    {"Thunderbolt 5",  10.00,  12.00, "80 Gbps bi-directional / 120 Gbps boost"},
-    {"USB4 40Gbps",    4.00,   5.00,  "40 Gbps external"},
-    {"USB4 80Gbps",    8.00,   10.00, "80 Gbps external"},
+    {"PCIe 3.0 x4",    3.40,   3.94,  "Entry-level GPU slot",                 false},
+    {"PCIe 3.0 x8",    6.80,   7.88,  "Mid-range GPU slot",                   false},
+    {"PCIe 3.0 x16",   13.60,  15.75, "Standard discrete GPU",                false},
+    {"PCIe 4.0 x4",    6.80,   7.88,  "NVMe / Entry eGPU",                    false},
+    {"PCIe 4.0 x8",    13.60,  15.75, "Mid-range PCIe 4.0",                   false},
+    {"PCIe 4.0 x16",   27.20,  31.51, "High-end discrete GPU",                false},
+    {"PCIe 5.0 x8",    27.20,  31.51, "PCIe 5.0 mid-range",                   false},
+    {"PCIe 5.0 x16",   54.40,  63.02, "High-end PCIe 5.0 GPU slot",           false},
+    {"PCIe 6.0 x16",   108.80, 126.03, "Next-gen PCIe 6.0 GPU slot",          false},
+    {"OCuLink 1.0",    3.40,   3.94,  "PCIe 3.0 x4 external",                 false},
+    {"OCuLink 2.0",    6.80,   7.88,  "PCIe 4.0 x4 external",                 false},
+    {"Thunderbolt 3",  2.50,   2.80,  "40 Gbps link (variable PCIe allocation)", true},
+    {"Thunderbolt 4 / USB4 40Gbps", 3.50, 4.00, "40 Gbps link (32 Gbps PCIe tunnel)", true},
+    {"Thunderbolt 5 / USB4 80Gbps", 6.50, 8.00, "80 Gbps link (64 Gbps PCIe tunnel)", true},
 };
 
 static const int NUM_INTERFACE_SPEEDS = sizeof(INTERFACE_SPEEDS) / sizeof(INTERFACE_SPEEDS[0]);
@@ -569,6 +578,7 @@ struct AppContext {
     VkFence                    benchFence = VK_NULL_HANDLE;
     uint64_t                   benchFenceValue = 1;
     float                      benchTimestampPeriod = 0.0f;  // nanoseconds per tick
+    uint64_t                   benchTimestampMask = ~0ull;   // mask of timestampValidBits for the bench queue family
 
     // Second queue for bidirectional transfers (allows true simultaneous upload/download)
     VkQueue                    benchQueue2 = VK_NULL_HANDLE;
@@ -1152,11 +1162,46 @@ bool IsGlobalTimeoutExceeded() {
 }
 
 // Find closest interface standard and calculate percentage
-void FindClosestInterface(double measured, std::string& outName, double& outPercentage) {
+// Find the interface standard to compare a measurement against.
+//
+// tunneledExternal (GPU confirmed behind a TB/USB4 PCIe tunnel): only the
+// tunneling tiers are candidates, and we pick the SMALLEST tier the
+// measurement plausibly fits under (measured <= achievable * 1.15). A
+// measurement that exceeds a tier's achievable bandwidth by more than ~15%
+// physically disproves that tier - reporting "134% of USB4 40Gbps" for a
+// 5.35 GB/s link is wrong; that number is only possible on an 80 Gbps-class
+// link. If the measurement disproves every tier, compare against the largest.
+//
+// Internal GPUs: nearest non-tunneled standard by absolute difference
+// (original behavior, minus the nonsensical TB/USB4 candidates).
+void FindClosestInterface(double measured, bool tunneledExternal,
+                          std::string& outName, double& outPercentage) {
+    if (measured <= 0) { outName = "Unknown"; outPercentage = 0; return; }
+
+    if (tunneledExternal) {
+        const InterfaceSpeed* fit = nullptr;
+        const InterfaceSpeed* largest = nullptr;
+        for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
+            const InterfaceSpeed& e = INTERFACE_SPEEDS[i];
+            if (!e.tunneledExternal) continue;
+            if (!largest || e.bandwidth > largest->bandwidth) largest = &e;
+            if (measured <= e.bandwidth * 1.15) {
+                if (!fit || e.bandwidth < fit->bandwidth) fit = &e;
+            }
+        }
+        const InterfaceSpeed* best = fit ? fit : largest;
+        if (best) {
+            outName = best->name;
+            outPercentage = (measured / best->bandwidth) * 100.0;
+            return;
+        }
+        // No external entries in the table (shouldn't happen) - fall through
+    }
+
     const InterfaceSpeed* best = nullptr;
     double bestDiff = 1e9;
-
     for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
+        if (INTERFACE_SPEEDS[i].tunneledExternal) continue;
         double diff = std::abs(measured - INTERFACE_SPEEDS[i].bandwidth);
         double ratio = measured / INTERFACE_SPEEDS[i].bandwidth;
         // Only consider if within reasonable range (30% to 200% of standard)
@@ -1280,36 +1325,53 @@ void DetectInterface(double upload, double download, int gpuIndex) {
     
     // Discrete GPU - detect PCIe/Thunderbolt interface
     double measured = std::max(upload, download);
-    const InterfaceSpeed* best = nullptr;
-    double bestDiff = 1e9;
+    bool tunneled = gpu.isThunderbolt || gpu.isUSB4 || gpu.isUSB;
 
-    for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
-        double diff = std::abs(measured - INTERFACE_SPEEDS[i].bandwidth);
-        double ratio = measured / INTERFACE_SPEEDS[i].bandwidth;
-        // More restrictive for detection (50% to 120% of standard)
-        if (ratio >= 0.5 && ratio <= 1.2 && diff < bestDiff) {
-            best = &INTERFACE_SPEEDS[i];
-            bestDiff = diff;
+    if (tunneled) {
+        // Confirmed TB/USB4 PCIe tunnel: classify against tunneling tiers only,
+        // using the fit-under rule (a tier the measurement exceeds is disproven).
+        double pct = 0;
+        FindClosestInterface(measured, true, g_app.detectedInterface, pct);
+        g_app.detectedInterfaceDescription = "External GPU over TB/USB4 PCIe tunnel";
+        for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
+            if (g_app.detectedInterface == INTERFACE_SPEEDS[i].name) {
+                g_app.detectedInterfaceDescription = INTERFACE_SPEEDS[i].description;
+                break;
+            }
         }
-    }
-
-    if (best) {
-        g_app.detectedInterface = best->name;
-        g_app.detectedInterfaceDescription = best->description;
-    } else if (measured > 50) {
-        g_app.detectedInterface = "PCIe 5.0 x16 (or faster)";
-        g_app.detectedInterfaceDescription = "High-performance discrete GPU";
     } else {
-        g_app.detectedInterface = "Unknown";
-        g_app.detectedInterfaceDescription = "";
+        const InterfaceSpeed* best = nullptr;
+        double bestDiff = 1e9;
+
+        for (int i = 0; i < NUM_INTERFACE_SPEEDS; i++) {
+            if (INTERFACE_SPEEDS[i].tunneledExternal) continue;  // internal GPU: PCIe/OCuLink only
+            double diff = std::abs(measured - INTERFACE_SPEEDS[i].bandwidth);
+            double ratio = measured / INTERFACE_SPEEDS[i].bandwidth;
+            // More restrictive for detection (50% to 120% of standard)
+            if (ratio >= 0.5 && ratio <= 1.2 && diff < bestDiff) {
+                best = &INTERFACE_SPEEDS[i];
+                bestDiff = diff;
+            }
+        }
+
+        if (best) {
+            g_app.detectedInterface = best->name;
+            g_app.detectedInterfaceDescription = best->description;
+        } else if (measured > 50) {
+            g_app.detectedInterface = "PCIe 5.0 x16 (or faster)";
+            g_app.detectedInterfaceDescription = "High-performance discrete GPU";
+        } else {
+            g_app.detectedInterface = "Unknown";
+            g_app.detectedInterfaceDescription = "";
+        }
     }
 
     g_app.uploadBW = upload;
     g_app.downloadBW = download;
 
-    // Calculate percentages vs closest standards
-    FindClosestInterface(upload, g_app.closestUploadStandard, g_app.uploadPercentage);
-    FindClosestInterface(download, g_app.closestDownloadStandard, g_app.downloadPercentage);
+    // Calculate percentages vs closest standards (external tiers for eGPUs)
+    FindClosestInterface(upload, tunneled, g_app.closestUploadStandard, g_app.uploadPercentage);
+    FindClosestInterface(download, tunneled, g_app.closestDownloadStandard, g_app.downloadPercentage);
 }
 
 // Detect if this is an eGPU - prefer hardware detection, fall back to bandwidth heuristic
@@ -1324,27 +1386,38 @@ void DetectEGPU(double upload, double download, const GPUInfo& gpu) {
     if (gpu.isThunderbolt || gpu.isUSB4 || gpu.isUSB) {
         g_app.possibleEGPU = true;
         g_app.eGPUConnectionType = gpu.externalConnectionType;
+        // The sysfs thunderbolt subsystem doesn't reliably expose the
+        // negotiated USB4 link rate, but measured bandwidth can disprove a
+        // 40 Gbps link: its PCIe tunnel caps at 32 Gbps (~3.5-4 GB/s real).
+        // Anything clearly above that is an 80 Gbps-class link (Thunderbolt 5
+        // / USB4v2) - annotate so users see an accurate link class.
+        double maxBw = std::max(upload, download);
+        if (maxBw > Constants::TB4_MAX_BANDWIDTH) {
+            g_app.eGPUConnectionType += " - 80 Gbps-class (TB5/USB4v2, by measured bandwidth)";
+        }
         // Don't log here - it was already logged during enumeration
         return;
     }
-    
+
     // Fallback: Use bandwidth heuristic for cases where hardware detection failed
     double maxBandwidth = std::max(upload, download);
-    
+
     // If a discrete GPU has suspiciously low bandwidth, it might be external
     if (maxBandwidth < Constants::EGPU_BANDWIDTH_THRESHOLD) {
         g_app.possibleEGPU = true;
-        
+
         // Identify the connection type from bandwidth
         // Don't add "inferred" qualifier - the eGPU detection itself is the confirmation
         if (maxBandwidth <= Constants::TB3_MAX_BANDWIDTH) {
             g_app.eGPUConnectionType = "Thunderbolt 3 / USB4 40Gbps";
         } else if (maxBandwidth <= Constants::TB4_MAX_BANDWIDTH) {
-            g_app.eGPUConnectionType = "Thunderbolt 4 / USB4";
+            g_app.eGPUConnectionType = "Thunderbolt 4 / USB4 40Gbps";
+        } else if (maxBandwidth <= Constants::TB5_MAX_BANDWIDTH) {
+            g_app.eGPUConnectionType = "Thunderbolt 5 / USB4 80Gbps";
         } else {
-            g_app.eGPUConnectionType = "External (OCuLink / USB4 80Gbps)";
+            g_app.eGPUConnectionType = "External (OCuLink / beyond 80 Gbps-class)";
         }
-        
+
         Log("[INFO] eGPU detected - bandwidth indicates " + g_app.eGPUConnectionType);
     }
 }
@@ -2680,6 +2753,14 @@ bool InitBenchmarkDevice(int gpuIndex) {
         Log("[ERROR] No suitable queue family found on benchmark device");
         return false;
     }
+
+    // Per spec, only timestampValidBits of each timestamp are meaningful; the
+    // rest are undefined. Precompute the mask so readback sites can strip
+    // undefined high bits before computing deltas.
+    {
+        uint32_t validBits = queueFamilies[g_app.benchQueueFamily].timestampValidBits;
+        g_app.benchTimestampMask = (validBits >= 64) ? ~0ull : ((1ull << validBits) - 1);
+    }
     
     // Create logical device for benchmarking
     // Request 2 queues for bidirectional overlap (separate DMA engines)
@@ -2808,6 +2889,15 @@ void CleanupBenchmarkDevice() {
 // EXCLUSIVE sharing mode is correct: both queues share the same family.
 // ============================================================================
 
+const char* BufferTypeName(VkBufferType t) {
+    switch (t) {
+        case VkBufferType::Upload:      return "Upload (host RAM)";
+        case VkBufferType::DeviceLocal: return "DeviceLocal (VRAM)";
+        case VkBufferType::Readback:    return "Readback (host RAM)";
+        default:                        return "Other";
+    }
+}
+
 VkBufferAllocation CreateBuffer(VkBufferType type, VkDeviceSize size, VkBufferUsageFlags extraUsage = 0) {
     VkBufferAllocation alloc = {};
     alloc.size = size;
@@ -2840,8 +2930,8 @@ VkBufferAllocation CreateBuffer(VkBufferType type, VkDeviceSize size, VkBufferUs
 
     VkResult result = vkCreateBuffer(g_app.benchDevice, &bufferInfo, nullptr, &alloc.buffer);
     if (result != VK_SUCCESS) {
-        Log("[ERROR] vkCreateBuffer failed: " + std::to_string((int)result) + 
-            " (Size: " + FormatSize(size) + ")");
+        Log("[ERROR] vkCreateBuffer failed: " + std::to_string((int)result) +
+            " (Size: " + FormatSize(size) + ", Type: " + BufferTypeName(type) + ")");
         alloc.buffer = VK_NULL_HANDLE;
         return alloc;
     }
@@ -3071,7 +3161,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, VkBufferAllocation& sr
 
                 double totalSeconds = std::chrono::duration<double>(endTime - startTime).count();
                 if (totalSeconds > 0) {
-                    double sizeGB = static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0);
+                    double sizeGB = static_cast<double>(size) * copies / Constants::BYTES_PER_GB;
                     
                     double uploadBw;
                     bool usedImprovedMethod = false;
@@ -3091,7 +3181,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, VkBufferAllocation& sr
                     
                     if (!usedImprovedMethod) {
                         double totalBytes = static_cast<double>(size) * copies * 2;
-                        double roundtripBw = (totalBytes / (1024.0 * 1024.0 * 1024.0)) / totalSeconds;
+                        double roundtripBw = (totalBytes / Constants::BYTES_PER_GB) / totalSeconds;
                         uploadBw = roundtripBw / 2.0;
                     }
                     
@@ -3140,7 +3230,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, VkBufferAllocation& sr
 
                 double seconds = std::chrono::duration<double>(endTime - startTime).count();
                 if (seconds > 0) {
-                    double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                    double bw = (static_cast<double>(size) * copies / Constants::BYTES_PER_GB) / seconds;
                     bandwidths.push_back(bw);
                 } else {
                     failedBatches++;
@@ -3200,12 +3290,14 @@ BenchmarkResult RunBandwidthTest(const std::string& name, VkBufferAllocation& sr
                 VkResult qr = vkGetQueryPoolResults(g_app.benchDevice, queryPool, 0, 2,
                     sizeof(timestamps), timestamps, sizeof(uint64_t),
                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-                
+                timestamps[0] &= g_app.benchTimestampMask;  // strip undefined bits (timestampValidBits)
+                timestamps[1] &= g_app.benchTimestampMask;
+
                 if (qr == VK_SUCCESS && timestamps[1] > timestamps[0]) {
                     uint64_t delta = timestamps[1] - timestamps[0];
                     double seconds = static_cast<double>(delta) * static_cast<double>(g_app.benchTimestampPeriod) / 1e9;
                     if (seconds > 0) {
-                        double bw = (static_cast<double>(size) * copies / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                        double bw = (static_cast<double>(size) * copies / Constants::BYTES_PER_GB) / seconds;
                         bandwidths.push_back(bw);
                     } else {
                         failedBatches++;
@@ -3312,8 +3404,8 @@ BenchmarkResult RunLatencyTest(const std::string& name, VkBufferAllocation& src,
         
         if (qr == VK_SUCCESS) {
             for (int i = 0; i < opsThisBatch; ++i) {
-                uint64_t tStart = timestamps[i * 2 + 0];
-                uint64_t tEnd = timestamps[i * 2 + 1];
+                uint64_t tStart = timestamps[i * 2 + 0] & g_app.benchTimestampMask;
+                uint64_t tEnd = timestamps[i * 2 + 1] & g_app.benchTimestampMask;
                 if (tEnd > tStart) {
                     double deltaSec = static_cast<double>(tEnd - tStart) * static_cast<double>(g_app.benchTimestampPeriod) / 1e9;
                     double us = deltaSec * 1'000'000.0;
@@ -3401,11 +3493,15 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
         
         if (qr == VK_SUCCESS) {
             for (int i = 0; i < opsThisBatch; ++i) {
-                uint64_t tStart = timestamps[i * 2 + 0];
-                uint64_t tEnd = timestamps[i * 2 + 1];
-                double deltaSec = static_cast<double>(tEnd - tStart) * static_cast<double>(g_app.benchTimestampPeriod) / 1e9;
-                double us = deltaSec * 1'000'000.0;
-                latencies.push_back(us);
+                uint64_t tStart = timestamps[i * 2 + 0] & g_app.benchTimestampMask;
+                uint64_t tEnd = timestamps[i * 2 + 1] & g_app.benchTimestampMask;
+                // tEnd > tStart guard: equal/reordered timestamps would
+                // underflow the unsigned subtraction into a bogus sample.
+                if (tEnd > tStart) {
+                    double deltaSec = static_cast<double>(tEnd - tStart) * static_cast<double>(g_app.benchTimestampPeriod) / 1e9;
+                    double us = deltaSec * 1'000'000.0;
+                    latencies.push_back(us);
+                }
             }
         }
 
@@ -3438,18 +3534,42 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
     result.testName = GetCurrentTest();
     result.unit = "GB/s";
 
-    auto cpuUpload = CreateBuffer(VkBufferType::Upload, size);
-    auto gpuDefault = CreateBuffer(VkBufferType::DeviceLocal, size);
-    auto gpuSrc = CreateBuffer(VkBufferType::DeviceLocal, size);
-    auto cpuReadback = CreateBuffer(VkBufferType::Readback, size);
+    // The bidirectional test needs 4 buffers of `size` at once (2x host, 2x
+    // device) - the largest simultaneous footprint of any test. On eGPUs over
+    // Thunderbolt/USB4 the OS/driver grants conservative memory budgets, so
+    // the same size that worked for single-direction tests can fail here
+    // despite ample physical VRAM. Rather than skipping the test, retry with
+    // progressively halved buffers; bandwidth math uses the actual size, so
+    // results stay valid.
+    constexpr VkDeviceSize MIN_BIDIR_SIZE = 32ull * 1024 * 1024;
+    const size_t requestedSize = size;
+    VkBufferAllocation cpuUpload = {}, gpuDefault = {}, gpuSrc = {}, cpuReadback = {};
+    for (;;) {
+        cpuUpload = CreateBuffer(VkBufferType::Upload, size);
+        if (cpuUpload) gpuDefault = CreateBuffer(VkBufferType::DeviceLocal, size);
+        if (gpuDefault) gpuSrc = CreateBuffer(VkBufferType::DeviceLocal, size);
+        if (gpuSrc) cpuReadback = CreateBuffer(VkBufferType::Readback, size);
+        if (cpuReadback) break;  // all four succeeded
 
-    if (!cpuUpload || !gpuDefault || !gpuSrc || !cpuReadback) {
-        Log("[ERROR] Failed to create resources for bidirectional test - likely out of VRAM");
         cpuUpload.Destroy(g_app.benchDevice);
         gpuDefault.Destroy(g_app.benchDevice);
         gpuSrc.Destroy(g_app.benchDevice);
         cpuReadback.Destroy(g_app.benchDevice);
-        return result;
+        cpuUpload = {}; gpuDefault = {}; gpuSrc = {}; cpuReadback = {};
+        if (size / 2 < MIN_BIDIR_SIZE) {
+            Log("[ERROR] Failed to create resources for bidirectional test even at " +
+                FormatSize(size) + " - skipping bidirectional measurement");
+            return result;
+        }
+        size /= 2;
+        Log("[WARNING] Bidirectional buffer allocation failed - retrying at " + FormatSize(size));
+    }
+    if (size != requestedSize) {
+        Log("[WARNING] Bidirectional test running with " + FormatSize(size) + " buffers instead of " +
+            FormatSize(requestedSize) + " (driver/OS refused the larger allocation - common for "
+            "Thunderbolt/USB4 eGPUs with constrained memory budgets). Results remain valid.");
+        SetCurrentTest("Bidirectional " + FormatSize(size));
+        result.testName = GetCurrentTest();
     }
 
     std::vector<double> bandwidths;
@@ -3586,7 +3706,7 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
             
             double seconds = std::chrono::duration<double>(endTime - startTime).count();
             if (seconds > 0) {
-                double bw = (static_cast<double>(size) * copies * 2 / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                double bw = (static_cast<double>(size) * copies * 2 / Constants::BYTES_PER_GB) / seconds;
                 bandwidths.push_back(bw);
             }
 
@@ -3623,7 +3743,7 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
 
             double seconds = std::chrono::duration<double>(endTime - startTime).count();
             if (seconds > 0) {
-                double bw = (static_cast<double>(size) * copies * 2 / (1024.0 * 1024.0 * 1024.0)) / seconds;
+                double bw = (static_cast<double>(size) * copies * 2 / Constants::BYTES_PER_GB) / seconds;
                 bandwidths.push_back(bw);
             }
 
@@ -5101,6 +5221,13 @@ BenchmarkResult RunMemoryLatencyTest() {
         Log("[WARNING] No compute-capable queue with timestamps - skipping GPU memory latency test");
         return result;
     }
+    // The compute family may differ from the bench transfer family, so compute
+    // its own timestampValidBits mask (undefined high bits must be stripped).
+    uint64_t computeTsMask = ~0ull;
+    {
+        uint32_t validBits = queueFamilies[computeFamily].timestampValidBits;
+        computeTsMask = (validBits >= 64) ? ~0ull : ((1ull << validBits) - 1);
+    }
     if (g_app.config.debugLogging)
         Log("[DEBUG] Creating separate compute device (family " + std::to_string(computeFamily) + ") for memory latency test");
 
@@ -5501,6 +5628,8 @@ BenchmarkResult RunMemoryLatencyTest() {
             vr = vkGetQueryPoolResults(computeDevice, queryPool, 0, 2,
                 sizeof(timestamps), timestamps, sizeof(uint64_t),
                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            timestamps[0] &= computeTsMask;  // strip undefined bits (timestampValidBits)
+            timestamps[1] &= computeTsMask;
 
             if (g_app.config.debugLogging && m == 0) {
                 Log("[DEBUG] Timestamp query result: " + std::to_string((int)vr) +
@@ -7884,7 +8013,12 @@ void Render() {
         g_app.imageAvailableSemaphores[frameIdx], VK_NULL_HANDLE, &g_app.imageIndex);
     
     if (acquireResult == VK_ERROR_OUT_OF_DATE_KHR) {
-        // Swapchain needs recreation
+        // Swapchain needs recreation - schedule it explicitly rather than
+        // hoping a framebuffer-size callback arrives (DPI/monitor changes can
+        // produce OUT_OF_DATE without one, which previously stalled rendering).
+        g_app.pendingWidth = g_app.windowWidth;
+        g_app.pendingHeight = g_app.windowHeight;
+        g_app.pendingResize = true;
         return;
     }
 
@@ -7960,7 +8094,12 @@ void Render() {
     VkResult presentResult = vkQueuePresentKHR(g_app.graphicsQueue, &presentInfo);
     
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR || presentResult == VK_SUBOPTIMAL_KHR) {
-        // Will handle on next frame
+        // Schedule swapchain recreation on the next loop iteration (the
+        // pendingResize handler rebuilds it) instead of waiting for a
+        // framebuffer-size callback.
+        g_app.pendingWidth = g_app.windowWidth;
+        g_app.pendingHeight = g_app.windowHeight;
+        g_app.pendingResize = true;
     }
 
     g_app.frameIndex = (g_app.frameIndex + 1) % Constants::NUM_FRAMES_IN_FLIGHT;
@@ -8231,6 +8370,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup - request cancellation and wait for benchmark thread
+    bool workerHung = false;
     g_app.cancelRequested = true;
     if (g_app.benchmarkThread.joinable()) {
         bool threadStopped = false;
@@ -8243,6 +8383,7 @@ int main(int argc, char* argv[]) {
             g_app.benchmarkThread.join();
         } else {
             g_app.benchmarkThread.detach();
+            workerHung = true;
         }
     }
 
@@ -8259,7 +8400,15 @@ int main(int argc, char* argv[]) {
             g_app.vramTestThread.join();
         } else {
             g_app.vramTestThread.detach();
+            workerHung = true;
         }
+    }
+
+    if (workerHung) {
+        // A detached worker is still live and using g_app's Vulkan objects.
+        // Tearing down the devices/ImGui underneath it is a use-after-free, so
+        // exit the process immediately instead - the OS reclaims everything.
+        _exit(0);
     }
 
     WaitForGPU();

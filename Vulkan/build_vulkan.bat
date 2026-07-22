@@ -96,7 +96,15 @@ if not exist "%IMGUI_ZIP%" (
     echo   URL: %IMGUI_URL%
     goto :cleanup_fail
 )
-echo [OK] ImGui downloaded
+REM Verify pinned SHA-256 - a moved tag / tampered or truncated download fails
+REM loudly instead of being compiled. If GitHub regenerates its source archives
+REM (rare but has happened), re-pin after verifying the new archive's contents.
+call :verify_sha256 "%IMGUI_ZIP%" b237f93d071bcbb4d948259bfb7ea1464e341f20a84c9e49c7fe260906ad9d09
+if errorlevel 1 (
+    echo [ERROR] ImGui archive SHA-256 mismatch - refusing to build from it
+    goto :cleanup_fail
+)
+echo [OK] ImGui downloaded and verified
 
 REM ---- Extract ImGui ----
 echo [EXTRACT] ImGui
@@ -153,7 +161,12 @@ if not exist "%IMPLOT_ZIP%" (
     echo   URL: %IMPLOT_URL%
     goto :cleanup_fail
 )
-echo [OK] ImPlot downloaded
+call :verify_sha256 "%IMPLOT_ZIP%" 24f772c688f6b8a6e19d7efc10e4923a04a915f13d487b08b83553aa62ae1708
+if errorlevel 1 (
+    echo [ERROR] ImPlot archive SHA-256 mismatch - refusing to build from it
+    goto :cleanup_fail
+)
+echo [OK] ImPlot downloaded and verified
 
 REM ---- Extract ImPlot ----
 echo [EXTRACT] ImPlot
@@ -242,6 +255,16 @@ echo.
 echo Run: %OUTPUT%
 echo.
 goto :eof
+
+REM :verify_sha256 <file> <expected-hash> - exit /b 0 on match, 1 on mismatch
+:verify_sha256
+set "VH_ACTUAL="
+for /f "skip=1 delims=" %%H in ('certutil -hashfile "%~1" SHA256 2^>nul') do if not defined VH_ACTUAL set "VH_ACTUAL=%%H"
+set "VH_ACTUAL=%VH_ACTUAL: =%"
+if /i "%VH_ACTUAL%"=="%~2" exit /b 0
+echo   expected %~2
+echo   got      %VH_ACTUAL%
+exit /b 1
 
 :cleanup_fail
 echo.

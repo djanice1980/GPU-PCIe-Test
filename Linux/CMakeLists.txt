@@ -32,11 +32,16 @@ include(FetchContent)
 
 FetchContent_Declare(imgui
     URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.8-docking.zip
+    # Pinned so a moved tag / tampered download fails loudly. If GitHub ever
+    # regenerates its source archives (rare but has happened), re-pin after
+    # verifying the new archive's contents match the tag.
+    URL_HASH SHA256=b237f93d071bcbb4d948259bfb7ea1464e341f20a84c9e49c7fe260906ad9d09
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 
 FetchContent_Declare(implot
     URL https://github.com/epezent/implot/archive/refs/tags/v0.16.zip
+    URL_HASH SHA256=24f772c688f6b8a6e19d7efc10e4923a04a915f13d487b08b83553aa62ae1708
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 

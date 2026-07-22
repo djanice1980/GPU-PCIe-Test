@@ -2,6 +2,68 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.0.7] - 2026-07-21
+
+### Fixed
+- **Thunderbolt 5 / USB4 80Gbps eGPUs misclassified** - the "closest standard"
+  comparison picked the nearest interface by absolute difference, producing
+  contradictions like "5.35 GB/s (134% of USB4 40Gbps)" - impossible, since a
+  40 Gbps link's PCIe tunnel caps at 32 Gbps (~3.5-4 GB/s real). eGPUs
+  confirmed behind a TB/USB4 tunnel now compare only against tunneling tiers
+  and pick the smallest tier the measurement plausibly fits under; a tier the
+  measurement exceeds by >15% is treated as disproven. Internal GPUs no longer
+  match against TB/USB4 tiers either.
+- **TB/USB4 tier table corrected for PCIe tunnel limits** - Thunderbolt 5 and
+  USB4 80Gbps merged into one 80 Gbps-class entry (6.5 GB/s achievable / 8.0
+  theoretical, reflecting the 64 Gbps PCIe tunnel cap - the old 10/12 figures
+  described the link rate, not tunneled PCIe); Thunderbolt 4 and USB4 40Gbps
+  merged at 3.5/4.0 (32 Gbps tunnel). Bandwidth-heuristic eGPU fallback gained
+  a TB5 tier.
+- **eGPU connection labels now state the measured link class** - when the
+  device tree confirms a TB/USB4 tunnel but measured bandwidth disproves a
+  40 Gbps link, the connection line is annotated "80 Gbps-class (TB5/USB4v2,
+  by measured bandwidth)" (Windows exposes no USB4 link-rate query).
+- **Bidirectional test no longer skipped on eGPU allocation failure** - the
+  test needs 4 buffers at once (largest footprint of any test); on TB/USB4
+  eGPUs the OS grants conservative memory budgets, so 256 MB could fail with
+  E_OUTOFMEMORY despite 16 GB of free VRAM. Allocation now retries with
+  progressively halved buffers (min 32 MB) with a clear warning; bandwidth
+  math uses the actual size, so results remain valid.
+- **HRESULTs logged as nonsense** - errors printed signed decimal with an "0x"
+  prefix ("0x-2147024882"); now proper hex plus a friendly name
+  ("0x8007000E (E_OUTOFMEMORY)"), and buffer-allocation failures name the heap
+  type. D3D12 also logs OS video-memory budgets (local + non-local) at
+  benchmark start and on allocation failure - on eGPUs the budget, not
+  physical VRAM, is usually the real ceiling.
+- **Bandwidth was reported in GiB/s but compared against decimal-GB standards**
+  - all bandwidth math now uses decimal GB (1e9), matching how PCIe/TB/USB4
+  standards are specified. Reported numbers rise ~7.4% versus previous
+  versions; percent-of-standard figures are now accurate.
+- **Command-latency timestamps could underflow into bogus samples** - equal or
+  reordered GPU timestamps produced huge unsigned deltas that poisoned
+  min/avg/max. All timestamp deltas now require tEnd > tStart (D3D12 command
+  latency, D3D12 bandwidth GPU-timestamp path, Vulkan command latency).
+- **Vulkan timestamps used undefined high bits** - per spec only
+  `timestampValidBits` of each query result are meaningful; both Vulkan
+  variants now mask timestamps to the queue family's valid bits before
+  computing deltas (separate mask for the memory-latency compute family).
+- **Hung worker thread at exit caused teardown use-after-free** - if a worker
+  survived the 5s cancellation grace (GPU stall), it was detached and the
+  device/ImGui were destroyed underneath it. The app now exits the process
+  immediately in that case instead of tearing down state a live thread uses.
+- **Swapchain OUT_OF_DATE stalled rendering without a resize event** - DPI or
+  monitor changes can invalidate the swapchain with no WM_SIZE/framebuffer
+  callback; acquire/present now schedule an explicit recreation at the current
+  window size (both Vulkan variants).
+
+### Security
+- **Dependency downloads are now SHA-256 verified** - `build_gui.bat` pins a
+  hash for every ImGui/ImPlot source file (with `curl -f --retry 3` and
+  automatic re-download on mismatch), `Vulkan/build_vulkan.bat` verifies both
+  release archives, and `Linux/CMakeLists.txt` uses `URL_HASH`. A moved tag,
+  tampered mirror, or truncated download now fails the build loudly instead of
+  compiling unexpected code.
+
 ## [3.0.6] - 2026-07-21
 
 ### Fixed
