@@ -2,6 +2,25 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.0.4] - 2026-07-21
+
+### Fixed
+- **GPU-verify silently under-tested VRAM (false PASS)** - The GPU compute-shader
+  verification dispatched one thread group per 256 dwords, producing 131K-524K
+  groups for 128-512MB chunks. Both D3D12 (`D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION`)
+  and Vulkan (`maxComputeWorkGroupCount[0]`, guaranteed minimum) cap a dispatch
+  dimension at 65535. Over-limit groups are dropped, so only the first ~64MB of
+  each chunk was actually compared and the remainder reported error-free. Fixed
+  by splitting each verify into sub-dispatches that stay within the 65535-group
+  limit, using a per-sub-dispatch `baseIndex` (dword offset) push/root constant
+  so every dword is covered. Affected all three variants (D3D12, Vulkan Windows,
+  Vulkan Linux). `vram_verify.comp` recompiled; embedded SPIR-V regenerated.
+- **GPU-verify chunk buffer bound without storage usage flag** - The chunk buffer
+  was bound as a UAV (D3D12) / storage buffer (Vulkan) by the verify shader but
+  created without `ALLOW_UNORDERED_ACCESS` / `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT`,
+  which is undefined behavior. Now requested only when GPU-verify is active, so
+  bandwidth-test buffers keep their original transfer-only usage.
+
 ## [3.0.3] - 2025-02-24
 
 ### Added

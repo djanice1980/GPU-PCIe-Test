@@ -9,6 +9,12 @@ Vulkan/GPU-PCIe-Test-Vulkan.exe
 *.exp
 *.lib
 
+# Downloaded dependencies (fetched on demand by the build scripts)
+imgui/
+Vulkan/imgui/
+Linux/imgui/
+_build_temp/
+
 # Benchmark results (optional - remove this line if you want to track results)
 gpu_benchmark_results.csv
 

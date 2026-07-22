@@ -4074,7 +4074,7 @@ cbuffer Params : register(b0) {
     uint dwordCount;
     uint patternType;
     uint patternIter;
-    uint pad;
+    uint baseIndex;   // dword offset added per sub-dispatch (D3D12 65535-group cap)
 };
 
 uint GenerateExpected(uint i) {
@@ -4090,7 +4090,7 @@ uint GenerateExpected(uint i) {
 
 [numthreads(256, 1, 1)]
 void CSMain(uint3 dtid : SV_DispatchThreadID) {
-    uint i = dtid.x;
+    uint i = dtid.x + baseIndex;
     if (i >= dwordCount) return;
     uint actual = ChainBuf[i];
     uint expected = GenerateExpected(i);
@@ -4258,11 +4258,22 @@ bool VerifyChunkOnGPU(VRAMGpuVerifyState& gpuState,
             static_cast<uint32_t>(dwordCount),
             static_cast<uint32_t>(pattern),
             static_cast<uint32_t>(iteration),
-            0
+            0   // baseIndex - set per sub-dispatch below
         };
-        g_app.benchList->SetComputeRoot32BitConstants(1, 4, params, 0);
-        UINT groups = static_cast<UINT>((dwordCount + 255) / 256);
-        g_app.benchList->Dispatch(groups, 1, 1);
+        // D3D12 caps thread groups per dimension at 65535
+        // (D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION). A 512MB chunk
+        // needs ~524288 groups, so split into sub-dispatches that each stay
+        // within the limit. All sub-dispatches accumulate into the same error
+        // buffer via InterlockedAdd, so no barrier between them is needed.
+        const UINT   THREADS_PER_GROUP = 256;
+        const UINT   MAX_GROUPS_PER_DISPATCH = 65535;
+        const UINT64 totalGroups = (static_cast<UINT64>(dwordCount) + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
+        for (UINT64 groupBase = 0; groupBase < totalGroups; groupBase += MAX_GROUPS_PER_DISPATCH) {
+            UINT groupsThis = static_cast<UINT>(std::min<UINT64>(MAX_GROUPS_PER_DISPATCH, totalGroups - groupBase));
+            params[3] = static_cast<uint32_t>(groupBase * THREADS_PER_GROUP);  // baseIndex (dword offset)
+            g_app.benchList->SetComputeRoot32BitConstants(1, 4, params, 0);
+            g_app.benchList->Dispatch(groupsThis, 1, 1);
+        }
 
         // Resolve error buffer to readback
         g_app.benchList->CopyResource(gpuState.errorRb.Get(), gpuState.errorBuf.Get());
@@ -4593,9 +4604,14 @@ void VRAMTestThreadFunc() {
         Log("=== Chunk " + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + 
             " (" + FormatSize(thisChunkSize) + " at logical offset " + FormatSize(chunkOffset) + ") ===");
         
-        // Allocate fresh buffers for this chunk
+        // Allocate fresh buffers for this chunk. When GPU-verify is active the
+        // chunk buffer is bound as a UAV by the verify shader, so it must be
+        // created with ALLOW_UNORDERED_ACCESS.
         ComPtr<ID3D12Resource> uploadBuffer = CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, thisChunkSize, D3D12_RESOURCE_STATE_GENERIC_READ);
-        ComPtr<ID3D12Resource> gpuBuffer = CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, thisChunkSize, D3D12_RESOURCE_STATE_COMMON);
+        ComPtr<ID3D12Resource> gpuBuffer = useGpuVerify
+            ? CreateBufferWithFlags(D3D12_HEAP_TYPE_DEFAULT, thisChunkSize, D3D12_RESOURCE_STATE_COMMON,
+                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+            : CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, thisChunkSize, D3D12_RESOURCE_STATE_COMMON);
         ComPtr<ID3D12Resource> readbackBuffer = CreateBuffer(D3D12_HEAP_TYPE_READBACK, thisChunkSize, D3D12_RESOURCE_STATE_COPY_DEST);
         
         if (!uploadBuffer || !gpuBuffer || !readbackBuffer) {

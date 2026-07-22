@@ -19,7 +19,7 @@ layout(push_constant) uniform Params {
     uint dwordCount;
     uint patternType;   // matches VRAMTestPattern enum
     uint patternIter;   // iteration index (for marching patterns)
-    uint pad;
+    uint baseIndex;     // dword offset added per sub-dispatch (workgroup-count cap)
 } pc;
 
 uint GenerateExpected(uint i) {
@@ -35,7 +35,7 @@ uint GenerateExpected(uint i) {
 }
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
+    uint i = gl_GlobalInvocationID.x + pc.baseIndex;
     if (i >= pc.dwordCount) return;
     uint actual = chainBuf.data[i];
     uint expected = GenerateExpected(i);
