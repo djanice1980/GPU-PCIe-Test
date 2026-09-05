@@ -1223,7 +1223,10 @@ void FindClosestInterface(double measured, bool tunneledExternal,
         const InterfaceSpeed* best = fit ? fit : largest;
         if (best) {
             outName = best->name;
-            outPercentage = (measured / best->bandwidth) * 100.0;
+            // Percent of the PCIe tunnel cap (the tier's theoretical figure), not
+            // of the soft "achievable" estimate - a healthy 3.9 GB/s TB4 link is
+            // 98% of its 4.0 GB/s tunnel, not "112%" of a 3.5 GB/s guess.
+            outPercentage = (measured / best->theoretical) * 100.0;
             return;
         }
         // No external entries in the table (shouldn't happen) - fall through
@@ -2160,7 +2163,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 3);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 4);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2636,7 +2639,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 3);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 4);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;

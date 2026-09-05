@@ -1184,7 +1184,10 @@ void FindClosestInterface(double measured, bool tunneledExternal,
         const InterfaceSpeed* best = fit ? fit : largest;
         if (best) {
             outName = best->name;
-            outPercentage = (measured / best->bandwidth) * 100.0;
+            // Percent of the PCIe tunnel cap (the tier's theoretical figure), not
+            // of the soft "achievable" estimate - a healthy 3.9 GB/s TB4 link is
+            // 98% of its 4.0 GB/s tunnel, not "112%" of a 3.5 GB/s guess.
+            outPercentage = (measured / best->theoretical) * 100.0;
             return;
         }
         // No external entries in the table (shouldn't happen) - fall through

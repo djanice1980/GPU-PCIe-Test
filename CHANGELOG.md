@@ -2,6 +2,16 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.4.4] - 2026-09-05
+
+### Changed
+- **eGPU percentages are now relative to the PCIe tunnel cap.** Thunderbolt /
+  USB4 tiers were compared against their soft "achievable" estimate, so a
+  healthy link read "112% of Thunderbolt 4 / USB4 40Gbps". The percentage now
+  uses the tier's theoretical tunnel bandwidth (4.0 GB/s for 40 Gbps links,
+  8.0 GB/s for 80 Gbps), so the same link reads about 98%. Tier selection is
+  unchanged.
+
 ## [3.4.3] - 2026-09-05
 
 ### Fixed
