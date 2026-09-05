@@ -2,7 +2,7 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
-## [3.4.2] - unreleased
+## [3.4.2] - 2026-09-05
 
 ### Fixed
 - **Linux reported "0 sticks, single channel" when not run as root.** Unprivileged
