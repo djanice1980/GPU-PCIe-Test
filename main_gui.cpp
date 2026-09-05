@@ -5157,6 +5157,36 @@ void VRAMTestThreadFunc() {
     g_app.showVRAMTestWindow = true;
 }
 
+// The PCIe link speed/width are read at startup, when link power management
+// has usually dropped an idle GPU to Gen1 (an idle eGPU reports "PCIe 1.0 x4",
+// i.e. a 0.8 GB/s "theoretical max" under a 3.9 GB/s measurement). Re-read
+// right after the first bandwidth test, while the link is still trained up,
+// and keep the higher state for the summary. Called on the benchmark thread.
+void RefreshPCIeLinkUnderLoad() {
+    int idx = g_app.config.selectedGPU;
+    if (idx < 0 || idx >= static_cast<int>(g_app.gpuList.size())) return;
+    GPUInfo& gpu = g_app.gpuList[idx];
+    if (gpu.isIntegrated) return;
+
+    GPUInfo probe = gpu;  // detection rewrites the pcie* fields; probe a copy
+    if (!DetectPCIeLink(gpu.vendorId, gpu.deviceId, probe) || !probe.pcieInfoValid) return;
+
+    bool faster = probe.pcieGenCurrent > gpu.pcieGenCurrent ||
+                  (probe.pcieGenCurrent == gpu.pcieGenCurrent && probe.pcieLanesCurrent > gpu.pcieLanesCurrent);
+    if (!gpu.pcieInfoValid || faster) {
+        Log("[INFO] PCIe link under load: " + FormatPCIeConfig(probe.pcieGenCurrent, probe.pcieLanesCurrent) +
+            (gpu.pcieInfoValid ? " (startup read was " + FormatPCIeConfig(gpu.pcieGenCurrent, gpu.pcieLanesCurrent) +
+                                 " - idle link power management)" : ""));
+        gpu.pcieGenCurrent   = probe.pcieGenCurrent;
+        gpu.pcieLanesCurrent = probe.pcieLanesCurrent;
+        if (probe.pcieGenMax > 0)   gpu.pcieGenMax   = probe.pcieGenMax;
+        if (probe.pcieLanesMax > 0) gpu.pcieLanesMax = probe.pcieLanesMax;
+        gpu.pcieInfoValid = true;
+    } else {
+        Log("[INFO] PCIe link under load: " + FormatPCIeConfig(probe.pcieGenCurrent, probe.pcieLanesCurrent) + " (unchanged)");
+    }
+}
+
 void BenchmarkThreadFunc() {
     g_app.benchmarkThreadRunning = true;
     g_app.benchmarkStartTime = std::chrono::steady_clock::now();
@@ -5294,6 +5324,9 @@ void BenchmarkThreadFunc() {
                 g_app.config.copiesPerBatch,
                 g_app.config.bandwidthBatches);
             
+            // Link is still trained up right after the copies: re-read it now.
+            if (run == 1) RefreshPCIeLinkUnderLoad();
+
             if (!resDownload.samples.empty()) {
                 allResults.push_back(resDownload);
                 avgDownload += resDownload.avgValue;

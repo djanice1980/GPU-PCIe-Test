@@ -2,6 +2,16 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.4.3] - 2026-09-05
+
+### Fixed
+- **PCIe link reported at its idle state.** The link speed/width were read once
+  at startup, when link power management has already dropped an idle GPU to
+  Gen1 - an eGPU showed "Current Link: PCIe 1.0 x4, Theoretical Max 0.81 GB/s"
+  next to a 3.9 GB/s measurement. The link is now re-read right after the
+  first bandwidth test while it is trained up; the summary uses that state and
+  the log records the idle value it replaced.
+
 ## [3.4.2] - 2026-09-05
 
 ### Fixed
