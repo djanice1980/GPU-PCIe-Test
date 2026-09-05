@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v3.0 - GUI Edition
+// GPU-PCIe-Test v3.4 - GUI Edition
 // Dear ImGui + D3D12 Frontend
 // ============================================================================
 // Graphical frontend for the GPU/PCIe benchmark tool.
@@ -1028,7 +1028,8 @@ void EstimateRatedLatency(SystemMemoryInfo& mem) {
             mem.ratedLatencyNs = MEMORY_LATENCY_TABLE[bestIdx].latencyNs;
         } else {
             // Interpolate: CL / (speed_MT / 2000) * 1000
-            mem.ratedLatencyNs = static_cast<double>(mem.estimatedCL) / (speed / 2000.0) * 1000.0;
+            // latency_ns = CL * clock_period_ns, clock_period_ns = 2000 / MT/s
+            mem.ratedLatencyNs = static_cast<double>(mem.estimatedCL) * 2000.0 / static_cast<double>(speed);
         }
         mem.latencyEstimated = true;
     }
@@ -2440,47 +2441,60 @@ FenceWaitResult WaitForBenchFenceEx() {
     if (g_app.cancelRequested || g_app.vramTestCancelRequested) {
         return FenceWaitResult::Cancelled;
     }
-    
-    // Check global timeout (only if not in VRAM test mode, which has its own timing)
-    if (!g_app.vramTestRunning && IsGlobalTimeoutExceeded()) {
-        Log("[ERROR] Global benchmark timeout exceeded (5 minutes)");
-        return FenceWaitResult::Timeout;
-    }
-    
+
     g_app.benchQueue->Signal(g_app.benchFence.Get(), g_app.benchFenceValue);
 
     if (g_app.benchFence->GetCompletedValue() < g_app.benchFenceValue) {
         HRESULT hr = g_app.benchFence->SetEventOnCompletion(g_app.benchFenceValue, g_app.benchFenceEvent);
         if (FAILED(hr)) {
-            Log("[ERROR] SetEventOnCompletion failed: " + std::to_string(hr));
+            Log("[ERROR] SetEventOnCompletion failed: " + HResultToString(hr));
+            g_app.benchmarkAborted = true;
             return FenceWaitResult::Error;
         }
 
-        DWORD waitResult = WaitForSingleObject(g_app.benchFenceEvent, Constants::FENCE_WAIT_TIMEOUT_MS);
-        if (waitResult == WAIT_TIMEOUT) {
+        // WAIT_TIMEOUT is retried up to MAX_FENCE_RETRIES times on the SAME
+        // fence value (a slow-but-alive GPU gets ~24 s); only then is it a hang.
+        // Every non-Success return therefore means the GPU never reached this
+        // fence value, and benchmarkAborted is set so callers stop Reset()ing
+        // the allocator / command list that is still executing. (Previously a
+        // single timeout returned Timeout with the work in flight and callers
+        // treated it as a completed batch: bogus 8-second "sample", then an
+        // allocator Reset underneath a live command list.)
+        for (;;) {
+            DWORD waitResult = WaitForSingleObject(g_app.benchFenceEvent, Constants::FENCE_WAIT_TIMEOUT_MS);
+            if (waitResult == WAIT_OBJECT_0) break;
+            if (waitResult != WAIT_TIMEOUT) {
+                Log("[ERROR] WaitForSingleObject failed: " + std::to_string(GetLastError()));
+                g_app.benchmarkAborted = true;
+                return FenceWaitResult::Error;
+            }
             g_app.fenceTimeoutCount++;
-            Log("[WARNING] Benchmark fence wait timed out after " + 
-                std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" + 
+            Log("[WARNING] Benchmark fence wait timed out after " +
+                std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" +
                 std::to_string(g_app.fenceTimeoutCount.load()) + ")");
-            
+            if (g_app.cancelRequested || g_app.vramTestCancelRequested) {
+                return FenceWaitResult::Cancelled;
+            }
             if (g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) {
                 Log("[ERROR] Max fence timeouts exceeded - possible GPU hang. Aborting benchmark.");
                 g_app.benchmarkAborted = true;
                 return FenceWaitResult::Timeout;
             }
-            
-            // Try to continue but warn
-            return FenceWaitResult::Timeout;
-        } else if (waitResult != WAIT_OBJECT_0) {
-            Log("[ERROR] WaitForSingleObject failed: " + std::to_string(GetLastError()));
-            return FenceWaitResult::Error;
         }
-        
+
         // Success - reset timeout counter
         g_app.fenceTimeoutCount = 0;
     }
 
     g_app.benchFenceValue++;
+
+    // Global timeout is evaluated after the wait so the submission it covered
+    // has finished and nothing is left executing on the queue.
+    if (!g_app.vramTestRunning && IsGlobalTimeoutExceeded()) {
+        Log("[ERROR] Global benchmark timeout exceeded (5 minutes)");
+        g_app.benchmarkAborted = true;
+        return FenceWaitResult::Timeout;
+    }
     return FenceWaitResult::Success;
 }
 
@@ -2605,7 +2619,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
                 if (fenceResult == FenceWaitResult::Cancelled) {
                     break;
                 }
-                if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
+                if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) {
                     Log("[ERROR] Critical fence error - aborting bandwidth test");
                     break;
                 }
@@ -2711,7 +2725,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, ComPtr<ID3D12Resource>
             if (fenceResult == FenceWaitResult::Cancelled) {
                 break;
             }
-            if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
+            if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) {
                 Log("[ERROR] Critical fence error - aborting bandwidth test");
                 break;
             }
@@ -2839,7 +2853,7 @@ BenchmarkResult RunLatencyTest(const std::string& name, ComPtr<ID3D12Resource> s
         g_app.benchQueue->ExecuteCommandLists(1, lists);
         
         FenceWaitResult fenceResult = WaitForBenchFenceEx();
-        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
+        if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) {
             break;
         }
 
@@ -2944,7 +2958,7 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
         g_app.benchQueue->ExecuteCommandLists(1, lists);
         
         FenceWaitResult fenceResult = WaitForBenchFenceEx();
-        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
+        if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) {
             break;
         }
 
@@ -3495,29 +3509,39 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
             g_app.benchQueue->Signal(g_app.benchFence.Get(), g_app.benchFenceValue);
             g_app.benchQueue2->Signal(g_app.benchFence2.Get(), g_app.benchFenceValue2);
             
-            // Wait for both to complete
+            // Wait for both to complete. WAIT_TIMEOUT is retried (bounded) on the
+            // same fence values before it is declared a hang. If the fences never
+            // signal, both command lists are still executing and their allocators
+            // must not be Reset for the next batch: abort instead.
             g_app.benchFence->SetEventOnCompletion(g_app.benchFenceValue, g_app.benchFenceEvent);
             g_app.benchFence2->SetEventOnCompletion(g_app.benchFenceValue2, g_app.benchFenceEvent2);
             HANDLE events[2] = { g_app.benchFenceEvent, g_app.benchFenceEvent2 };
             DWORD waitResult = WaitForMultipleObjects(2, events, TRUE, Constants::FENCE_WAIT_TIMEOUT_MS);
-            
+            while (waitResult == WAIT_TIMEOUT) {
+                g_app.fenceTimeoutCount++;
+                Log("[WARNING] Bidirectional fence wait timed out after " +
+                    std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" +
+                    std::to_string(g_app.fenceTimeoutCount.load()) + ")");
+                if (ShouldAbortBenchmark() || g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) break;
+                waitResult = WaitForMultipleObjects(2, events, TRUE, Constants::FENCE_WAIT_TIMEOUT_MS);
+            }
             auto endTime = std::chrono::high_resolution_clock::now();
-            
+
             g_app.benchFenceValue++;
             g_app.benchFenceValue2++;
-            
-            if (waitResult == WAIT_TIMEOUT) {
-                g_app.fenceTimeoutCount++;
-                if (g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) {
-                    g_app.benchmarkAborted = true;
-                    break;
+
+            if (waitResult != WAIT_OBJECT_0) {
+                if (waitResult == WAIT_TIMEOUT) {
+                    Log("[ERROR] Max fence timeouts exceeded in bidirectional test - possible GPU hang. Aborting benchmark.");
+                } else {
+                    Log("[ERROR] WaitForMultipleObjects failed in bidirectional test: " + std::to_string(GetLastError()));
                 }
-                continue;
-            } else if (waitResult != WAIT_OBJECT_0) {
+                g_app.benchmarkAborted = true;
                 break;
             }
-            
+
             g_app.fenceTimeoutCount = 0;
+
             
             double seconds = std::chrono::duration<double>(endTime - startTime).count();
             if (seconds > 0) {
@@ -3568,7 +3592,7 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
             
             auto endTime = std::chrono::high_resolution_clock::now();
             
-            if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) {
+            if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) {
                 break;
             }
 
@@ -5123,7 +5147,6 @@ void BenchmarkThreadFunc() {
     }
 
     std::vector<BenchmarkResult> allResults;
-    int successfulRuns = 0;
 
     // Calculate total tests
     int testsPerRun = 2;  // Upload + Download
@@ -5240,7 +5263,7 @@ void BenchmarkThreadFunc() {
         if (g_app.config.runBidirectional) {
             auto resBidir = RunBidirectionalTest(g_app.config.bandwidthSize, g_app.config.copiesPerBatch, g_app.config.bandwidthBatches);
             if (!resBidir.samples.empty()) {
-                resBidir.testName = "Bidirectional " + FormatSize(g_app.config.bandwidthSize) + runSuffix;
+                resBidir.testName += runSuffix;  // RunBidirectionalTest already named it after the ACTUAL buffer size
                 allResults.push_back(resBidir);
                 Log("  Bidirectional: " + std::to_string(resBidir.avgValue).substr(0, 5) + " GB/s");
             }
@@ -5315,7 +5338,6 @@ void BenchmarkThreadFunc() {
             if (ShouldAbortBenchmark()) break;
         }
 
-        successfulRuns++;
     }
 
     CleanupBenchmarkDevice();
@@ -5537,8 +5559,6 @@ void BenchmarkThreadFunc() {
             }
         }
         
-        // Show summary window
-        g_app.showSummaryWindow = true;
 
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
         
@@ -5553,6 +5573,9 @@ void BenchmarkThreadFunc() {
         // Append new results to existing results (accumulate across benchmark runs)
         g_app.results.insert(g_app.results.end(), newResults.begin(), newResults.end());
         
+        // Only now (results inserted under the lock) let the UI open the
+        // summary window that walks g_app.results.
+        g_app.showSummaryWindow = true;
         g_app.state = AppState::Completed;
     }
     
@@ -5697,7 +5720,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v3.0 GUI");
+    ImGui::Text("GPU-PCIe-Test v3.4 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -6419,6 +6442,9 @@ void RenderGUI() {
         ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
         
         ImGui::Begin("Benchmark Summary", &g_app.showSummaryWindow);
+        // Worker threads append to g_app.results; hold the lock for the whole
+        // window so the loops below never iterate a vector mid-reallocation.
+        std::lock_guard<std::mutex> resultsLock(g_app.resultsMutex);
         
         const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
         
@@ -6535,7 +6561,6 @@ void RenderGUI() {
             double measuredLatencyMin = 0;
             double measuredLatencyMax = 0;
             {
-                std::lock_guard<std::mutex> lock(g_app.resultsMutex);
                 for (const auto& r : g_app.results) {
                     if (r.testName.find("GPU Memory Latency") != std::string::npos) {
                         hasMemLatency = true;
@@ -7317,7 +7342,7 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v3.0 GUI Edition");
+        ImGui::Text("GPU-PCIe-Test v3.4 GUI Edition");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
@@ -7553,7 +7578,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.0 GUI",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.4 GUI",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,

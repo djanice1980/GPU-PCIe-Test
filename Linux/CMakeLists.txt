@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(GPU-PCIe-Test-Vulkan-Linux VERSION 3.0.2 LANGUAGES CXX)
+project(GPU-PCIe-Test-Vulkan-Linux VERSION 3.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -105,3 +105,9 @@ endif()
 # ==============================================================================
 
 install(TARGETS gpu-pcie-test-vulkan RUNTIME DESTINATION bin)
+
+# Desktop integration (used by the AppImage and the Arch/CachyOS package)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/gpu-pcie-test.desktop
+        DESTINATION share/applications)
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/../packaging/gpu-pcie-test.png
+        DESTINATION share/icons/hicolor/256x256/apps)

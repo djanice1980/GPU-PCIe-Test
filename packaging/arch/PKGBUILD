@@ -1,0 +1,34 @@
+# Maintainer: David Janice <djanice1980@gmail.com>
+# Native package for Arch Linux / CachyOS.
+#
+#   cd packaging/arch && makepkg -si
+#
+# Builds the Vulkan+GLFW GUI from the tagged release tarball. ImGui and ImPlot
+# are fetched by CMake at build time (pinned + SHA-256 verified in
+# Linux/CMakeLists.txt), so the build needs network access.
+
+pkgname=gpu-pcie-test
+pkgver=3.4.0
+pkgrel=1
+pkgdesc="GPU/PCIe bandwidth, latency and VRAM integrity benchmark (Vulkan GUI)"
+arch=('x86_64')
+url="https://github.com/djanice1980/GPU-PCIe-Test"
+license=('MIT')
+depends=('glfw' 'vulkan-icd-loader' 'hicolor-icon-theme')
+makedepends=('cmake' 'vulkan-headers')
+optdepends=('dmidecode: detailed system RAM info (run as root)'
+            'vulkan-validation-layers: for -DENABLE_VULKAN_VALIDATION=ON builds')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cmake -S "GPU-PCIe-Test-$pkgver/Linux" -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/usr
+    cmake --build build --parallel
+}
+
+package() {
+    DESTDIR="$pkgdir" cmake --install build
+    install -Dm644 "GPU-PCIe-Test-$pkgver/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

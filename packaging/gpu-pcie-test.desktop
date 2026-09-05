@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=GPU-PCIe-Test
+GenericName=GPU Bandwidth Benchmark
+Comment=GPU/PCIe bandwidth, latency and VRAM integrity benchmark (Vulkan)
+Exec=gpu-pcie-test-vulkan
+Icon=gpu-pcie-test
+Terminal=false
+Categories=System;Utility;
+Keywords=GPU;PCIe;Vulkan;benchmark;VRAM;bandwidth;eGPU;Thunderbolt;

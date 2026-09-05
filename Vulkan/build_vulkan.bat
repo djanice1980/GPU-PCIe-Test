@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================================
-REM GPU-PCIe-Test v3.0 (Vulkan) - Build Script
+REM GPU-PCIe-Test v3.4 (Vulkan) - Build Script
 REM Requires: Visual Studio 2019+ (MSVC), Vulkan SDK
 REM Automatically downloads ImGui + ImPlot if not present
 REM ============================================================================

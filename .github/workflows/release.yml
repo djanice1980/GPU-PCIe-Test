@@ -1,0 +1,117 @@
+name: Release builds
+
+# Builds the Windows D3D12 and Vulkan executables and the Linux AppImage and
+# attaches them to the GitHub release for the pushed tag. The Arch/CachyOS
+# package is built natively with packaging/arch/PKGBUILD and uploaded
+# separately.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows (D3D12 + Vulkan)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          arch: x64
+
+      - name: Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: latest
+          cache: true
+
+      - name: Build D3D12 GUI
+        shell: cmd
+        run: build_gui.bat < nul
+
+      - name: Build Vulkan GUI
+        shell: cmd
+        working-directory: Vulkan
+        run: build_vulkan.bat < nul
+
+      - name: Collect
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item GPU-PCIe-Test_GUI.exe dist/
+          Copy-Item Vulkan/GPU-PCIe-Test-Vulkan.exe dist/
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exes
+          path: dist/*.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: dist/*.exe
+
+  appimage:
+    name: Linux AppImage
+    runs-on: ubuntu-latest
+    # Build inside an older userland so the AppImage's glibc floor stays low.
+    container: ubuntu:22.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      APPIMAGE_EXTRACT_AND_RUN: 1
+    steps:
+      - name: Toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake git ca-certificates curl file \
+            libglfw3-dev libvulkan-dev libgl-dev libx11-dev libxkbcommon-dev \
+            libwayland-dev libfuse2 desktop-file-utils
+
+      - uses: actions/checkout@v4
+
+      - name: Configure and build
+        run: |
+          cmake -S Linux -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+          cmake --build build --parallel "$(nproc)"
+
+      - name: Stage AppDir
+        run: |
+          DESTDIR="$PWD/AppDir" cmake --install build
+          ls -R AppDir | head -50
+
+      - name: Build AppImage
+        run: |
+          curl -fsSL --retry 3 -o linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$VERSION" = "$GITHUB_REF_NAME" ] && VERSION="dev"
+          # The Vulkan loader must come from the host so it finds the host's ICDs.
+          OUTPUT="GPU-PCIe-Test-${VERSION}-x86_64.AppImage" \
+          ./linuxdeploy --appdir AppDir \
+            --desktop-file AppDir/usr/share/applications/gpu-pcie-test.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/gpu-pcie-test.png \
+            --exclude-library 'libvulkan.so*' \
+            --output appimage
+          ls -la *.AppImage
+          echo "APPIMAGE=$(ls *.AppImage)" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: ${{ env.APPIMAGE }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          files: ${{ env.APPIMAGE }}

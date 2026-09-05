@@ -2,6 +2,52 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.4.0] - 2026-09-04
+
+### Fixed
+- **Fence timeout was treated as a successful batch** (all variants) - a single
+  8 s fence timeout returned from `WaitForBenchFenceEx` while the GPU work was
+  still in flight. The CPU-timed bandwidth loops recorded the timeout as a real
+  sample, and the next batch reset the command buffer / allocator underneath a
+  live submission and re-submitted a fence still in use. Timeouts are now
+  retried on the *same* submission (up to `MAX_FENCE_RETRIES`, ~24 s of grace
+  for a slow GPU) and any non-Success result aborts the benchmark. The
+  dual-queue bidirectional loop no longer resets fences that never signaled,
+  and the latency tests no longer block indefinitely in
+  `vkGetQueryPoolResults` after a timeout.
+- **Rated RAM latency was 1000x too high** whenever the memory speed was not an
+  exact table entry (DDR5-6200 showed ~12900 ns instead of 12.9 ns).
+- **Bidirectional result was mislabeled** after the v3.0.7 halved-buffer
+  fallback - the results table showed the requested size, not the size that
+  was actually measured.
+- **Benchmark summary window could walk `results` while the worker inserted
+  into it** - results are now published before the window is told to open,
+  and the window holds the results mutex for its whole body.
+- **Vulkan memory-latency test crashed instead of skipping on allocation
+  failure** - buffer, memory-type, allocation, bind and map results are now
+  checked (matters on eGPUs with tight OS memory budgets).
+- **Render-finished semaphores are now per swapchain image** (Vulkan
+  variants) - a per-frame semaphore could be re-signaled while an earlier
+  present still referenced it (VUID-vkQueueSubmit-pSignalSemaphores-00067).
+- **Linux validation builds did nothing** - `-DENABLE_VULKAN_VALIDATION=ON`
+  defined the macro but the Linux source never enabled
+  `VK_LAYER_KHRONOS_validation`; it now mirrors the Windows Vulkan variant.
+- **Linux build broke with GCC 16** - a dead `successfulRuns` counter tripped
+  `-Werror=unused-but-set-variable`.
+- **`build_gui.bat` was stored LF** despite the v3.0.7 CRLF fix (the commit
+  was normalized by `core.autocrlf=input`). `.gitattributes` now pins `*.bat`
+  to CRLF on checkout so it cannot regress.
+
+### Added
+- GitHub Actions release workflow: the Windows D3D12 and Vulkan executables
+  and a Linux AppImage are built and attached to every `v*` tag.
+- `packaging/arch/PKGBUILD` for Arch Linux / CachyOS (`makepkg -si`), plus a
+  desktop entry and icon installed by CMake (used by the AppImage too).
+
+### Changed
+- Version scheme unified: tag, changelog and in-app version now all read
+  3.4.0 (earlier commits used 3.0.x while tags were 3.x.0).
+
 ## [3.0.7] - 2026-07-21
 
 ### Fixed

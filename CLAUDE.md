@@ -95,6 +95,20 @@ GUI built with Dear ImGui (docking branch) + ImPlot.
 - Hardware detection abstracted per-platform (SetupAPI/WMI vs sysfs/dmidecode)
 - Benchmark methodology is identical across all variants for comparable results
 
+## Releasing
+- Version strings live in: the three sources (`"GPU-PCIe-Test v3.4"` window/about
+  strings, `VK_MAKE_VERSION(3, 4, 0)` in the Vulkan variants), `Linux/CMakeLists.txt`
+  `project(... VERSION)`, `packaging/arch/PKGBUILD` `pkgver`, the two `.bat` headers,
+  `Linux/build_linux.sh`, and `CHANGELOG.md`. Bump all of them together.
+- Tag `vX.Y.Z` and push it. `.github/workflows/release.yml` builds the Windows D3D12 +
+  Vulkan executables (MSVC + Vulkan SDK on windows-latest) and the Linux AppImage
+  (ubuntu:22.04 container + linuxdeploy) and attaches them to the release for that tag.
+- Arch/CachyOS package: `cd packaging/arch && makepkg -s` on the Arch host, then
+  `gh release upload vX.Y.Z gpu-pcie-test-X.Y.Z-1-x86_64.pkg.tar.zst`. The PKGBUILD
+  builds from the tag tarball, so tag first, then pin `sha256sums`.
+- `*.bat` files are CRLF-on-checkout via `.gitattributes`; never commit them with
+  `core.autocrlf` tricks - the attribute handles it.
+
 ## Directories
 - `Vulkan/` - Vulkan GUI variant (Windows)
 - `Linux/` - Vulkan GUI variant (Linux, GLFW)

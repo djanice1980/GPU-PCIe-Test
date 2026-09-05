@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v3.0 - GUI Edition (Vulkan)
+// GPU-PCIe-Test v3.4 - GUI Edition (Vulkan)
 // Dear ImGui + Vulkan Frontend
 // ============================================================================
 // Graphical frontend for the GPU/PCIe benchmark tool.
@@ -590,7 +590,7 @@ struct AppContext {
     VkCommandPool              commandPool = VK_NULL_HANDLE;
     VkCommandBuffer            commandBuffers[Constants::NUM_FRAMES_IN_FLIGHT] = {};
     VkSemaphore                imageAvailableSemaphores[Constants::NUM_FRAMES_IN_FLIGHT] = {};
-    VkSemaphore                renderFinishedSemaphores[Constants::NUM_FRAMES_IN_FLIGHT] = {};
+    std::vector<VkSemaphore>   renderFinishedSemaphores;  // one per swapchain image, indexed by imageIndex
     VkFence                    inFlightFences[Constants::NUM_FRAMES_IN_FLIGHT] = {};
     VkDescriptorPool           imguiDescriptorPool = VK_NULL_HANDLE;
     uint32_t                   frameIndex = 0;
@@ -1065,7 +1065,8 @@ void EstimateRatedLatency(SystemMemoryInfo& mem) {
         if (bestDiff == 0) {
             mem.ratedLatencyNs = MEMORY_LATENCY_TABLE[bestIdx].latencyNs;
         } else {
-            mem.ratedLatencyNs = static_cast<double>(mem.estimatedCL) / (speed / 2000.0) * 1000.0;
+            // latency_ns = CL * clock_period_ns, clock_period_ns = 2000 / MT/s
+            mem.ratedLatencyNs = static_cast<double>(mem.estimatedCL) * 2000.0 / static_cast<double>(speed);
         }
         mem.latencyEstimated = true;
     }
@@ -2070,7 +2071,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 0, 0);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 0);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2298,6 +2299,30 @@ uint32_t FindQueueFamily(VkPhysicalDevice physDevice, VkQueueFlags flags, VkSurf
 }
 
 // Create Vulkan swapchain
+// renderFinished semaphores are per swapchain IMAGE, not per frame-in-flight.
+// vkQueuePresentKHR waits on the semaphore and nothing tells the CPU when that
+// wait has been consumed, so a per-frame semaphore can be re-signaled while an
+// earlier present still references it (VUID-vkQueueSubmit-pSignalSemaphores-
+// 00067 under validation). Indexing by the acquired image guarantees the
+// previous signal on that semaphore was consumed by the present of that same
+// image, which must finish before the image can be acquired again.
+bool CreateRenderFinishedSemaphores() {
+    VkSemaphoreCreateInfo semInfo = {};
+    semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    g_app.renderFinishedSemaphores.assign(g_app.swapChainImages.size(), VK_NULL_HANDLE);
+    for (auto& s : g_app.renderFinishedSemaphores) {
+        VK_CHECK_RETURN(vkCreateSemaphore(g_app.device, &semInfo, nullptr, &s), false);
+    }
+    return true;
+}
+
+void DestroyRenderFinishedSemaphores() {
+    for (auto s : g_app.renderFinishedSemaphores) {
+        if (s != VK_NULL_HANDLE) vkDestroySemaphore(g_app.device, s, nullptr);
+    }
+    g_app.renderFinishedSemaphores.clear();
+}
+
 bool CreateSwapChain() {
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_app.renderPhysicalDevice, g_app.surface, &capabilities);
@@ -2375,6 +2400,8 @@ bool CreateSwapChain() {
         VK_CHECK_RETURN(vkCreateImageView(g_app.device, &viewInfo, nullptr, &g_app.swapChainImageViews[i]), false);
     }
 
+    if (!CreateRenderFinishedSemaphores()) return false;
+
     return true;
 }
 
@@ -2440,6 +2467,7 @@ bool CreateFramebuffers() {
 // Cleanup swapchain resources (for resize)
 void CleanupSwapChain() {
     vkDeviceWaitIdle(g_app.device);
+    DestroyRenderFinishedSemaphores();
     
     for (auto fb : g_app.swapChainFramebuffers) {
         if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(g_app.device, fb, nullptr);
@@ -2519,7 +2547,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 0, 0);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 0);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2639,7 +2667,6 @@ bool InitVulkan() {
 
     for (int i = 0; i < Constants::NUM_FRAMES_IN_FLIGHT; i++) {
         VK_CHECK_RETURN(vkCreateSemaphore(g_app.device, &semInfo, nullptr, &g_app.imageAvailableSemaphores[i]), false);
-        VK_CHECK_RETURN(vkCreateSemaphore(g_app.device, &semInfo, nullptr, &g_app.renderFinishedSemaphores[i]), false);
         VK_CHECK_RETURN(vkCreateFence(g_app.device, &fenceInfo, nullptr, &g_app.inFlightFences[i]), false);
     }
 
@@ -2971,40 +2998,52 @@ FenceWaitResult WaitForBenchFenceEx() {
     if (g_app.cancelRequested || g_app.vramTestCancelRequested) {
         return FenceWaitResult::Cancelled;
     }
-    
-    // Check global timeout
-    if (!g_app.vramTestRunning && IsGlobalTimeoutExceeded()) {
-        Log("[ERROR] Global benchmark timeout exceeded (5 minutes)");
-        return FenceWaitResult::Timeout;
-    }
-    
-    // Wait for fence
-    uint64_t timeout = static_cast<uint64_t>(Constants::FENCE_WAIT_TIMEOUT_MS) * 1000000ULL; // ms -> ns
-    VkResult result = vkWaitForFences(g_app.benchDevice, 1, &g_app.benchFence, VK_TRUE, timeout);
-    
-    if (result == VK_TIMEOUT) {
+
+    // Wait for the fence. VK_TIMEOUT is retried up to MAX_FENCE_RETRIES times on
+    // the SAME submission (a slow-but-alive GPU gets ~24 s); only then is it a
+    // hang. Every non-Success return therefore means the fence was never seen
+    // signaled, and benchmarkAborted is set so callers stop touching the
+    // still-pending command buffer and fence. (Previously a single timeout
+    // returned Timeout with the work still in flight, and callers treated it as
+    // a completed batch: bogus 8-second "sample", then vkResetCommandBuffer on a
+    // pending buffer and vkQueueSubmit with a fence already in use.)
+    const uint64_t timeout = static_cast<uint64_t>(Constants::FENCE_WAIT_TIMEOUT_MS) * 1000000ULL; // ms -> ns
+    for (;;) {
+        VkResult result = vkWaitForFences(g_app.benchDevice, 1, &g_app.benchFence, VK_TRUE, timeout);
+        if (result == VK_SUCCESS) break;
+        if (result != VK_TIMEOUT) {
+            Log("[ERROR] vkWaitForFences failed: " + std::to_string((int)result));
+            g_app.benchmarkAborted = true;
+            return FenceWaitResult::Error;
+        }
         g_app.fenceTimeoutCount++;
-        Log("[WARNING] Benchmark fence wait timed out after " + 
-            std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" + 
+        Log("[WARNING] Benchmark fence wait timed out after " +
+            std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" +
             std::to_string(g_app.fenceTimeoutCount.load()) + ")");
-        
+        if (g_app.cancelRequested || g_app.vramTestCancelRequested) {
+            return FenceWaitResult::Cancelled;
+        }
         if (g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) {
             Log("[ERROR] Max fence timeouts exceeded - possible GPU hang. Aborting benchmark.");
             g_app.benchmarkAborted = true;
             return FenceWaitResult::Timeout;
         }
-        return FenceWaitResult::Timeout;
-    } else if (result != VK_SUCCESS) {
-        Log("[ERROR] vkWaitForFences failed: " + std::to_string((int)result));
-        return FenceWaitResult::Error;
     }
-    
+
     // Reset fence for next use
     vkResetFences(g_app.benchDevice, 1, &g_app.benchFence);
-    
+
     // Success - reset timeout counter
     g_app.fenceTimeoutCount = 0;
     g_app.benchFenceValue++;
+
+    // Global timeout is evaluated after the wait so the submission it covered
+    // has finished and nothing is left pending on the queue.
+    if (!g_app.vramTestRunning && IsGlobalTimeoutExceeded()) {
+        Log("[ERROR] Global benchmark timeout exceeded (5 minutes)");
+        g_app.benchmarkAborted = true;
+        return FenceWaitResult::Timeout;
+    }
     return FenceWaitResult::Success;
 }
 
@@ -3146,7 +3185,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, VkBufferAllocation& sr
                 auto endTime = std::chrono::high_resolution_clock::now();
                 
                 if (fenceResult == FenceWaitResult::Cancelled) break;
-                if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
+                if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) {
                     Log("[ERROR] Critical fence error - aborting bandwidth test");
                     break;
                 }
@@ -3218,7 +3257,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, VkBufferAllocation& sr
                 auto endTime = std::chrono::high_resolution_clock::now();
                 
                 if (fenceResult == FenceWaitResult::Cancelled) break;
-                if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) break;
+                if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) break;
 
                 double seconds = std::chrono::duration<double>(endTime - startTime).count();
                 if (seconds > 0) {
@@ -3273,7 +3312,7 @@ BenchmarkResult RunBandwidthTest(const std::string& name, VkBufferAllocation& sr
                 
                 FenceWaitResult fenceResult = WaitForBenchFenceEx();
                 if (fenceResult == FenceWaitResult::Cancelled) break;
-                if (fenceResult == FenceWaitResult::Error || g_app.benchmarkAborted) {
+                if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) {
                     Log("[ERROR] Critical fence error - aborting bandwidth test");
                     break;
                 }
@@ -3386,7 +3425,7 @@ BenchmarkResult RunLatencyTest(const std::string& name, VkBufferAllocation& src,
         }
 
         FenceWaitResult fenceResult = EndAndSubmitBenchCommandBuffer();
-        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) break;
+        if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) break;
 
         // Read timestamps
         std::vector<uint64_t> timestamps(opsThisBatch * 2);
@@ -3476,7 +3515,7 @@ BenchmarkResult RunCommandLatencyTest(int iterations) {
         }
 
         FenceWaitResult fenceResult = EndAndSubmitBenchCommandBuffer();
-        if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) break;
+        if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) break;
 
         std::vector<uint64_t> timestamps(opsThisBatch * 2);
         VkResult qr = vkGetQueryPoolResults(g_app.benchDevice, queryPool, 0, opsThisBatch * 2,
@@ -3693,49 +3732,90 @@ BenchmarkResult RunMemoryLatencyTest() {
         Log("[DEBUG] Generating pointer-chase chain (" + std::to_string(numElements) + " elements, " + FormatSize(Constants::MEMORY_LATENCY_BUFFER_SIZE) + ")");
     auto chainData = GeneratePointerChaseChain(numElements);
 
-    // 9. Create chain buffer (device-local, storage buffer compatible)
-    VkBufferCreateInfo chainBufInfo = {};
-    chainBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    chainBufInfo.size = Constants::MEMORY_LATENCY_BUFFER_SIZE;
-    chainBufInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    chainBufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    // 9./10. Create the chain buffer (device-local storage) and the staging
+    // buffer, and upload the chain. Every allocation step is checked: on an eGPU
+    // whose OS memory budget refuses even these 32 MB, the old code fell through
+    // to vkBindBufferMemory/vkMapMemory with null handles and crashed instead of
+    // skipping the test.
     VkBuffer chainBuffer = VK_NULL_HANDLE;
-    vkCreateBuffer(computeDevice, &chainBufInfo, nullptr, &chainBuffer);
-
-    VkMemoryRequirements chainMemReqs;
-    vkGetBufferMemoryRequirements(computeDevice, chainBuffer, &chainMemReqs);
-    VkMemoryAllocateInfo chainAllocInfo = {};
-    chainAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    chainAllocInfo.allocationSize = chainMemReqs.size;
-    chainAllocInfo.memoryTypeIndex = FindMemoryType(g_app.benchPhysicalDevice, chainMemReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     VkDeviceMemory chainMemory = VK_NULL_HANDLE;
-    vkAllocateMemory(computeDevice, &chainAllocInfo, nullptr, &chainMemory);
-    vkBindBufferMemory(computeDevice, chainBuffer, chainMemory, 0);
-
-    // 10. Create staging buffer and upload chain data
-    VkBufferCreateInfo stagingBufInfo = {};
-    stagingBufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    stagingBufInfo.size = Constants::MEMORY_LATENCY_BUFFER_SIZE;
-    stagingBufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    stagingBufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
-    vkCreateBuffer(computeDevice, &stagingBufInfo, nullptr, &stagingBuffer);
-
-    VkMemoryRequirements stagingMemReqs;
-    vkGetBufferMemoryRequirements(computeDevice, stagingBuffer, &stagingMemReqs);
-    VkMemoryAllocateInfo stagingAllocInfo = {};
-    stagingAllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    stagingAllocInfo.allocationSize = stagingMemReqs.size;
-    stagingAllocInfo.memoryTypeIndex = FindMemoryType(g_app.benchPhysicalDevice, stagingMemReqs.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
-    vkAllocateMemory(computeDevice, &stagingAllocInfo, nullptr, &stagingMemory);
-    vkBindBufferMemory(computeDevice, stagingBuffer, stagingMemory, 0);
+    auto memLatFail = [&](const std::string& what) -> BenchmarkResult {
+        Log("[ERROR] Memory latency test: " + what + " - skipping test");
+        vkDeviceWaitIdle(computeDevice);
+        if (stagingBuffer) vkDestroyBuffer(computeDevice, stagingBuffer, nullptr);
+        if (stagingMemory) vkFreeMemory(computeDevice, stagingMemory, nullptr);
+        if (chainBuffer)   vkDestroyBuffer(computeDevice, chainBuffer, nullptr);
+        if (chainMemory)   vkFreeMemory(computeDevice, chainMemory, nullptr);
+        vkDestroyPipeline(computeDevice, computePipeline, nullptr);
+        vkDestroyPipelineLayout(computeDevice, pipelineLayout, nullptr);
+        vkDestroyDescriptorSetLayout(computeDevice, descriptorSetLayout, nullptr);
+        vkDestroyShaderModule(computeDevice, shaderModule, nullptr);
+        vkDestroyCommandPool(computeDevice, computeCommandPool, nullptr);
+        vkDestroyDevice(computeDevice, nullptr);
+        return result;
+    };
+    auto createComputeBuffer = [&](VkBuffer& outBuf, VkDeviceMemory& outMem,
+                                   VkBufferUsageFlags usage, VkMemoryPropertyFlags memFlags,
+                                   const char* label) -> bool {
+        VkBufferCreateInfo bufInfo = {};
+        bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufInfo.size = Constants::MEMORY_LATENCY_BUFFER_SIZE;
+        bufInfo.usage = usage;
+        bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkResult r = vkCreateBuffer(computeDevice, &bufInfo, nullptr, &outBuf);
+        if (r != VK_SUCCESS) {
+            Log(std::string("[ERROR] vkCreateBuffer (") + label + ") failed: " + std::to_string((int)r));
+            return false;
+        }
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(computeDevice, outBuf, &memReqs);
+        uint32_t memType = FindMemoryType(g_app.benchPhysicalDevice, memReqs.memoryTypeBits, memFlags);
+        if (memType == UINT32_MAX) {
+            Log(std::string("[ERROR] No suitable memory type for ") + label);
+            return false;
+        }
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReqs.size;
+        allocInfo.memoryTypeIndex = memType;
+        r = vkAllocateMemory(computeDevice, &allocInfo, nullptr, &outMem);
+        if (r != VK_SUCCESS) {
+            Log(std::string("[ERROR] vkAllocateMemory (") + label + ", " +
+                FormatSize(Constants::MEMORY_LATENCY_BUFFER_SIZE) + ") failed: " + std::to_string((int)r));
+            return false;
+        }
+        r = vkBindBufferMemory(computeDevice, outBuf, outMem, 0);
+        if (r != VK_SUCCESS) {
+            Log(std::string("[ERROR] vkBindBufferMemory (") + label + ") failed: " + std::to_string((int)r));
+            return false;
+        }
+        return true;
+    };
+    if (!createComputeBuffer(chainBuffer, chainMemory,
+                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "chain buffer")) {
+        return memLatFail("chain buffer allocation failed");
+    }
+    if (!createComputeBuffer(stagingBuffer, stagingMemory,
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                             "staging buffer")) {
+        return memLatFail("staging buffer allocation failed");
+    }
 
     // Map and copy chain data
-    void* mappedData = nullptr;
-    vkMapMemory(computeDevice, stagingMemory, 0, Constants::MEMORY_LATENCY_BUFFER_SIZE, 0, &mappedData);
-    memcpy(mappedData, chainData.data(), Constants::MEMORY_LATENCY_BUFFER_SIZE);
-    vkUnmapMemory(computeDevice, stagingMemory);
+    {
+        void* mappedData = nullptr;
+        VkResult mr = vkMapMemory(computeDevice, stagingMemory, 0, Constants::MEMORY_LATENCY_BUFFER_SIZE, 0, &mappedData);
+        if (mr != VK_SUCCESS || !mappedData) {
+            return memLatFail("staging buffer map failed (" + std::to_string((int)mr) + ")");
+        }
+        memcpy(mappedData, chainData.data(), Constants::MEMORY_LATENCY_BUFFER_SIZE);
+        vkUnmapMemory(computeDevice, stagingMemory);
+    }
+
 
     // Upload chain data via compute queue (compute families implicitly support transfer)
     {
@@ -3876,7 +3956,10 @@ BenchmarkResult RunMemoryLatencyTest() {
         vr = vkWaitForFences(computeDevice, 1, &computeFence, VK_TRUE, Constants::FENCE_WAIT_TIMEOUT_MS * 1000000ULL);
         if (vr != VK_SUCCESS) {
             Log("[ERROR] Warmup dispatch " + std::to_string(w) + " fence wait failed: " + std::to_string((int)vr));
+            g_app.benchmarkAborted = true;  // fence still pending - it must not be reset or reused
+            break;
         }
+
     }
     if (g_app.config.debugLogging)
         Log("[DEBUG] Warmup dispatches complete");
@@ -3917,8 +4000,10 @@ BenchmarkResult RunMemoryLatencyTest() {
         vr = vkWaitForFences(computeDevice, 1, &computeFence, VK_TRUE, Constants::FENCE_WAIT_TIMEOUT_MS * 1000000ULL);
         if (vr != VK_SUCCESS) {
             Log("[ERROR] Measurement dispatch " + std::to_string(m) + " fence wait failed: " + std::to_string((int)vr));
-            continue;
+            g_app.benchmarkAborted = true;  // fence still pending - it must not be reset or reused
+            break;
         }
+
 
         uint64_t timestamps[2] = {};
         vr = vkGetQueryPoolResults(computeDevice, queryPool, 0, 2,
@@ -4145,27 +4230,36 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
             vkQueueSubmit(g_app.benchQueue, 1, &submitInfo1, g_app.benchFence);
             vkQueueSubmit(g_app.benchQueue2, 1, &submitInfo2, g_app.benchFence2);
             
-            // Wait for both to complete
+            // Wait for both to complete. VK_TIMEOUT is retried (bounded) on the
+            // same submission before it is declared a hang. Fences that never
+            // signaled mean the GPU work is still pending, so they must not be
+            // reset and the command buffers must not be re-recorded: abort.
             VkFence fences[2] = { g_app.benchFence, g_app.benchFence2 };
             uint64_t timeout = static_cast<uint64_t>(Constants::FENCE_WAIT_TIMEOUT_MS) * 1000000ULL;
             VkResult waitResult = vkWaitForFences(g_app.benchDevice, 2, fences, VK_TRUE, timeout);
-            
-            auto endTime = std::chrono::high_resolution_clock::now();
-            
-            vkResetFences(g_app.benchDevice, 2, fences);
-            
-            if (waitResult == VK_TIMEOUT) {
+            while (waitResult == VK_TIMEOUT) {
                 g_app.fenceTimeoutCount++;
-                if (g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) {
-                    g_app.benchmarkAborted = true;
-                    break;
+                Log("[WARNING] Bidirectional fence wait timed out after " +
+                    std::to_string(Constants::FENCE_WAIT_TIMEOUT_MS / 1000) + "s (timeout #" +
+                    std::to_string(g_app.fenceTimeoutCount.load()) + ")");
+                if (ShouldAbortBenchmark() || g_app.fenceTimeoutCount >= Constants::MAX_FENCE_RETRIES) break;
+                waitResult = vkWaitForFences(g_app.benchDevice, 2, fences, VK_TRUE, timeout);
+            }
+            auto endTime = std::chrono::high_resolution_clock::now();
+
+            if (waitResult != VK_SUCCESS) {
+                if (waitResult == VK_TIMEOUT) {
+                    Log("[ERROR] Max fence timeouts exceeded in bidirectional test - possible GPU hang. Aborting benchmark.");
+                } else {
+                    Log("[ERROR] vkWaitForFences failed in bidirectional test: " + std::to_string((int)waitResult));
                 }
-                continue;
-            } else if (waitResult != VK_SUCCESS) {
+                g_app.benchmarkAborted = true;
                 break;
             }
-            
+
+            vkResetFences(g_app.benchDevice, 2, fences);
             g_app.fenceTimeoutCount = 0;
+
             
             double seconds = std::chrono::duration<double>(endTime - startTime).count();
             if (seconds > 0) {
@@ -4202,7 +4296,7 @@ BenchmarkResult RunBidirectionalTest(size_t size, int copies, int batches) {
             FenceWaitResult fenceResult = WaitForBenchFenceEx();
             auto endTime = std::chrono::high_resolution_clock::now();
             
-            if (fenceResult == FenceWaitResult::Cancelled || g_app.benchmarkAborted) break;
+            if (fenceResult != FenceWaitResult::Success || g_app.benchmarkAborted) break;
 
             double seconds = std::chrono::duration<double>(endTime - startTime).count();
             if (seconds > 0) {
@@ -5773,7 +5867,6 @@ void BenchmarkThreadFunc() {
     }
 
     std::vector<BenchmarkResult> allResults;
-    int successfulRuns = 0;
 
     int testsPerRun = 2;  // Upload + Download
     if (g_app.config.runBidirectional) testsPerRun++;
@@ -5888,7 +5981,7 @@ void BenchmarkThreadFunc() {
         if (g_app.config.runBidirectional) {
             auto resBidir = RunBidirectionalTest(g_app.config.bandwidthSize, g_app.config.copiesPerBatch, g_app.config.bandwidthBatches);
             if (!resBidir.samples.empty()) {
-                resBidir.testName = "Bidirectional " + FormatSize(g_app.config.bandwidthSize) + runSuffix;
+                resBidir.testName += runSuffix;  // RunBidirectionalTest already named it after the ACTUAL buffer size
                 allResults.push_back(resBidir);
                 Log("  Bidirectional: " + std::to_string(resBidir.avgValue).substr(0, 5) + " GB/s");
             }
@@ -5990,7 +6083,6 @@ void BenchmarkThreadFunc() {
             if (ShouldAbortBenchmark()) break;
         }
 
-        successfulRuns++;
     }
 
     CleanupBenchmarkDevice();
@@ -6212,8 +6304,6 @@ void BenchmarkThreadFunc() {
             }
         }
         
-        // Show summary window
-        g_app.showSummaryWindow = true;
 
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
         
@@ -6228,6 +6318,9 @@ void BenchmarkThreadFunc() {
         // Append new results to existing results (accumulate across benchmark runs)
         g_app.results.insert(g_app.results.end(), newResults.begin(), newResults.end());
         
+        // Only now (results inserted under the lock) let the UI open the
+        // summary window that walks g_app.results.
+        g_app.showSummaryWindow = true;
         g_app.state = AppState::Completed;
     }
     
@@ -6372,7 +6465,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v3.0 GUI");
+    ImGui::Text("GPU-PCIe-Test v3.4 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -7089,6 +7182,9 @@ void RenderGUI() {
         ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
         
         ImGui::Begin("Benchmark Summary", &g_app.showSummaryWindow);
+        // Worker threads append to g_app.results; hold the lock for the whole
+        // window so the loops below never iterate a vector mid-reallocation.
+        std::lock_guard<std::mutex> resultsLock(g_app.resultsMutex);
         
         const GPUInfo& gpu = g_app.gpuList[g_app.config.selectedGPU];
         
@@ -7203,7 +7299,6 @@ void RenderGUI() {
             bool hasMemLatency = false;
             double measuredLatencyNs = 0, measuredLatencyMin = 0, measuredLatencyMax = 0;
             {
-                std::lock_guard<std::mutex> lock(g_app.resultsMutex);
                 for (const auto& r : g_app.results) {
                     if (r.testName.find("GPU Memory Latency") != std::string::npos) {
                         hasMemLatency = true;
@@ -7973,7 +8068,7 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v3.0 GUI Edition (Vulkan)");
+        ImGui::Text("GPU-PCIe-Test v3.4 GUI Edition (Vulkan)");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
@@ -8102,7 +8197,7 @@ void Render() {
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
     submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &g_app.renderFinishedSemaphores[frameIdx];
+    submitInfo.pSignalSemaphores = &g_app.renderFinishedSemaphores[g_app.imageIndex];
 
     vkQueueSubmit(g_app.graphicsQueue, 1, &submitInfo, g_app.inFlightFences[frameIdx]);
 
@@ -8110,7 +8205,7 @@ void Render() {
     VkPresentInfoKHR presentInfo = {};
     presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     presentInfo.waitSemaphoreCount = 1;
-    presentInfo.pWaitSemaphores = &g_app.renderFinishedSemaphores[frameIdx];
+    presentInfo.pWaitSemaphores = &g_app.renderFinishedSemaphores[g_app.imageIndex];
     presentInfo.swapchainCount = 1;
     presentInfo.pSwapchains = &g_app.swapChain;
     presentInfo.pImageIndices = &g_app.imageIndex;
@@ -8133,6 +8228,7 @@ void ResizeSwapChain(int width, int height) {
     if (g_app.device == VK_NULL_HANDLE) return;
 
     WaitForGPU();
+    DestroyRenderFinishedSemaphores();
 
     // Cleanup old swapchain resources
     for (auto fb : g_app.swapChainFramebuffers) {
@@ -8217,6 +8313,11 @@ void ResizeSwapChain(int width, int height) {
         vkCreateImageView(g_app.device, &viewInfo, nullptr, &g_app.swapChainImageViews[i]);
     }
 
+    if (!CreateRenderFinishedSemaphores()) {
+        Log("[ERROR] Failed to recreate render-finished semaphores");
+        return;
+    }
+
     // Recreate framebuffers
     CreateFramebuffers();
 
@@ -8294,7 +8395,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.0 GUI (Vulkan)",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.4 GUI (Vulkan)",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,
@@ -8472,9 +8573,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui::DestroyContext();
 
     // Vulkan cleanup
+    DestroyRenderFinishedSemaphores();
     for (int i = 0; i < Constants::NUM_FRAMES_IN_FLIGHT; i++) {
         if (g_app.imageAvailableSemaphores[i] != VK_NULL_HANDLE) vkDestroySemaphore(g_app.device, g_app.imageAvailableSemaphores[i], nullptr);
-        if (g_app.renderFinishedSemaphores[i] != VK_NULL_HANDLE) vkDestroySemaphore(g_app.device, g_app.renderFinishedSemaphores[i], nullptr);
         if (g_app.inFlightFences[i] != VK_NULL_HANDLE) vkDestroyFence(g_app.device, g_app.inFlightFences[i], nullptr);
     }
     

@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-#   GPU-PCIe-Test v3.0 (Vulkan - Linux) - Build Script
+#   GPU-PCIe-Test v3.4 (Vulkan - Linux) - Build Script
 # ==============================================================================
 # Prerequisites:
 #   sudo apt install cmake g++ libvulkan-dev libglfw3-dev    # Ubuntu/Debian
@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 
 echo "=================================================="
-echo "  GPU-PCIe-Test v3.0 (Vulkan - Linux) Build"
+echo "  GPU-PCIe-Test v3.4 (Vulkan - Linux) Build"
 echo "=================================================="
 echo
 

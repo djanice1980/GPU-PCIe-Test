@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ==================================================
-echo   GPU-PCIe-Test v3.0 GUI - Build Script
+echo   GPU-PCIe-Test v3.4 GUI - Build Script
 echo ==================================================
 echo.
 

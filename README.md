@@ -50,6 +50,19 @@ A tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Measures re
 - CMake 3.16+, g++, libglfw3-dev, libvulkan-dev
 - X11 or Wayland display server
 
+## Installing (prebuilt)
+
+Download from the [Releases page](https://github.com/djanice1980/GPU-PCIe-Test/releases).
+
+| Platform | File | Notes |
+|---|---|---|
+| Windows (Direct3D 12) | `GPU-PCIe-Test_GUI.exe` | Primary build; no installer, just run it |
+| Windows (Vulkan) | `GPU-PCIe-Test-Vulkan.exe` | Needs a Vulkan-capable driver |
+| Linux (any distro) | `GPU-PCIe-Test-<version>-x86_64.AppImage` | `chmod +x` and run; uses your distro's Vulkan loader and GPU driver |
+| Arch Linux / CachyOS | `gpu-pcie-test-<version>-1-x86_64.pkg.tar.zst` | `sudo pacman -U <file>`, or build it yourself: `cd packaging/arch && makepkg -si` |
+
+Run the Linux build as root (`sudo`) if you want full system RAM details from `dmidecode`.
+
 ## Building
 
 ### Windows - Quick Build (Recommended)
