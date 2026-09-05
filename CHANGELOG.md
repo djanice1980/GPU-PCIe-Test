@@ -5,6 +5,20 @@ All notable changes to GPU-PCIe-Test will be documented in this file.
 ## [3.4.2] - unreleased
 
 ### Fixed
+- **Linux reported "0 sticks, single channel" when not run as root.** Unprivileged
+  `dmidecode` still prints its banner, which passed the "no output" check; zero
+  parsed devices then fell through to the single-channel default. With no device
+  data the channel count is now reported as unknown, and the tool explains that
+  the SMBIOS table needs root.
+- **Startup prompt to read memory details with admin rights (Linux).** Instead of
+  relaunching the whole GUI as root, "Read with admin rights" runs `dmidecode`
+  once through `pkexec` (desktop password prompt); nothing else is elevated. Also
+  available later under Help > Read memory details. Elevated results survive
+  benchmark start (which used to re-detect and discard them).
+- **dmidecode 3.6+ sizes ("16 GiB") were not parsed**, and installed capacity now
+  comes from SMBIOS rather than MemTotal (128 GiB no longer shows as 125).
+- **"Bank Locator: P0 CHANNEL A" is now used as a channel hint** - soldered LPDDR
+  boards repeat the same Locator for every device, so it was the only hint.
 - **CSV export went to the process working directory with a fixed name**, so a
   launch from a menu or AppImage put `gpu_benchmark_results.csv` somewhere
   unobvious and every export overwrote the last. "Export to CSV" now opens the

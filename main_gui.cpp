@@ -281,6 +281,7 @@ struct SystemMemoryInfo {
     uint32_t busWidthBits = 0;         // Memory bus width from SMBIOS data widths (0 = unknown)
     bool   channelsUnverified = false; // Soldered LPDDR: channel count is only an SMBIOS-based guess
     bool   channelsInferred = false;   // Channel count raised to fit the measured iGPU bandwidth
+    bool   needsElevation = false;     // Linux: SMBIOS (dmidecode) needs root; per-device details missing
 };
 
 // VRAM test pattern types
@@ -959,8 +960,10 @@ SystemMemoryInfo DetectSystemMemory() {
         info.channels = 4;  // Quad channel
     } else if (uniqueBanks.size() >= 2u || stickCount >= 2) {
         info.channels = 2;  // Dual channel (typical)
-    } else {
+    } else if (stickCount == 1) {
         info.channels = 1;  // Single channel
+    } else {
+        info.channels = 0;  // No device data at all - unknown, not "single"
     }
 
     // Soldered memory: prefer the SMBIOS per-device data widths, which the
@@ -996,7 +999,8 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
     
     std::ostringstream oss;
     oss << "System Memory: ";
-    oss << mem.totalCapacityGB << "GB " << mem.type;
+    oss << mem.totalCapacityGB << "GB";
+    if (!mem.type.empty()) oss << " " << mem.type;
     
     if (mem.configuredSpeedMT > 0) {
         oss << " @ " << mem.configuredSpeedMT << " MT/s";
@@ -1007,7 +1011,12 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
         oss << " @ " << mem.speedMT << " MT/s";
     }
     
-    oss << ", " << mem.totalSticks << " stick" << (mem.totalSticks != 1 ? "s" : "");
+    if (mem.totalSticks == 0) {
+        oss << (mem.needsElevation ? ", SMBIOS memory table not readable without root" : ", no memory devices reported");
+    } else {
+        oss << ", " << mem.totalSticks << (mem.channelsUnverified ? " device" : " stick")
+            << (mem.totalSticks != 1 ? "s" : "");
+    }
     
     if (mem.channels > 0) {
         oss << ", ";
@@ -1019,6 +1028,8 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
         if (mem.busWidthBits > 0) oss << " (" << mem.busWidthBits << "-bit)";
         if (mem.channelsInferred) oss << " (inferred from measured bandwidth)";
         else if (mem.channelsUnverified) oss << " (SMBIOS estimate)";
+    } else if (mem.totalSticks == 0) {
+        oss << ", channels unknown";
     }
     
     if (mem.theoreticalBandwidth > 0) {

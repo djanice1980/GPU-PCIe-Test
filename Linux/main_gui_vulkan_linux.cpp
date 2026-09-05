@@ -293,6 +293,7 @@ struct SystemMemoryInfo {
     uint32_t busWidthBits = 0;         // Memory bus width from SMBIOS data widths (0 = unknown)
     bool   channelsUnverified = false; // Soldered LPDDR: channel count is only an SMBIOS-based guess
     bool   channelsInferred = false;   // Channel count raised to fit the measured iGPU bandwidth
+    bool   needsElevation = false;     // Linux: SMBIOS (dmidecode) needs root; per-device details missing
 };
 
 // VRAM test pattern types
@@ -671,6 +672,7 @@ struct AppContext {
     std::atomic<float> vramTestProgress{ 0.0f };
     std::string vramTestCurrentPattern;
     bool showVRAMTestWindow = false;
+    bool memoryPromptDismissed = false;  // startup pkexec prompt answered
     // (Coverage is now driven by g_app.config.vramCoveragePercent - see BenchmarkConfig)
 };
 
@@ -817,7 +819,7 @@ static std::string TrimString(const std::string& s) {
 }
 
 // Detect system memory configuration via /proc/meminfo and dmidecode
-SystemMemoryInfo DetectSystemMemory() {
+SystemMemoryInfo DetectSystemMemoryFrom(const std::string& dmidecodeOutputIn) {
     SystemMemoryInfo info;
 
     // ---- Step 1: Get total capacity from /proc/meminfo (always available) ----
@@ -839,14 +841,19 @@ SystemMemoryInfo DetectSystemMemory() {
         }
     }
 
-    // ---- Step 2: Try dmidecode for detailed info (requires root) ----
-    std::string dmidecodeOutput = ExecCommand("dmidecode --type memory 2>/dev/null");
+    // ---- Step 2: dmidecode output (requires root to read the SMBIOS table) ----
+    // Unprivileged dmidecode still prints its banner ("# dmidecode 3.7 ...
+    // SMBIOS 3.7.0 present.") before failing on the table, so "non-empty
+    // output" is not "has data": require at least one Memory Device section.
+    std::string dmidecodeOutput = dmidecodeOutputIn;
 
-    if (dmidecodeOutput.empty()) {
-        // dmidecode not available or not root - fall back to basic info
+    if (dmidecodeOutput.find("Memory Device") == std::string::npos) {
+        info.needsElevation = (geteuid() != 0);
         if (info.totalCapacityGB > 0) {
             info.detected = true;
-            info.errorMessage = "dmidecode unavailable (run as root for full details)";
+            info.errorMessage = info.needsElevation
+                ? "SMBIOS memory table needs root (Help > Read memory details, or run with sudo)"
+                : "dmidecode unavailable or reported no memory devices";
         } else {
             info.errorMessage = "Failed to read /proc/meminfo";
         }
@@ -862,6 +869,7 @@ SystemMemoryInfo DetectSystemMemory() {
     uint32_t dataWidthSum = 0;  // sum of per-device SMBIOS data widths (bits), populated devices only
     uint64_t dmidecodeCapacity = 0;
     std::set<std::string> uniqueLocators;  // For channel counting
+    std::set<char> bankChannelLetters;     // From "Bank Locator: ... CHANNEL X"
 
     // Split output into lines and parse Memory Device sections
     std::istringstream dmiStream(dmidecodeOutput);
@@ -869,6 +877,7 @@ SystemMemoryInfo DetectSystemMemory() {
     bool inMemoryDevice = false;
     bool slotHasModule = false;
     std::string currentLocator;
+    uint32_t currentDataWidth = 0;  // "Data Width" precedes "Size" in dmidecode output
 
     while (std::getline(dmiStream, line)) {
         // Detect start of a "Memory Device" section
@@ -877,6 +886,7 @@ SystemMemoryInfo DetectSystemMemory() {
             // If we were processing a previous device with a module, count it
             if (inMemoryDevice && slotHasModule) {
                 stickCount++;
+                dataWidthSum += currentDataWidth;
                 if (!currentLocator.empty()) {
                     uniqueLocators.insert(currentLocator);
                 }
@@ -884,6 +894,7 @@ SystemMemoryInfo DetectSystemMemory() {
             inMemoryDevice = true;
             slotHasModule = false;
             currentLocator.clear();
+            currentDataWidth = 0;
             continue;
         }
 
@@ -910,9 +921,10 @@ SystemMemoryInfo DetectSystemMemory() {
             uint64_t sizeVal = 0;
             std::string sizeUnit;
             sizeStream >> sizeVal >> sizeUnit;
-            if (sizeUnit == "MB" || sizeUnit == "mb") {
+            // dmidecode >= 3.6 prints binary units ("16 GiB"); older prints "16 GB".
+            if (sizeUnit == "MB" || sizeUnit == "mb" || sizeUnit == "MiB") {
                 dmidecodeCapacity += sizeVal;  // Keep in MB
-            } else if (sizeUnit == "GB" || sizeUnit == "gb") {
+            } else if (sizeUnit == "GB" || sizeUnit == "gb" || sizeUnit == "GiB") {
                 dmidecodeCapacity += sizeVal * 1024;  // Convert to MB
             }
         }
@@ -956,13 +968,15 @@ SystemMemoryInfo DetectSystemMemory() {
             }
         }
 
-        // Data Width ("64 bits"; summed across populated devices for soldered memory)
-        if (field == "Data Width" && slotHasModule) {
+        // Data Width ("64 bits"). It is printed BEFORE Size, so it cannot be
+        // gated on slotHasModule here; remember it and add it when the device
+        // turns out to be populated (summed for soldered memory).
+        if (field == "Data Width") {
             if (value != "Unknown" && !value.empty()) {
                 std::istringstream widthStream(value);
                 uint32_t bits = 0;
                 widthStream >> bits;
-                if (bits > 0 && bits <= 1024) dataWidthSum += bits;
+                if (bits > 0 && bits <= 1024) currentDataWidth = bits;
             }
         }
 
@@ -972,11 +986,27 @@ SystemMemoryInfo DetectSystemMemory() {
                 currentLocator = value;
             }
         }
+
+        // Bank Locator often names the channel directly ("P0 CHANNEL A",
+        // "BANK 0 CHANNEL B") - soldered LPDDR boards typically repeat the same
+        // Locator ("DIMM 0") for every device, so this is the only channel hint.
+        if (field == "Bank Locator" && slotHasModule) {
+            std::string upper = value;
+            std::transform(upper.begin(), upper.end(), upper.begin(),
+                           [](char c) { return static_cast<char>(::toupper(static_cast<unsigned char>(c))); });
+            size_t cp = upper.find("CHANNEL");
+            if (cp != std::string::npos) {
+                size_t i = cp + 7;
+                while (i < upper.size() && (upper[i] == ' ' || upper[i] == '_' || upper[i] == '-')) ++i;
+                if (i < upper.size() && upper[i] >= 'A' && upper[i] <= 'Z') bankChannelLetters.insert(upper[i]);
+            }
+        }
     }
 
     // Don't forget the last Memory Device section
     if (inMemoryDevice && slotHasModule) {
         stickCount++;
+        dataWidthSum += currentDataWidth;
         if (!currentLocator.empty()) {
             uniqueLocators.insert(currentLocator);
         }
@@ -984,8 +1014,9 @@ SystemMemoryInfo DetectSystemMemory() {
 
     // ---- Step 3: Fill in the SystemMemoryInfo struct ----
 
-    // Use dmidecode capacity if available and /proc/meminfo wasn't read
-    if (info.totalCapacityGB == 0 && dmidecodeCapacity > 0) {
+    // Installed size from SMBIOS beats MemTotal (the kernel reserves some RAM,
+    // so 128 GiB installed reads as ~125 GiB in /proc/meminfo).
+    if (dmidecodeCapacity / 1024 > info.totalCapacityGB) {
         info.totalCapacityGB = dmidecodeCapacity / 1024;  // MB to GB
     }
 
@@ -1029,6 +1060,8 @@ SystemMemoryInfo DetectSystemMemory() {
         }
     }
 
+    for (char c : bankChannelLetters) channelLetters.insert(c);
+
     if (channelLetters.size() >= 4u) {
         info.channels = 4;  // Quad channel
     } else if (channelLetters.size() >= 2u) {
@@ -1037,8 +1070,10 @@ SystemMemoryInfo DetectSystemMemory() {
         info.channels = 4;  // Quad channel (heuristic)
     } else if (stickCount >= 2) {
         info.channels = 2;  // Dual channel (typical)
-    } else {
+    } else if (stickCount == 1) {
         info.channels = 1;  // Single channel
+    } else {
+        info.channels = 0;  // No device data at all - unknown, not "single"
     }
 
     // Soldered memory: prefer the SMBIOS per-device data widths, which the
@@ -1074,6 +1109,12 @@ SystemMemoryInfo DetectSystemMemory() {
     return info;
 }
 
+// Normal path: whatever dmidecode gives the current user (root sees the table;
+// an unprivileged run only gets the banner and needsElevation is set).
+SystemMemoryInfo DetectSystemMemory() {
+    return DetectSystemMemoryFrom(ExecCommand("dmidecode --type memory 2>/dev/null"));
+}
+
 // Format system memory info as a string for logging
 std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
     if (!mem.detected) {
@@ -1082,7 +1123,8 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
 
     std::ostringstream oss;
     oss << "System Memory: ";
-    oss << mem.totalCapacityGB << "GB " << mem.type;
+    oss << mem.totalCapacityGB << "GB";
+    if (!mem.type.empty()) oss << " " << mem.type;
 
     if (mem.configuredSpeedMT > 0) {
         oss << " @ " << mem.configuredSpeedMT << " MT/s";
@@ -1093,7 +1135,12 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
         oss << " @ " << mem.speedMT << " MT/s";
     }
 
-    oss << ", " << mem.totalSticks << " stick" << (mem.totalSticks != 1 ? "s" : "");
+    if (mem.totalSticks == 0) {
+        oss << (mem.needsElevation ? ", SMBIOS memory table not readable without root" : ", no memory devices reported");
+    } else {
+        oss << ", " << mem.totalSticks << (mem.channelsUnverified ? " device" : " stick")
+            << (mem.totalSticks != 1 ? "s" : "");
+    }
 
     if (mem.channels > 0) {
         oss << ", ";
@@ -1105,6 +1152,8 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
         if (mem.busWidthBits > 0) oss << " (" << mem.busWidthBits << "-bit)";
         if (mem.channelsInferred) oss << " (inferred from measured bandwidth)";
         else if (mem.channelsUnverified) oss << " (SMBIOS estimate)";
+    } else if (mem.totalSticks == 0) {
+        oss << ", channels unknown";
     }
 
     if (mem.theoreticalBandwidth > 0) {
@@ -5974,7 +6023,11 @@ void BenchmarkThreadFunc() {
         Log("GPU Type: Discrete (using round-trip method for accurate upload measurement)");
     }
     
-    g_app.systemMemory = DetectSystemMemory();
+    // Keep an elevated (pkexec) read from startup: only re-detect when we
+    // have no per-device data yet.
+    if (g_app.systemMemory.totalSticks == 0) {
+        g_app.systemMemory = DetectSystemMemory();
+    }
     if (g_app.systemMemory.detected) {
         Log(FormatSystemMemoryInfo(g_app.systemMemory));
         
@@ -6612,7 +6665,69 @@ void ExportBenchmarkCsvInteractive() {
 //                             GUI RENDERING
 // ============================================================================
 
+// ============================================================================
+// ELEVATED SMBIOS READ (Linux)
+// ============================================================================
+// The SMBIOS memory table is root-only on Linux. Rather than relaunching a
+// Vulkan GUI as root (fragile under Wayland, and far more privilege than
+// needed), run dmidecode alone through pkexec: the desktop's polkit agent asks
+// for the password and only that one read is elevated.
+void ElevatedMemoryRead() {
+    if (TrimString(ExecCommand("command -v pkexec 2>/dev/null")).empty()) {
+        Log("[WARNING] pkexec not found - start the tool with sudo to read memory details");
+        return;
+    }
+    Log("[INFO] Reading the SMBIOS memory table via pkexec (password prompt)...");
+    std::string out = ExecCommand("pkexec dmidecode --type 17 2>/dev/null");
+    if (out.find("Memory Device") == std::string::npos) {
+        Log("[WARNING] Elevated dmidecode read was cancelled or failed");
+        return;
+    }
+    g_app.systemMemory = DetectSystemMemoryFrom(out);
+    g_app.systemMemory.needsElevation = false;
+    EstimateRatedLatency(g_app.systemMemory);
+    Log(FormatSystemMemoryInfo(g_app.systemMemory));
+}
+
+static bool g_memoryPromptOpened = false;
+void RenderMemoryElevationPrompt() {
+    if (!g_app.systemMemory.needsElevation || g_app.memoryPromptDismissed) return;
+    const char* title = "Memory details need administrator access";
+    if (!g_memoryPromptOpened) {
+        ImGui::OpenPopup(title);
+        g_memoryPromptOpened = true;
+    }
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
+        ImGui::TextWrapped("Memory type, speed and channel count come from the SMBIOS table, "
+                           "which Linux only exposes to root. Without it the tool cannot tell how "
+                           "many memory channels this system has, and the integrated-GPU comparison "
+                           "falls back to an estimate.");
+        ImGui::Spacing();
+        ImGui::TextWrapped("\"Read with admin rights\" runs dmidecode once through pkexec (you will be "
+                           "asked for your password). Nothing else runs elevated. You can also start "
+                           "the tool with sudo, or use Help > Read memory details later.");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        if (ImGui::Button("Read with admin rights (pkexec)", ImVec2(270, 0))) {
+            g_app.memoryPromptDismissed = true;
+            ImGui::CloseCurrentPopup();
+            ElevatedMemoryRead();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Continue without", ImVec2(160, 0))) {
+            g_app.memoryPromptDismissed = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
 void RenderGUI() {
+    RenderMemoryElevationPrompt();
+
     // Initialize docking once
     if (!g_app.dockingInitialized) {
         ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
@@ -6667,6 +6782,9 @@ void RenderGUI() {
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
+            if (ImGui::MenuItem("Read memory details (admin)...")) {
+                ElevatedMemoryRead();
+            }
             if (ImGui::MenuItem("About")) {
                 g_app.showAboutDialog = true;
             }
