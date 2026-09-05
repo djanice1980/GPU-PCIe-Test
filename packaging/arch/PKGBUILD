@@ -8,7 +8,7 @@
 # Linux/CMakeLists.txt), so the build needs network access.
 
 pkgname=gpu-pcie-test
-pkgver=3.4.0
+pkgver=3.4.1
 pkgrel=1
 pkgdesc="GPU/PCIe bandwidth, latency and VRAM integrity benchmark (Vulkan GUI)"
 arch=('x86_64')
@@ -19,7 +19,7 @@ makedepends=('cmake' 'vulkan-headers')
 optdepends=('dmidecode: detailed system RAM info (run as root)'
             'vulkan-validation-layers: for -DENABLE_VULKAN_VALIDATION=ON builds')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('0a5d562cd8993724ea67d9c39c142794636b9118fe970ad65e5f93a32d30424e')
+sha256sums=('SKIP')  # pinned after tagging
 
 build() {
     cmake -S "GPU-PCIe-Test-$pkgver/Linux" -B build \

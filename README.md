@@ -58,7 +58,7 @@ Download from the [Releases page](https://github.com/djanice1980/GPU-PCIe-Test/r
 |---|---|---|
 | Windows (Direct3D 12) | `GPU-PCIe-Test_GUI.exe` | Primary build; no installer, just run it |
 | Windows (Vulkan) | `GPU-PCIe-Test-Vulkan.exe` | Needs a Vulkan-capable driver |
-| Linux (any distro) | `GPU-PCIe-Test-<version>-x86_64.AppImage` | `chmod +x` and run; uses your distro's Vulkan loader and GPU driver |
+| Linux (any distro) | `GPU-PCIe-Test-<version>-x86_64.AppImage` | `chmod +x` and run; native Wayland or X11 (bundled GLFW 3.4); uses your distro's Vulkan loader and GPU driver |
 | Arch Linux / CachyOS | `gpu-pcie-test-<version>-1-x86_64.pkg.tar.zst` | `sudo pacman -U <file>`, or build it yourself: `cd packaging/arch && makepkg -si` |
 
 Run the Linux build as root (`sudo`) if you want full system RAM details from `dmidecode`.

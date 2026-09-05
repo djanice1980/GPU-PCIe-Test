@@ -2236,7 +2236,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 0);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 1);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2714,7 +2714,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 0);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 1);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2752,7 +2752,15 @@ bool InitVulkan() {
         return false;
     }
 
-    // Pick physical device (use first discrete GPU, fallback to any)
+    // Pick the UI render device. The UI is a handful of ImGui draw calls and
+    // must never depend on the GPU under test, so prefer an INTEGRATED GPU. On
+    // an eGPU host, rendering the window on the eGPU sends every presented
+    // frame back across the Thunderbolt/USB4 tunnel through the compositor's
+    // cross-GPU buffer sharing; on NVIDIA that produced a corrupted-pushbuffer
+    // Xid 32 a few seconds after launch with no benchmark running. The
+    // benchmark device (benchPhysicalDevice) is chosen separately by the user.
+    // Preference: integrated > discrete > anything else; a candidate must have
+    // a graphics queue that can present to our surface and VK_KHR_swapchain.
     uint32_t deviceCount = 0;
     vkEnumeratePhysicalDevices(g_app.instance, &deviceCount, nullptr);
     if (deviceCount == 0) return false;
@@ -2760,14 +2768,47 @@ bool InitVulkan() {
     std::vector<VkPhysicalDevice> devices(deviceCount);
     vkEnumeratePhysicalDevices(g_app.instance, &deviceCount, devices.data());
 
-    g_app.renderPhysicalDevice = devices[0];  // Default to first
-    for (auto& d : devices) {
-        VkPhysicalDeviceProperties props;
-        vkGetPhysicalDeviceProperties(d, &props);
-        if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+    g_app.renderPhysicalDevice = VK_NULL_HANDLE;
+    {
+        auto canPresent = [&](VkPhysicalDevice d) -> bool {
+            if (FindQueueFamily(d, VK_QUEUE_GRAPHICS_BIT, g_app.surface) == UINT32_MAX) return false;
+            uint32_t extCount = 0;
+            vkEnumerateDeviceExtensionProperties(d, nullptr, &extCount, nullptr);
+            std::vector<VkExtensionProperties> exts(extCount);
+            vkEnumerateDeviceExtensionProperties(d, nullptr, &extCount, exts.data());
+            for (const auto& e : exts) {
+                if (strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) return true;
+            }
+            return false;
+        };
+        auto rank = [](VkPhysicalDeviceType t) -> int {
+            switch (t) {
+                case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return 3;
+                case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return 2;
+                case VK_PHYSICAL_DEVICE_TYPE_CPU:            return 0;
+                default:                                     return 1;
+            }
+        };
+        int bestRank = -1;
+        VkPhysicalDeviceProperties bestProps = {};
+        for (auto& d : devices) {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(d, &props);
+            int r = rank(props.deviceType);
+            if (r <= bestRank) continue;          // keep enumeration order on ties
+            if (!canPresent(d)) continue;
+            bestRank = r;
+            bestProps = props;
             g_app.renderPhysicalDevice = d;
-            break;
         }
+        if (g_app.renderPhysicalDevice == VK_NULL_HANDLE) {
+            Log("[ERROR] No Vulkan device can present to the window (graphics queue + VK_KHR_swapchain)");
+            return false;
+        }
+        Log(std::string("[INFO] UI renders on ") + bestProps.deviceName +
+            (bestProps.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+                ? " (integrated GPU preferred so the UI never crosses an eGPU tunnel)"
+                : " (no presentable integrated GPU found)"));
     }
 
     // Find queue family supporting graphics + present

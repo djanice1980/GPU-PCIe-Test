@@ -2,6 +2,24 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.4.1] - 2026-09-05
+
+### Fixed
+- **eGPU hosts: opening the tool corrupted the eGPU's channel (NVRM Xid 32)
+  about five seconds after launch, before any benchmark ran.** Two causes,
+  both fixed:
+  - The Linux AppImage bundled the distro's GLFW 3.3.6, built X11-only, so on
+    a Wayland desktop the window was an XWayland client and every frame went
+    through the compositor's cross-GPU buffer sharing. The AppImage now bundles
+    GLFW 3.4 built from source with both the Wayland and X11 backends; it uses
+    native Wayland when `WAYLAND_DISPLAY` is set and X11 otherwise.
+  - The Vulkan variants rendered the UI on the first *discrete* GPU, i.e. the
+    eGPU itself, so the UI's frames crossed the Thunderbolt/USB4 tunnel on the
+    way to the display. The UI now renders on the integrated GPU whenever one
+    can present (falling back to a discrete GPU, then anything presentable).
+    The benchmark device is unaffected: it is still selected by the user and
+    lives on its own `VkDevice`. The chosen UI device is written to the log.
+
 ## [3.4.0] - 2026-09-04
 
 ### Fixed

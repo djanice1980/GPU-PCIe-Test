@@ -106,9 +106,33 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential cmake git ca-certificates curl file \
-            libglfw3-dev libvulkan-dev libgl-dev libx11-dev libxkbcommon-dev \
-            libwayland-dev libfuse2 desktop-file-utils
+            build-essential cmake git ca-certificates curl file unzip pkg-config \
+            libvulkan-dev libgl-dev libfuse2 desktop-file-utils \
+            libwayland-dev libxkbcommon-dev \
+            libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxext-dev
+
+      # Ubuntu 22.04's libglfw3 (3.3.6) is built X11-only. Under a Wayland
+      # desktop that makes the window an XWayland client, and on an eGPU host
+      # every presented frame then goes through the compositor's cross-GPU
+      # buffer sharing (NVRM Xid 32 a few seconds after launch). Build GLFW 3.4
+      # with both backends; it picks Wayland at runtime when WAYLAND_DISPLAY is
+      # set and X11 otherwise. The Wayland client libs are dlopen'ed by GLFW
+      # from the host, so nothing Wayland-specific is bundled besides GLFW.
+      - name: Build GLFW 3.4 (Wayland + X11)
+        run: |
+          curl -fsSL --retry 3 -o glfw-3.4.zip https://github.com/glfw/glfw/releases/download/3.4/glfw-3.4.zip
+          echo "b5ec004b2712fd08e8861dc271428f048775200a2df719ccf575143ba749a3e9  glfw-3.4.zip" | sha256sum -c -
+          unzip -q glfw-3.4.zip
+          cmake -S glfw-3.4 -B glfw-build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DGLFW_BUILD_WAYLAND=ON -DGLFW_BUILD_X11=ON \
+            -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF -DGLFW_BUILD_DOCS=OFF \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build glfw-build --parallel "$(nproc)"
+          cmake --install glfw-build
+          ldconfig
+          # Both backends must be present in the shared library we are about to bundle.
+          strings /usr/local/lib/libglfw.so.3 | grep -q wl_display_connect || { echo "GLFW has no Wayland backend"; exit 1; }
+          strings /usr/local/lib/libglfw.so.3 | grep -q XOpenDisplay      || { echo "GLFW has no X11 backend"; exit 1; }
 
       - uses: actions/checkout@v4
 
