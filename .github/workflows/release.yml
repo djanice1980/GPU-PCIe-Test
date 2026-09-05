@@ -26,10 +26,20 @@ jobs:
           arch: x64
 
       - name: Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: latest
-          cache: true
+        # Silent install with the official LunarG installer (Qt IFW CLI). The
+        # third-party "install-vulkan-sdk" action 7z-extracts the installer,
+        # which no longer yields an SDK layout with current installers.
+        shell: pwsh
+        run: |
+          $url = 'https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe'
+          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe -UseBasicParsing
+          $p = Start-Process -FilePath (Resolve-Path .\vulkan_sdk.exe) -Wait -PassThru -NoNewWindow `
+               -ArgumentList '--root','C:\VulkanSDK\latest','--accept-licenses','--accept-messages','--default-answer','--confirm-command','install'
+          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer exited with $($p.ExitCode)" }
+          if (-not (Test-Path 'C:\VulkanSDK\latest\Include\vulkan\vulkan.h')) { throw 'vulkan.h missing after install' }
+          if (-not (Test-Path 'C:\VulkanSDK\latest\Lib\vulkan-1.lib')) { throw 'vulkan-1.lib missing after install' }
+          'VULKAN_SDK=C:\VulkanSDK\latest' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Remove-Item vulkan_sdk.exe
 
       - name: Build D3D12 GUI
         shell: cmd

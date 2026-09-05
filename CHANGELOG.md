@@ -32,6 +32,17 @@ All notable changes to GPU-PCIe-Test will be documented in this file.
 - **Linux validation builds did nothing** - `-DENABLE_VULKAN_VALIDATION=ON`
   defined the macro but the Linux source never enabled
   `VK_LAYER_KHRONOS_validation`; it now mirrors the Windows Vulkan variant.
+- **Soldered LPDDR reported as single-channel RAM** (Strix Halo and similar
+  APUs) - channels were guessed from the SMBIOS device count, so firmware
+  that describes a 256-bit LPDDR5X bus as one device produced a
+  "single-channel" warning and a theoretical bandwidth 4x too low, which
+  inflated the iGPU percent-of-RAM figures. Soldered memory now uses the
+  SMBIOS per-device data widths when present, is never warned about, and
+  the iGPU comparison raises the channel estimate when the measured
+  bandwidth proves it too low (logged as inferred).
+- **Linux build failed with CMake < 3.24** - `DOWNLOAD_EXTRACT_TIMESTAMP`
+  is now only passed to CMake versions that know it (the stated minimum
+  is 3.16).
 - **Linux build broke with GCC 16** - a dead `successfulRuns` counter tripped
   `-Werror=unused-but-set-variable`.
 - **`build_gui.bat` was stored LF** despite the v3.0.7 CRLF fix (the commit

@@ -289,6 +289,9 @@ struct SystemMemoryInfo {
     double ratedLatencyNs = 0;         // Estimated chip latency from speed tier (ns)
     int    estimatedCL = 0;            // Estimated CAS latency
     bool   latencyEstimated = false;   // True if we found a matching speed tier
+    uint32_t busWidthBits = 0;         // Memory bus width from SMBIOS data widths (0 = unknown)
+    bool   channelsUnverified = false; // Soldered LPDDR: channel count is only an SMBIOS-based guess
+    bool   channelsInferred = false;   // Channel count raised to fit the measured iGPU bandwidth
 };
 
 // VRAM test pattern types
@@ -776,10 +779,27 @@ std::string GetDDRTypeFromSMBIOS(uint16_t memoryType) {
     }
 }
 
+// Soldered memory (LPDDR on laptops / APUs; SMBIOS form factor "Row Of Chips")
+// has no DIMM-per-channel relationship: firmware may describe a 256-bit bus as
+// one device or as eight 32-bit devices. Device counting and locator letters
+// therefore say little about the channel count.
+static bool IsSolderedMemory(const std::string& type, const std::string& formFactor) {
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](char c) { return static_cast<char>(::tolower(static_cast<unsigned char>(c))); });
+        return s;
+    };
+    std::string t = lower(type), f = lower(formFactor);
+    return t.find("lpddr") != std::string::npos ||
+           f.find("row of chips") != std::string::npos ||
+           f.find("chip") != std::string::npos;
+}
+
 // Form factor mapping
 std::string GetFormFactorName(uint16_t formFactor) {
     switch (formFactor) {
         case 8:  return "DIMM";
+        case 9:  return "Row Of Chips";  // soldered (LPDDR on laptops / APUs)
         case 12: return "SODIMM";
         case 13: return "SRIMM";
         case 14: return "FB-DIMM";
@@ -838,6 +858,7 @@ SystemMemoryInfo DetectSystemMemory() {
     std::string detectedType;
     std::string detectedFormFactor;
     int stickCount = 0;
+    uint32_t dataWidthSum = 0;  // sum of per-device SMBIOS data widths (bits), populated devices only
     uint64_t dmidecodeCapacity = 0;
     std::set<std::string> uniqueLocators;  // For channel counting
 
@@ -934,6 +955,16 @@ SystemMemoryInfo DetectSystemMemory() {
             }
         }
 
+        // Data Width ("64 bits"; summed across populated devices for soldered memory)
+        if (field == "Data Width" && slotHasModule) {
+            if (value != "Unknown" && !value.empty()) {
+                std::istringstream widthStream(value);
+                uint32_t bits = 0;
+                widthStream >> bits;
+                if (bits > 0 && bits <= 1024) dataWidthSum += bits;
+            }
+        }
+
         // Locator (for channel counting - e.g., "DIMM_A1", "DIMM_B1", "ChannelA-DIMM0")
         if (field == "Locator" && slotHasModule) {
             if (value != "Unknown" && !value.empty()) {
@@ -1009,6 +1040,19 @@ SystemMemoryInfo DetectSystemMemory() {
         info.channels = 1;  // Single channel
     }
 
+    // Soldered memory: prefer the SMBIOS per-device data widths, which the
+    // device-count / locator heuristics above cannot see. Strix Halo class APUs
+    // report e.g. 8 x 32-bit LPDDR5X devices (256-bit bus) or a single device;
+    // either way the estimate is flagged so no "single-channel" warning fires
+    // and the iGPU comparison can correct it from the measurement.
+    if (IsSolderedMemory(info.type, info.formFactor)) {
+        info.channelsUnverified = true;
+        if (dataWidthSum >= 64) {
+            info.busWidthBits = dataWidthSum;
+            info.channels = std::clamp<uint32_t>(dataWidthSum / 64, 1u, 8u);
+        }
+    }
+
     // Calculate theoretical bandwidth
     // DDR bandwidth = speed (MT/s) * 8 bytes * channels / 1000 = GB/s
     if (info.configuredSpeedMT > 0) {
@@ -1057,6 +1101,9 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
         else if (mem.channels == 4) oss << "quad";
         else oss << mem.channels;
         oss << "-channel";
+        if (mem.busWidthBits > 0) oss << " (" << mem.busWidthBits << "-bit)";
+        if (mem.channelsInferred) oss << " (inferred from measured bandwidth)";
+        else if (mem.channelsUnverified) oss << " (SMBIOS estimate)";
     }
 
     if (mem.theoreticalBandwidth > 0) {
@@ -1290,6 +1337,36 @@ void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo&
     if (g_app.systemMemory.detected && g_app.systemMemory.theoreticalBandwidth > 0) {
         // Use detected RAM bandwidth with ~80% efficiency factor
         expectedBandwidth = g_app.systemMemory.theoreticalBandwidth * 0.80;
+
+        // An iGPU cannot pull system RAM faster than the bus delivers it, so a
+        // measurement above the estimate proves the channel count is too low
+        // (soldered LPDDR firmware often describes the whole bus as one
+        // device). Raise the estimate to the smallest power-of-two channel
+        // count that can carry the measurement and say so in the log.
+        {
+            uint32_t memSpeed = g_app.systemMemory.configuredSpeedMT > 0 ?
+                g_app.systemMemory.configuredSpeedMT : g_app.systemMemory.speedMT;
+            double perChannelGBs = memSpeed * 8.0 / 1000.0;   // one 64-bit channel
+            uint32_t oldChannels = g_app.systemMemory.channels > 0 ? g_app.systemMemory.channels : 1;
+            if (perChannelGBs > 0 && maxBandwidth > expectedBandwidth) {
+                uint32_t ch = oldChannels;
+                while (ch < 16 && maxBandwidth > perChannelGBs * ch * 0.80) ch *= 2;
+                if (ch != oldChannels) {
+                    char msg[320];
+                    snprintf(msg, sizeof(msg),
+                        "[INFO] Measured %.1f GB/s exceeds the %.1f GB/s achievable for %u-channel RAM - "
+                        "SMBIOS under-reports the memory bus (typical for soldered LPDDR); "
+                        "assuming %u channels (%u-bit, %.1f GB/s theoretical)",
+                        maxBandwidth, expectedBandwidth, oldChannels, ch, ch * 64u, perChannelGBs * ch);
+                    Log(msg);
+                    g_app.systemMemory.channels = ch;
+                    g_app.systemMemory.busWidthBits = ch * 64u;
+                    g_app.systemMemory.theoreticalBandwidth = perChannelGBs * ch;
+                    g_app.systemMemory.channelsInferred = true;
+                    expectedBandwidth = g_app.systemMemory.theoreticalBandwidth * 0.80;
+                }
+            }
+        }
         char buf[64];
         snprintf(buf, sizeof(buf), "%s @ %u MT/s (%.0f GB/s)", 
                 g_app.systemMemory.type.c_str(),
@@ -5867,7 +5944,16 @@ void BenchmarkThreadFunc() {
                 " MT/s) - XMP/EXPO may not be enabled");
         }
         
-        if (g_app.systemMemory.channels == 1) {
+        if (g_app.systemMemory.channelsUnverified) {
+            // Soldered LPDDR: SMBIOS device count is not a channel count, so no
+            // single-channel warning - state what was read and that it is an estimate.
+            Log("[INFO] Soldered " + g_app.systemMemory.type + " memory: SMBIOS lists " +
+                std::to_string(g_app.systemMemory.totalSticks) + " device(s)" +
+                (g_app.systemMemory.busWidthBits > 0
+                    ? ", " + std::to_string(g_app.systemMemory.busWidthBits) + "-bit data width"
+                    : std::string()) +
+                " - channel count (" + std::to_string(g_app.systemMemory.channels) + ") is an estimate");
+        } else if (g_app.systemMemory.channels == 1) {
             Log("[WARNING] Single-channel RAM detected - this may bottleneck PCIe bandwidth");
         }
     } else {
