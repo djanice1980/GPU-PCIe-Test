@@ -29,17 +29,41 @@ jobs:
         # Silent install with the official LunarG installer (Qt IFW CLI). The
         # third-party "install-vulkan-sdk" action 7z-extracts the installer,
         # which no longer yields an SDK layout with current installers.
+        # Falls back to building the loader with the runner's vcpkg: the only
+        # things build_vulkan.bat needs are Include\vulkan\*.h and Lib\vulkan-1.lib.
         shell: pwsh
         run: |
-          $url = 'https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe'
-          Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe -UseBasicParsing
-          $p = Start-Process -FilePath (Resolve-Path .\vulkan_sdk.exe) -Wait -PassThru -NoNewWindow `
-               -ArgumentList '--root','C:\VulkanSDK\latest','--accept-licenses','--accept-messages','--default-answer','--confirm-command','install'
-          if ($p.ExitCode -ne 0) { throw "Vulkan SDK installer exited with $($p.ExitCode)" }
-          if (-not (Test-Path 'C:\VulkanSDK\latest\Include\vulkan\vulkan.h')) { throw 'vulkan.h missing after install' }
-          if (-not (Test-Path 'C:\VulkanSDK\latest\Lib\vulkan-1.lib')) { throw 'vulkan-1.lib missing after install' }
-          'VULKAN_SDK=C:\VulkanSDK\latest' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Remove-Item vulkan_sdk.exe
+          $sdk = $null
+          try {
+            $url = 'https://sdk.lunarg.com/sdk/download/latest/windows/vulkan_sdk.exe'
+            Invoke-WebRequest -Uri $url -OutFile vulkan_sdk.exe -UseBasicParsing
+            Write-Host "installer size: $((Get-Item vulkan_sdk.exe).Length) bytes"
+            $p = Start-Process -FilePath "$PWD\vulkan_sdk.exe" -Wait -PassThru `
+                 -RedirectStandardOutput sdk-out.txt -RedirectStandardError sdk-err.txt `
+                 -ArgumentList '--root','C:\VulkanSDK\latest','--accept-licenses','--default-answer','--confirm-command','--verbose','install'
+            Get-Content sdk-out.txt, sdk-err.txt -ErrorAction SilentlyContinue | Select-Object -Last 40
+            if ($p.ExitCode -eq 0 -and (Test-Path 'C:\VulkanSDK\latest\Lib\vulkan-1.lib')) {
+              $sdk = 'C:\VulkanSDK\latest'
+            } else {
+              Write-Host "LunarG installer failed (exit $($p.ExitCode)) - falling back to vcpkg"
+            }
+          } catch {
+            Write-Host "LunarG installer error: $_ - falling back to vcpkg"
+          }
+          if (-not $sdk) {
+            $vcpkg = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { 'C:\vcpkg' }
+            & "$vcpkg\vcpkg.exe" install vulkan-loader --triplet x64-windows
+            if ($LASTEXITCODE -ne 0) { throw 'vcpkg install vulkan-loader failed' }
+            $sdk = "$PWD\vksdk"
+            New-Item -ItemType Directory -Force "$sdk\Include", "$sdk\Lib" | Out-Null
+            Copy-Item -Recurse -Force "$vcpkg\installed\x64-windows\include\*" "$sdk\Include\"
+            Copy-Item -Force "$vcpkg\installed\x64-windows\lib\vulkan-1.lib" "$sdk\Lib\"
+          }
+          if (-not (Test-Path "$sdk\Include\vulkan\vulkan.h")) { throw 'vulkan.h missing' }
+          if (-not (Test-Path "$sdk\Lib\vulkan-1.lib")) { throw 'vulkan-1.lib missing' }
+          Write-Host "VULKAN_SDK=$sdk"
+          "VULKAN_SDK=$sdk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Remove-Item vulkan_sdk.exe -ErrorAction SilentlyContinue
 
       - name: Build D3D12 GUI
         shell: cmd
