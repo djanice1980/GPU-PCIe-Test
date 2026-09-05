@@ -118,6 +118,8 @@
 #define VK_USE_PLATFORM_WIN32_KHR
 
 #include <windows.h>
+#include <commdlg.h>
+#include <shlobj.h>
 #include <vulkan/vulkan.h>
 #include <setupapi.h>
 #include <devpkey.h>
@@ -133,6 +135,7 @@
 #include <algorithm>
 #include <numeric>
 #include <chrono>
+#include <ctime>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -2146,7 +2149,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 1);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 2);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2622,7 +2625,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 1);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 2);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -6456,6 +6459,42 @@ void BenchmarkThreadFunc() {
 //                             CSV EXPORT
 // ============================================================================
 
+// Default export file name: timestamped so repeated exports never overwrite.
+std::string DefaultCsvFileName() {
+    std::time_t t = std::time(nullptr);
+    std::tm tmv = {};
+    localtime_s(&tmv, &t);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "gpu-pcie-test_%Y%m%d-%H%M%S.csv", &tmv);
+    return buf;
+}
+
+// Ask the user where to save the CSV with the native Save As dialog. Returns
+// "" if cancelled. Starts in the Documents folder. (Previously the file was
+// written silently to the process's working directory, which for a launch
+// from the Start menu is somewhere the user never looks.)
+std::string ChooseCsvSavePath() {
+    wchar_t path[MAX_PATH] = {};
+    std::wstring wdef = Utf8ToWide(DefaultCsvFileName());
+    wcsncpy_s(path, MAX_PATH, wdef.c_str(), _TRUNCATE);
+
+    wchar_t docs[MAX_PATH] = {};
+    bool haveDocs = SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_MYDOCUMENTS, nullptr, SHGFP_TYPE_CURRENT, docs));
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_app.hwnd;
+    ofn.lpstrFilter = L"CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrInitialDir = haveDocs ? docs : nullptr;
+    ofn.lpstrDefExt = L"csv";
+    ofn.lpstrTitle = L"Export benchmark results";
+    ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetSaveFileNameW(&ofn)) return "";
+    return WideToUtf8(path);
+}
+
 void ExportCSV(const std::string& filename) {
     std::ofstream file(filename);
     if (!file) {
@@ -6503,6 +6542,16 @@ void ExportCSV(const std::string& filename) {
     Log("Results exported to " + filename);
 }
 
+// Menu / button entry point: pick a location, then write.
+void ExportBenchmarkCsvInteractive() {
+    std::string path = ChooseCsvSavePath();
+    if (path.empty()) {
+        Log("Export cancelled");
+        return;
+    }
+    ExportCSV(path);
+}
+
 // ============================================================================
 //                             GUI RENDERING
 // ============================================================================
@@ -6541,7 +6590,7 @@ void RenderGUI() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Export CSV", nullptr, false, g_app.state == AppState::Completed)) {
-                ExportCSV("gpu_benchmark_results.csv");
+                ExportBenchmarkCsvInteractive();
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) {
@@ -6886,7 +6935,7 @@ void RenderGUI() {
         g_app.showCompareWindow = true;
     }
     if (ImGui::Button("Export to CSV", ImVec2(-1, 30))) {
-        ExportCSV("gpu_benchmark_results.csv");
+        ExportBenchmarkCsvInteractive();
     }
     
     ImGui::Spacing();

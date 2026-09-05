@@ -2,6 +2,17 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.4.2] - unreleased
+
+### Fixed
+- **CSV export went to the process working directory with a fixed name**, so a
+  launch from a menu or AppImage put `gpu_benchmark_results.csv` somewhere
+  unobvious and every export overwrote the last. "Export to CSV" now opens the
+  native Save As dialog (Windows common dialog; kdialog or zenity on Linux),
+  starts in Documents with a timestamped file name, and the log shows the full
+  path. Without kdialog/zenity the file goes to Documents (or `$HOME`) and the
+  path is logged.
+
 ## [3.4.1] - 2026-09-05
 
 ### Fixed

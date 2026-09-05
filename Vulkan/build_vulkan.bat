@@ -223,7 +223,7 @@ echo  Building %OUTPUT%
 echo ============================================================
 echo.
 
-set LIBS=vulkan-1.lib setupapi.lib cfgmgr32.lib wbemuuid.lib ole32.lib oleaut32.lib user32.lib gdi32.lib shell32.lib dwmapi.lib
+set LIBS=vulkan-1.lib setupapi.lib cfgmgr32.lib wbemuuid.lib ole32.lib oleaut32.lib user32.lib gdi32.lib shell32.lib comdlg32.lib dwmapi.lib
 set CFLAGS=/nologo /std:c++17 /EHsc /O2 /DNDEBUG /DUNICODE /D_UNICODE /DNOMINMAX /utf-8
 set INCLUDES=/I"%VK_SDK%\Include" /I.
 set LDFLAGS=/link /SUBSYSTEM:WINDOWS /LIBPATH:"%VK_SDK%\Lib" /ENTRY:WinMainCRTStartup

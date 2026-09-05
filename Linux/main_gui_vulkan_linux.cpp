@@ -122,6 +122,7 @@
 #include <algorithm>
 #include <numeric>
 #include <chrono>
+#include <ctime>
 #include <thread>
 #include <atomic>
 #include <mutex>
@@ -2236,7 +2237,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 1);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 2);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2714,7 +2715,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 1);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 2);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -6501,6 +6502,55 @@ void BenchmarkThreadFunc() {
 //                             CSV EXPORT
 // ============================================================================
 
+// Default export file name: timestamped so repeated exports never overwrite.
+std::string DefaultCsvFileName() {
+    std::time_t t = std::time(nullptr);
+    std::tm tmv = {};
+    localtime_r(&t, &tmv);
+    char buf[64];
+    std::strftime(buf, sizeof(buf), "gpu-pcie-test_%Y%m%d-%H%M%S.csv", &tmv);
+    return buf;
+}
+
+static std::string ShellQuote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) out += (c == '\'') ? std::string("'\\''") : std::string(1, c);
+    return out + "'";
+}
+
+// Ask the user where to save the CSV. Uses the desktop's native file dialog
+// (kdialog on KDE, zenity elsewhere; whichever exists). Returns "" if the
+// dialog was cancelled. Without either tool the file goes to the Documents
+// folder (xdg-user-dir) or $HOME with a timestamped name, and the log states
+// the full path. (Previously the file was written silently to the process's
+// working directory, which for a launcher/AppImage start is not obvious.)
+std::string ChooseCsvSavePath() {
+    std::string dir = TrimString(ExecCommand("xdg-user-dir DOCUMENTS 2>/dev/null"));
+    if (dir.empty() || access(dir.c_str(), W_OK) != 0) {
+        const char* home = getenv("HOME");
+        dir = home ? home : ".";
+    }
+    std::string def = dir + "/" + DefaultCsvFileName();
+
+    bool haveKdialog = !TrimString(ExecCommand("command -v kdialog 2>/dev/null")).empty();
+    bool haveZenity  = !TrimString(ExecCommand("command -v zenity 2>/dev/null")).empty();
+    const char* desktop = getenv("XDG_CURRENT_DESKTOP");
+    bool preferKde = desktop && std::string(desktop).find("KDE") != std::string::npos;
+
+    std::string cmd;
+    if (haveKdialog && (preferKde || !haveZenity)) {
+        cmd = "kdialog --title 'Export benchmark results' --getsavefilename " + ShellQuote(def) + " 'text/csv' 2>/dev/null";
+    } else if (haveZenity) {
+        cmd = "zenity --file-selection --save --confirm-overwrite --title='Export benchmark results' --filename=" +
+              ShellQuote(def) + " 2>/dev/null";
+    }
+    if (cmd.empty()) {
+        Log("[INFO] No kdialog/zenity found for a save dialog - saving to " + def);
+        return def;
+    }
+    return TrimString(ExecCommand(cmd));  // "" = cancelled
+}
+
 void ExportCSV(const std::string& filename) {
     std::ofstream file(filename);
     if (!file) {
@@ -6548,6 +6598,16 @@ void ExportCSV(const std::string& filename) {
     Log("Results exported to " + filename);
 }
 
+// Menu / button entry point: pick a location, then write.
+void ExportBenchmarkCsvInteractive() {
+    std::string path = ChooseCsvSavePath();
+    if (path.empty()) {
+        Log("Export cancelled");
+        return;
+    }
+    ExportCSV(path);
+}
+
 // ============================================================================
 //                             GUI RENDERING
 // ============================================================================
@@ -6586,7 +6646,7 @@ void RenderGUI() {
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Export CSV", nullptr, false, g_app.state == AppState::Completed)) {
-                ExportCSV("gpu_benchmark_results.csv");
+                ExportBenchmarkCsvInteractive();
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) {
@@ -6931,7 +6991,7 @@ void RenderGUI() {
         g_app.showCompareWindow = true;
     }
     if (ImGui::Button("Export to CSV", ImVec2(-1, 30))) {
-        ExportCSV("gpu_benchmark_results.csv");
+        ExportBenchmarkCsvInteractive();
     }
     
     ImGui::Spacing();

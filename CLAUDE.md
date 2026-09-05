@@ -12,7 +12,7 @@ GUI built with Dear ImGui (docking branch) + ImPlot.
 - `build_gui.bat` - Main GUI build (auto-downloads ImGui/ImPlot from GitHub)
 - `Vulkan/build_vulkan.bat` - Vulkan GUI variant (needs VULKAN_SDK env var)
 - Compiler flags: `/O2 /MD /EHsc /std:c++17 /DUNICODE /D_UNICODE`
-- Links: d3d12.lib dxgi.lib setupapi.lib cfgmgr32.lib wbemuuid.lib ole32.lib oleaut32.lib
+- Links: d3d12.lib dxgi.lib d3dcompiler.lib comdlg32.lib shell32.lib setupapi.lib cfgmgr32.lib wbemuuid.lib ole32.lib oleaut32.lib
 
 ### Linux
 - Requires CMake 3.16+, g++, Vulkan SDK, GLFW3
