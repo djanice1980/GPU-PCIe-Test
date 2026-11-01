@@ -33,7 +33,11 @@ GUI built with Dear ImGui (docking branch) + ImPlot.
 - Integrated GPUs use GPU timestamps directly for both upload/download
 - PCIe link info: Windows via SetupAPI, Linux via sysfs (/sys/bus/pci/devices/)
 - External GPU detection: Windows via cfgmgr32 device tree, Linux via sysfs thunderbolt subsystem
-- VRAM scanning: 512MB chunks, 8 test patterns, fresh alloc per chunk for physical coverage
+- VRAM scanning: 512MB chunks, 8 test patterns, fresh alloc per chunk for physical coverage.
+  Default (v3.5+) is resident GPU testing: `vram_fill.comp`/`g_vramFillHLSL` writes the pattern on-GPU,
+  the verify shader checks it; Random = lowbias32 hash of (index, iteration). Both shaders must stay
+  in sync (GLSL in Vulkan/*.comp, HLSL strings in main_gui.cpp). Regenerate SPIR-V with
+  `glslc -O --target-env=vulkan1.1` and re-embed as uint32 arrays in BOTH Vulkan sources.
 - System RAM: Windows via WMI (Win32_PhysicalMemory), Linux via /proc/meminfo + dmidecode
 
 ## Design Decisions & Rationale

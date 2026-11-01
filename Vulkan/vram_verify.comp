@@ -1,6 +1,7 @@
 #version 450
 
-// GPU-side VRAM pattern verification compute shader.
+// GPU-side VRAM pattern verification compute shader (memtest_vulkan-style
+// resident testing). Must stay in sync with vram_fill.comp.
 // Reads dwords from chain buffer, regenerates expected value per pattern type,
 // XORs and on mismatch atomically appends a (offset, expected, actual) record.
 
@@ -22,12 +23,21 @@ layout(push_constant) uniform Params {
     uint baseIndex;     // dword offset added per sub-dispatch (workgroup-count cap)
 } pc;
 
+// 32-bit integer hash (lowbias32, Chris Wellons). Reproducible on GPU and in
+// C++ so the Random pattern needs no CPU-generated data.
+uint Hash32(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
 uint GenerateExpected(uint i) {
     if (pc.patternType == 0u) return 0u;                                    // AllZeros
     if (pc.patternType == 1u) return 0xFFFFFFFFu;                           // AllOnes
     if (pc.patternType == 2u) return 0xAAAAAAAAu;                           // Checkerboard
     if (pc.patternType == 3u) return 0x55555555u;                           // InverseCheckerboard
-    // patternType == 4 (Random) is not supported here; caller must use CPU path.
+    if (pc.patternType == 4u) return Hash32(i ^ (0x9E3779B9u * (pc.patternIter + 1u)));  // Random
     if (pc.patternType == 5u) return 1u << (pc.patternIter & 31u);          // MarchingOnes
     if (pc.patternType == 6u) return ~(1u << (pc.patternIter & 31u));       // MarchingZeros
     if (pc.patternType == 7u) return i;                                     // AddressPattern

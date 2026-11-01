@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v3.4 - GUI Edition (Vulkan)
+// GPU-PCIe-Test v3.5 - GUI Edition (Vulkan)
 // Dear ImGui + Vulkan Frontend
 // ============================================================================
 // Graphical frontend for the GPU/PCIe benchmark tool.
@@ -458,7 +458,8 @@ struct BenchmarkConfig {
     bool   vramPreheatEnabled = false;
     int    vramPreheatSeconds = 30;
     bool   vramMarathonMode = false;
-    bool   vramGpuVerify = false;
+    bool   vramGpuVerify = true;   // resident GPU fill+verify (memtest_vulkan-style); CPU readback is the fallback
+    int    vramGpuPasses = 4;      // fill+verify passes per pattern per chunk in GPU mode (Random varies each pass)
 };
 
 struct InterfaceSpeed {
@@ -2163,7 +2164,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 4);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 5, 0);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2639,7 +2640,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 4, 4);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 5, 0);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -4904,7 +4905,8 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
     cfg.vramPreheatEnabled = false;
     cfg.vramPreheatSeconds = 30;
     cfg.vramMarathonMode = false;
-    cfg.vramGpuVerify = false;
+    cfg.vramGpuVerify = true;
+    cfg.vramGpuPasses = 4;
     switch (preset) {
         case VRAMScanPreset::Quick:
             cfg.vramPatternsEnabled = { true, true, true, false, true, false, false, false };
@@ -4913,6 +4915,7 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramNonSequentialEnabled = false;
             cfg.vramNonSequentialBlockSize = 65536;
             cfg.vramCoveragePercent = 50;
+            cfg.vramGpuPasses = 1;
             break;
         case VRAMScanPreset::Standard:
             cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
@@ -4921,6 +4924,7 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramNonSequentialEnabled = false;
             cfg.vramNonSequentialBlockSize = 65536;
             cfg.vramCoveragePercent = 80;
+            cfg.vramGpuPasses = 4;
             break;
         case VRAMScanPreset::Deep:
             cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
@@ -4932,6 +4936,7 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramPreheatEnabled = true;
             cfg.vramPreheatSeconds = 30;
             cfg.vramGpuVerify = true;
+            cfg.vramGpuPasses = 16;
             break;
         case VRAMScanPreset::Thorough:
             cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
@@ -4943,6 +4948,7 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramPreheatEnabled = true;
             cfg.vramPreheatSeconds = 60;
             cfg.vramGpuVerify = true;
+            cfg.vramGpuPasses = 64;
             break;
         case VRAMScanPreset::Marathon:
             cfg.vramPatternsEnabled = { true, true, true, true, true, true, true, true };
@@ -4954,6 +4960,7 @@ void ApplyVRAMScanPreset(VRAMScanPreset preset, BenchmarkConfig& cfg) {
             cfg.vramPreheatEnabled = true;
             cfg.vramPreheatSeconds = 30;
             cfg.vramGpuVerify = true;
+            cfg.vramGpuPasses = 64;
             cfg.vramMarathonMode = true;
             break;
         case VRAMScanPreset::Custom:
@@ -4973,7 +4980,8 @@ VRAMScanPreset DetectVRAMScanPreset(const BenchmarkConfig& cfg) {
             && tmp.vramPreheatEnabled == cfg.vramPreheatEnabled
             && tmp.vramPreheatSeconds == cfg.vramPreheatSeconds
             && tmp.vramMarathonMode == cfg.vramMarathonMode
-            && tmp.vramGpuVerify == cfg.vramGpuVerify;
+            && tmp.vramGpuVerify == cfg.vramGpuVerify
+            && tmp.vramGpuPasses == cfg.vramGpuPasses;
     };
     for (auto p : { VRAMScanPreset::Quick, VRAMScanPreset::Standard,
                     VRAMScanPreset::Deep, VRAMScanPreset::Thorough,
@@ -4985,93 +4993,194 @@ VRAMScanPreset DetectVRAMScanPreset(const BenchmarkConfig& cfg) {
     return VRAMScanPreset::Custom;
 }
 
-// SPIR-V compute shader: VRAM pattern verification (631 words / 2524 bytes)
-// Generated from vram_verify.comp with glslc -O --target-env=vulkan1.1
+// SPIR-V compute shader: VRAM pattern verification.
+// Generated from Vulkan/vram_verify.comp (757 words / 3028 bytes) with
+// glslc -O --target-env=vulkan1.1. Random pattern = GPU hash, no CPU data.
 static const uint32_t g_vramVerifySPIRV[] = {
-    0x07230203, 0x00010300, 0x000d000b, 0x000000d6, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x07230203, 0x00010300, 0x000d000b, 0x00000120, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-    0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x00000058, 0x00060010, 0x00000004,
-    0x00000011, 0x00000100, 0x00000001, 0x00000001, 0x00030047, 0x0000000c, 0x00000002, 0x00050048,
-    0x0000000c, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000000c, 0x00000001, 0x00000023,
-    0x00000004, 0x00050048, 0x0000000c, 0x00000002, 0x00000023, 0x00000008, 0x00050048, 0x0000000c,
-    0x00000003, 0x00000023, 0x0000000c, 0x00040047, 0x00000058, 0x0000000b, 0x0000001c, 0x00040047,
-    0x00000069, 0x00000006, 0x00000004, 0x00030047, 0x0000006a, 0x00000002, 0x00040048, 0x0000006a,
-    0x00000000, 0x00000013, 0x00040048, 0x0000006a, 0x00000000, 0x00000018, 0x00050048, 0x0000006a,
-    0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x0000006c, 0x00000013, 0x00030047, 0x0000006c,
-    0x00000018, 0x00040047, 0x0000006c, 0x00000021, 0x00000000, 0x00040047, 0x0000006c, 0x00000022,
-    0x00000000, 0x00040047, 0x0000007b, 0x00000006, 0x00000004, 0x00030047, 0x0000007c, 0x00000002,
-    0x00050048, 0x0000007c, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x0000007c, 0x00000001,
-    0x00000023, 0x00000004, 0x00040047, 0x0000007e, 0x00000021, 0x00000001, 0x00040047, 0x0000007e,
-    0x00000022, 0x00000000, 0x00040047, 0x00000095, 0x0000000b, 0x00000019, 0x00020013, 0x00000002,
-    0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x0006001e,
-    0x0000000c, 0x00000006, 0x00000006, 0x00000006, 0x00000006, 0x00040020, 0x0000000d, 0x00000009,
-    0x0000000c, 0x0004003b, 0x0000000d, 0x0000000e, 0x00000009, 0x00040015, 0x0000000f, 0x00000020,
-    0x00000001, 0x0004002b, 0x0000000f, 0x00000010, 0x00000001, 0x00040020, 0x00000011, 0x00000009,
-    0x00000006, 0x0004002b, 0x00000006, 0x00000014, 0x00000000, 0x00020014, 0x00000015, 0x0004002b,
-    0x00000006, 0x0000001c, 0x00000001, 0x0004002b, 0x00000006, 0x00000020, 0xffffffff, 0x0004002b,
-    0x00000006, 0x00000024, 0x00000002, 0x0004002b, 0x00000006, 0x00000028, 0xaaaaaaaa, 0x0004002b,
-    0x00000006, 0x0000002c, 0x00000003, 0x0004002b, 0x00000006, 0x00000030, 0x55555555, 0x0004002b,
-    0x00000006, 0x00000034, 0x00000005, 0x0004002b, 0x0000000f, 0x00000038, 0x00000002, 0x0004002b,
-    0x00000006, 0x0000003b, 0x0000001f, 0x0004002b, 0x00000006, 0x00000041, 0x00000006, 0x0004002b,
-    0x00000006, 0x0000004d, 0x00000007, 0x00040017, 0x00000056, 0x00000006, 0x00000003, 0x00040020,
-    0x00000057, 0x00000001, 0x00000056, 0x0004003b, 0x00000057, 0x00000058, 0x00000001, 0x00040020,
-    0x00000059, 0x00000001, 0x00000006, 0x0004002b, 0x0000000f, 0x0000005c, 0x00000003, 0x0004002b,
-    0x0000000f, 0x00000061, 0x00000000, 0x0003001d, 0x00000069, 0x00000006, 0x0003001e, 0x0000006a,
-    0x00000069, 0x00040020, 0x0000006b, 0x0000000c, 0x0000006a, 0x0004003b, 0x0000006b, 0x0000006c,
-    0x0000000c, 0x00040020, 0x0000006e, 0x0000000c, 0x00000006, 0x0003001d, 0x0000007b, 0x00000006,
-    0x0004001e, 0x0000007c, 0x00000006, 0x0000007b, 0x00040020, 0x0000007d, 0x0000000c, 0x0000007c,
-    0x0004003b, 0x0000007d, 0x0000007e, 0x0000000c, 0x0004002b, 0x00000006, 0x00000082, 0x00000100,
-    0x0006002c, 0x00000056, 0x00000095, 0x00000082, 0x0000001c, 0x0000001c, 0x00050036, 0x00000002,
-    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x000300f7, 0x00000096, 0x00000000,
-    0x000300fb, 0x00000014, 0x00000097, 0x000200f8, 0x00000097, 0x00050041, 0x00000059, 0x0000005a,
-    0x00000058, 0x00000014, 0x0004003d, 0x00000006, 0x0000005b, 0x0000005a, 0x00050041, 0x00000011,
-    0x0000005d, 0x0000000e, 0x0000005c, 0x0004003d, 0x00000006, 0x0000005e, 0x0000005d, 0x00050080,
-    0x00000006, 0x0000005f, 0x0000005b, 0x0000005e, 0x00050041, 0x00000011, 0x00000062, 0x0000000e,
-    0x00000061, 0x0004003d, 0x00000006, 0x00000063, 0x00000062, 0x000500ae, 0x00000015, 0x00000064,
-    0x0000005f, 0x00000063, 0x000300f7, 0x00000066, 0x00000000, 0x000400fa, 0x00000064, 0x00000065,
-    0x00000066, 0x000200f8, 0x00000065, 0x000200f9, 0x00000096, 0x000200f8, 0x00000066, 0x00060041,
-    0x0000006e, 0x0000006f, 0x0000006c, 0x00000061, 0x0000005f, 0x0004003d, 0x00000006, 0x00000070,
-    0x0000006f, 0x000300f7, 0x000000d3, 0x00000000, 0x000300fb, 0x00000014, 0x000000a5, 0x000200f8,
-    0x000000a5, 0x00050041, 0x00000011, 0x000000a6, 0x0000000e, 0x00000010, 0x0004003d, 0x00000006,
-    0x000000a7, 0x000000a6, 0x000500aa, 0x00000015, 0x000000a8, 0x000000a7, 0x00000014, 0x000300f7,
-    0x000000aa, 0x00000000, 0x000400fa, 0x000000a8, 0x000000a9, 0x000000aa, 0x000200f8, 0x000000a9,
-    0x000200f9, 0x000000d3, 0x000200f8, 0x000000aa, 0x000500aa, 0x00000015, 0x000000ad, 0x000000a7,
-    0x0000001c, 0x000300f7, 0x000000af, 0x00000000, 0x000400fa, 0x000000ad, 0x000000ae, 0x000000af,
-    0x000200f8, 0x000000ae, 0x000200f9, 0x000000d3, 0x000200f8, 0x000000af, 0x000500aa, 0x00000015,
-    0x000000b2, 0x000000a7, 0x00000024, 0x000300f7, 0x000000b4, 0x00000000, 0x000400fa, 0x000000b2,
-    0x000000b3, 0x000000b4, 0x000200f8, 0x000000b3, 0x000200f9, 0x000000d3, 0x000200f8, 0x000000b4,
-    0x000500aa, 0x00000015, 0x000000b7, 0x000000a7, 0x0000002c, 0x000300f7, 0x000000b9, 0x00000000,
-    0x000400fa, 0x000000b7, 0x000000b8, 0x000000b9, 0x000200f8, 0x000000b8, 0x000200f9, 0x000000d3,
-    0x000200f8, 0x000000b9, 0x000500aa, 0x00000015, 0x000000bc, 0x000000a7, 0x00000034, 0x000300f7,
-    0x000000c2, 0x00000000, 0x000400fa, 0x000000bc, 0x000000bd, 0x000000c2, 0x000200f8, 0x000000bd,
-    0x00050041, 0x00000011, 0x000000be, 0x0000000e, 0x00000038, 0x0004003d, 0x00000006, 0x000000bf,
-    0x000000be, 0x000500c7, 0x00000006, 0x000000c0, 0x000000bf, 0x0000003b, 0x000500c4, 0x00000006,
-    0x000000c1, 0x0000001c, 0x000000c0, 0x000200f9, 0x000000d3, 0x000200f8, 0x000000c2, 0x000500aa,
-    0x00000015, 0x000000c5, 0x000000a7, 0x00000041, 0x000300f7, 0x000000cc, 0x00000000, 0x000400fa,
-    0x000000c5, 0x000000c6, 0x000000cc, 0x000200f8, 0x000000c6, 0x00050041, 0x00000011, 0x000000c7,
-    0x0000000e, 0x00000038, 0x0004003d, 0x00000006, 0x000000c8, 0x000000c7, 0x000500c7, 0x00000006,
-    0x000000c9, 0x000000c8, 0x0000003b, 0x000500c4, 0x00000006, 0x000000ca, 0x0000001c, 0x000000c9,
-    0x000400c8, 0x00000006, 0x000000cb, 0x000000ca, 0x000200f9, 0x000000d3, 0x000200f8, 0x000000cc,
-    0x000500aa, 0x00000015, 0x000000cf, 0x000000a7, 0x0000004d, 0x000300f7, 0x000000d2, 0x00000000,
-    0x000400fa, 0x000000cf, 0x000000d0, 0x000000d2, 0x000200f8, 0x000000d0, 0x000200f9, 0x000000d3,
-    0x000200f8, 0x000000d2, 0x000200f9, 0x000000d3, 0x000200f8, 0x000000d3, 0x001300f5, 0x00000006,
-    0x000000d5, 0x00000014, 0x000000a9, 0x00000020, 0x000000ae, 0x00000028, 0x000000b3, 0x00000030,
-    0x000000b8, 0x000000c1, 0x000000bd, 0x000000cb, 0x000000c6, 0x0000005f, 0x000000d0, 0x00000014,
-    0x000000d2, 0x000500ab, 0x00000015, 0x00000077, 0x00000070, 0x000000d5, 0x000300f7, 0x00000079,
-    0x00000000, 0x000400fa, 0x00000077, 0x00000078, 0x00000079, 0x000200f8, 0x00000078, 0x00050041,
-    0x0000006e, 0x0000007f, 0x0000007e, 0x00000061, 0x000700ea, 0x00000006, 0x00000080, 0x0000007f,
-    0x0000001c, 0x00000014, 0x0000001c, 0x000500b0, 0x00000015, 0x00000083, 0x00000080, 0x00000082,
-    0x000300f7, 0x00000085, 0x00000000, 0x000400fa, 0x00000083, 0x00000084, 0x00000085, 0x000200f8,
-    0x00000084, 0x00050084, 0x00000006, 0x00000087, 0x00000080, 0x0000002c, 0x00060041, 0x0000006e,
-    0x0000008a, 0x0000007e, 0x00000010, 0x00000087, 0x0003003e, 0x0000008a, 0x0000005f, 0x00050080,
-    0x00000006, 0x0000008d, 0x00000087, 0x0000001c, 0x00060041, 0x0000006e, 0x0000008f, 0x0000007e,
-    0x00000010, 0x0000008d, 0x0003003e, 0x0000008f, 0x000000d5, 0x00050080, 0x00000006, 0x00000092,
-    0x00000087, 0x00000024, 0x00060041, 0x0000006e, 0x00000094, 0x0000007e, 0x00000010, 0x00000092,
-    0x0003003e, 0x00000094, 0x00000070, 0x000200f9, 0x00000085, 0x000200f8, 0x00000085, 0x000200f9,
-    0x00000079, 0x000200f8, 0x00000079, 0x000200f9, 0x00000096, 0x000200f8, 0x00000096, 0x000100fd,
-    0x00010038,
+    0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x00000082, 0x00060010, 0x00000004,
+    0x00000011, 0x00000100, 0x00000001, 0x00000001, 0x00030047, 0x00000027, 0x00000002, 0x00050048,
+    0x00000027, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000027, 0x00000001, 0x00000023,
+    0x00000004, 0x00050048, 0x00000027, 0x00000002, 0x00000023, 0x00000008, 0x00050048, 0x00000027,
+    0x00000003, 0x00000023, 0x0000000c, 0x00040047, 0x00000082, 0x0000000b, 0x0000001c, 0x00040047,
+    0x00000093, 0x00000006, 0x00000004, 0x00030047, 0x00000094, 0x00000002, 0x00040048, 0x00000094,
+    0x00000000, 0x00000013, 0x00040048, 0x00000094, 0x00000000, 0x00000018, 0x00050048, 0x00000094,
+    0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000096, 0x00000013, 0x00030047, 0x00000096,
+    0x00000018, 0x00040047, 0x00000096, 0x00000021, 0x00000000, 0x00040047, 0x00000096, 0x00000022,
+    0x00000000, 0x00040047, 0x000000a5, 0x00000006, 0x00000004, 0x00030047, 0x000000a6, 0x00000002,
+    0x00050048, 0x000000a6, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x000000a6, 0x00000001,
+    0x00000023, 0x00000004, 0x00040047, 0x000000a8, 0x00000021, 0x00000001, 0x00040047, 0x000000a8,
+    0x00000022, 0x00000000, 0x00040047, 0x000000bf, 0x0000000b, 0x00000019, 0x00020013, 0x00000002,
+    0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x00040015,
+    0x00000010, 0x00000020, 0x00000001, 0x0004002b, 0x00000010, 0x00000011, 0x00000010, 0x0004002b,
+    0x00000006, 0x00000015, 0x7feb352d, 0x0004002b, 0x00000010, 0x00000019, 0x0000000f, 0x0004002b,
+    0x00000006, 0x0000001d, 0x846ca68b, 0x0006001e, 0x00000027, 0x00000006, 0x00000006, 0x00000006,
+    0x00000006, 0x00040020, 0x00000028, 0x00000009, 0x00000027, 0x0004003b, 0x00000028, 0x00000029,
+    0x00000009, 0x0004002b, 0x00000010, 0x0000002a, 0x00000001, 0x00040020, 0x0000002b, 0x00000009,
+    0x00000006, 0x0004002b, 0x00000006, 0x0000002e, 0x00000000, 0x00020014, 0x0000002f, 0x0004002b,
+    0x00000006, 0x00000036, 0x00000001, 0x0004002b, 0x00000006, 0x0000003a, 0xffffffff, 0x0004002b,
+    0x00000006, 0x0000003e, 0x00000002, 0x0004002b, 0x00000006, 0x00000042, 0xaaaaaaaa, 0x0004002b,
+    0x00000006, 0x00000046, 0x00000003, 0x0004002b, 0x00000006, 0x0000004a, 0x55555555, 0x0004002b,
+    0x00000006, 0x0000004e, 0x00000004, 0x0004002b, 0x00000006, 0x00000053, 0x9e3779b9, 0x0004002b,
+    0x00000010, 0x00000054, 0x00000002, 0x0004002b, 0x00000006, 0x0000005f, 0x00000005, 0x0004002b,
+    0x00000006, 0x00000065, 0x0000001f, 0x0004002b, 0x00000006, 0x0000006b, 0x00000006, 0x0004002b,
+    0x00000006, 0x00000077, 0x00000007, 0x00040017, 0x00000080, 0x00000006, 0x00000003, 0x00040020,
+    0x00000081, 0x00000001, 0x00000080, 0x0004003b, 0x00000081, 0x00000082, 0x00000001, 0x00040020,
+    0x00000083, 0x00000001, 0x00000006, 0x0004002b, 0x00000010, 0x00000086, 0x00000003, 0x0004002b,
+    0x00000010, 0x0000008b, 0x00000000, 0x0003001d, 0x00000093, 0x00000006, 0x0003001e, 0x00000094,
+    0x00000093, 0x00040020, 0x00000095, 0x0000000c, 0x00000094, 0x0004003b, 0x00000095, 0x00000096,
+    0x0000000c, 0x00040020, 0x00000098, 0x0000000c, 0x00000006, 0x0003001d, 0x000000a5, 0x00000006,
+    0x0004001e, 0x000000a6, 0x00000006, 0x000000a5, 0x00040020, 0x000000a7, 0x0000000c, 0x000000a6,
+    0x0004003b, 0x000000a7, 0x000000a8, 0x0000000c, 0x0004002b, 0x00000006, 0x000000ac, 0x00000100,
+    0x0006002c, 0x00000080, 0x000000bf, 0x000000ac, 0x00000036, 0x00000036, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x000300f7, 0x000000c0, 0x00000000,
+    0x000300fb, 0x0000002e, 0x000000c1, 0x000200f8, 0x000000c1, 0x00050041, 0x00000083, 0x00000084,
+    0x00000082, 0x0000002e, 0x0004003d, 0x00000006, 0x00000085, 0x00000084, 0x00050041, 0x0000002b,
+    0x00000087, 0x00000029, 0x00000086, 0x0004003d, 0x00000006, 0x00000088, 0x00000087, 0x00050080,
+    0x00000006, 0x00000089, 0x00000085, 0x00000088, 0x00050041, 0x0000002b, 0x0000008c, 0x00000029,
+    0x0000008b, 0x0004003d, 0x00000006, 0x0000008d, 0x0000008c, 0x000500ae, 0x0000002f, 0x0000008e,
+    0x00000089, 0x0000008d, 0x000300f7, 0x00000090, 0x00000000, 0x000400fa, 0x0000008e, 0x0000008f,
+    0x00000090, 0x000200f8, 0x0000008f, 0x000200f9, 0x000000c0, 0x000200f8, 0x00000090, 0x00060041,
+    0x00000098, 0x00000099, 0x00000096, 0x0000008b, 0x00000089, 0x0004003d, 0x00000006, 0x0000009a,
+    0x00000099, 0x000300f7, 0x0000010a, 0x00000000, 0x000300fb, 0x0000002e, 0x000000d0, 0x000200f8,
+    0x000000d0, 0x00050041, 0x0000002b, 0x000000d1, 0x00000029, 0x0000002a, 0x0004003d, 0x00000006,
+    0x000000d2, 0x000000d1, 0x000500aa, 0x0000002f, 0x000000d3, 0x000000d2, 0x0000002e, 0x000300f7,
+    0x000000d5, 0x00000000, 0x000400fa, 0x000000d3, 0x000000d4, 0x000000d5, 0x000200f8, 0x000000d4,
+    0x000200f9, 0x0000010a, 0x000200f8, 0x000000d5, 0x000500aa, 0x0000002f, 0x000000d8, 0x000000d2,
+    0x00000036, 0x000300f7, 0x000000da, 0x00000000, 0x000400fa, 0x000000d8, 0x000000d9, 0x000000da,
+    0x000200f8, 0x000000d9, 0x000200f9, 0x0000010a, 0x000200f8, 0x000000da, 0x000500aa, 0x0000002f,
+    0x000000dd, 0x000000d2, 0x0000003e, 0x000300f7, 0x000000df, 0x00000000, 0x000400fa, 0x000000dd,
+    0x000000de, 0x000000df, 0x000200f8, 0x000000de, 0x000200f9, 0x0000010a, 0x000200f8, 0x000000df,
+    0x000500aa, 0x0000002f, 0x000000e2, 0x000000d2, 0x00000046, 0x000300f7, 0x000000e4, 0x00000000,
+    0x000400fa, 0x000000e2, 0x000000e3, 0x000000e4, 0x000200f8, 0x000000e3, 0x000200f9, 0x0000010a,
+    0x000200f8, 0x000000e4, 0x000500aa, 0x0000002f, 0x000000e7, 0x000000d2, 0x0000004e, 0x000300f7,
+    0x000000f0, 0x00000000, 0x000400fa, 0x000000e7, 0x000000e8, 0x000000f0, 0x000200f8, 0x000000e8,
+    0x00050041, 0x0000002b, 0x000000ea, 0x00000029, 0x00000054, 0x0004003d, 0x00000006, 0x000000eb,
+    0x000000ea, 0x00050080, 0x00000006, 0x000000ec, 0x000000eb, 0x00000036, 0x00050084, 0x00000006,
+    0x000000ed, 0x00000053, 0x000000ec, 0x000500c6, 0x00000006, 0x000000ee, 0x00000089, 0x000000ed,
+    0x000500c2, 0x00000006, 0x0000010f, 0x000000ee, 0x00000011, 0x000500c6, 0x00000006, 0x00000111,
+    0x000000ee, 0x0000010f, 0x00050084, 0x00000006, 0x00000113, 0x00000111, 0x00000015, 0x000500c2,
+    0x00000006, 0x00000115, 0x00000113, 0x00000019, 0x000500c6, 0x00000006, 0x00000117, 0x00000113,
+    0x00000115, 0x00050084, 0x00000006, 0x00000119, 0x00000117, 0x0000001d, 0x000500c2, 0x00000006,
+    0x0000011b, 0x00000119, 0x00000011, 0x000500c6, 0x00000006, 0x0000011d, 0x00000119, 0x0000011b,
+    0x000200f9, 0x0000010a, 0x000200f8, 0x000000f0, 0x000500aa, 0x0000002f, 0x000000f3, 0x000000d2,
+    0x0000005f, 0x000300f7, 0x000000f9, 0x00000000, 0x000400fa, 0x000000f3, 0x000000f4, 0x000000f9,
+    0x000200f8, 0x000000f4, 0x00050041, 0x0000002b, 0x000000f5, 0x00000029, 0x00000054, 0x0004003d,
+    0x00000006, 0x000000f6, 0x000000f5, 0x000500c7, 0x00000006, 0x000000f7, 0x000000f6, 0x00000065,
+    0x000500c4, 0x00000006, 0x000000f8, 0x00000036, 0x000000f7, 0x000200f9, 0x0000010a, 0x000200f8,
+    0x000000f9, 0x000500aa, 0x0000002f, 0x000000fc, 0x000000d2, 0x0000006b, 0x000300f7, 0x00000103,
+    0x00000000, 0x000400fa, 0x000000fc, 0x000000fd, 0x00000103, 0x000200f8, 0x000000fd, 0x00050041,
+    0x0000002b, 0x000000fe, 0x00000029, 0x00000054, 0x0004003d, 0x00000006, 0x000000ff, 0x000000fe,
+    0x000500c7, 0x00000006, 0x00000100, 0x000000ff, 0x00000065, 0x000500c4, 0x00000006, 0x00000101,
+    0x00000036, 0x00000100, 0x000400c8, 0x00000006, 0x00000102, 0x00000101, 0x000200f9, 0x0000010a,
+    0x000200f8, 0x00000103, 0x000500aa, 0x0000002f, 0x00000106, 0x000000d2, 0x00000077, 0x000300f7,
+    0x00000109, 0x00000000, 0x000400fa, 0x00000106, 0x00000107, 0x00000109, 0x000200f8, 0x00000107,
+    0x000200f9, 0x0000010a, 0x000200f8, 0x00000109, 0x000200f9, 0x0000010a, 0x000200f8, 0x0000010a,
+    0x001500f5, 0x00000006, 0x0000011f, 0x0000002e, 0x000000d4, 0x0000003a, 0x000000d9, 0x00000042,
+    0x000000de, 0x0000004a, 0x000000e3, 0x0000011d, 0x000000e8, 0x000000f8, 0x000000f4, 0x00000102,
+    0x000000fd, 0x00000089, 0x00000107, 0x0000002e, 0x00000109, 0x000500ab, 0x0000002f, 0x000000a1,
+    0x0000009a, 0x0000011f, 0x000300f7, 0x000000a3, 0x00000000, 0x000400fa, 0x000000a1, 0x000000a2,
+    0x000000a3, 0x000200f8, 0x000000a2, 0x00050041, 0x00000098, 0x000000a9, 0x000000a8, 0x0000008b,
+    0x000700ea, 0x00000006, 0x000000aa, 0x000000a9, 0x00000036, 0x0000002e, 0x00000036, 0x000500b0,
+    0x0000002f, 0x000000ad, 0x000000aa, 0x000000ac, 0x000300f7, 0x000000af, 0x00000000, 0x000400fa,
+    0x000000ad, 0x000000ae, 0x000000af, 0x000200f8, 0x000000ae, 0x00050084, 0x00000006, 0x000000b1,
+    0x000000aa, 0x00000046, 0x00060041, 0x00000098, 0x000000b4, 0x000000a8, 0x0000002a, 0x000000b1,
+    0x0003003e, 0x000000b4, 0x00000089, 0x00050080, 0x00000006, 0x000000b7, 0x000000b1, 0x00000036,
+    0x00060041, 0x00000098, 0x000000b9, 0x000000a8, 0x0000002a, 0x000000b7, 0x0003003e, 0x000000b9,
+    0x0000011f, 0x00050080, 0x00000006, 0x000000bc, 0x000000b1, 0x0000003e, 0x00060041, 0x00000098,
+    0x000000be, 0x000000a8, 0x0000002a, 0x000000bc, 0x0003003e, 0x000000be, 0x0000009a, 0x000200f9,
+    0x000000af, 0x000200f8, 0x000000af, 0x000200f9, 0x000000a3, 0x000200f8, 0x000000a3, 0x000200f9,
+    0x000000c0, 0x000200f8, 0x000000c0, 0x000100fd, 0x00010038,
 };
-static const size_t g_vramVerifySPIRVSize = 2596;
+static const size_t g_vramVerifySPIRVSize = sizeof(g_vramVerifySPIRV);
+
+// SPIR-V compute shader: VRAM pattern FILL (626 words / 2504 bytes).
+// Generated from Vulkan/vram_fill.comp with glslc -O --target-env=vulkan1.1.
+// Writes the expected value for every dword straight into VRAM so a test
+// pass never touches the PCIe bus (memtest_vulkan-style resident testing).
+static const uint32_t g_vramFillSPIRV[] = {
+    0x07230203, 0x00010300, 0x000d000b, 0x00000102, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+    0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x00000082, 0x00060010, 0x00000004,
+    0x00000011, 0x00000100, 0x00000001, 0x00000001, 0x00030047, 0x00000027, 0x00000002, 0x00050048,
+    0x00000027, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000027, 0x00000001, 0x00000023,
+    0x00000004, 0x00050048, 0x00000027, 0x00000002, 0x00000023, 0x00000008, 0x00050048, 0x00000027,
+    0x00000003, 0x00000023, 0x0000000c, 0x00040047, 0x00000082, 0x0000000b, 0x0000001c, 0x00040047,
+    0x00000092, 0x00000006, 0x00000004, 0x00030047, 0x00000093, 0x00000002, 0x00040048, 0x00000093,
+    0x00000000, 0x00000013, 0x00040048, 0x00000093, 0x00000000, 0x00000019, 0x00050048, 0x00000093,
+    0x00000000, 0x00000023, 0x00000000, 0x00030047, 0x00000095, 0x00000013, 0x00030047, 0x00000095,
+    0x00000019, 0x00040047, 0x00000095, 0x00000021, 0x00000000, 0x00040047, 0x00000095, 0x00000022,
+    0x00000000, 0x00040047, 0x0000009d, 0x0000000b, 0x00000019, 0x00020013, 0x00000002, 0x00030021,
+    0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000020, 0x00000000, 0x00040015, 0x00000010,
+    0x00000020, 0x00000001, 0x0004002b, 0x00000010, 0x00000011, 0x00000010, 0x0004002b, 0x00000006,
+    0x00000015, 0x7feb352d, 0x0004002b, 0x00000010, 0x00000019, 0x0000000f, 0x0004002b, 0x00000006,
+    0x0000001d, 0x846ca68b, 0x0006001e, 0x00000027, 0x00000006, 0x00000006, 0x00000006, 0x00000006,
+    0x00040020, 0x00000028, 0x00000009, 0x00000027, 0x0004003b, 0x00000028, 0x00000029, 0x00000009,
+    0x0004002b, 0x00000010, 0x0000002a, 0x00000001, 0x00040020, 0x0000002b, 0x00000009, 0x00000006,
+    0x0004002b, 0x00000006, 0x0000002e, 0x00000000, 0x00020014, 0x0000002f, 0x0004002b, 0x00000006,
+    0x00000036, 0x00000001, 0x0004002b, 0x00000006, 0x0000003a, 0xffffffff, 0x0004002b, 0x00000006,
+    0x0000003e, 0x00000002, 0x0004002b, 0x00000006, 0x00000042, 0xaaaaaaaa, 0x0004002b, 0x00000006,
+    0x00000046, 0x00000003, 0x0004002b, 0x00000006, 0x0000004a, 0x55555555, 0x0004002b, 0x00000006,
+    0x0000004e, 0x00000004, 0x0004002b, 0x00000006, 0x00000053, 0x9e3779b9, 0x0004002b, 0x00000010,
+    0x00000054, 0x00000002, 0x0004002b, 0x00000006, 0x0000005f, 0x00000005, 0x0004002b, 0x00000006,
+    0x00000065, 0x0000001f, 0x0004002b, 0x00000006, 0x0000006b, 0x00000006, 0x0004002b, 0x00000006,
+    0x00000077, 0x00000007, 0x00040017, 0x00000080, 0x00000006, 0x00000003, 0x00040020, 0x00000081,
+    0x00000001, 0x00000080, 0x0004003b, 0x00000081, 0x00000082, 0x00000001, 0x00040020, 0x00000083,
+    0x00000001, 0x00000006, 0x0004002b, 0x00000010, 0x00000086, 0x00000003, 0x0004002b, 0x00000010,
+    0x0000008b, 0x00000000, 0x0003001d, 0x00000092, 0x00000006, 0x0003001e, 0x00000093, 0x00000092,
+    0x00040020, 0x00000094, 0x0000000c, 0x00000093, 0x0004003b, 0x00000094, 0x00000095, 0x0000000c,
+    0x00040020, 0x0000009a, 0x0000000c, 0x00000006, 0x0004002b, 0x00000006, 0x0000009c, 0x00000100,
+    0x0006002c, 0x00000080, 0x0000009d, 0x0000009c, 0x00000036, 0x00000036, 0x00050036, 0x00000002,
+    0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x000300f7, 0x000000a2, 0x00000000,
+    0x000300fb, 0x0000002e, 0x000000a3, 0x000200f8, 0x000000a3, 0x00050041, 0x00000083, 0x00000084,
+    0x00000082, 0x0000002e, 0x0004003d, 0x00000006, 0x00000085, 0x00000084, 0x00050041, 0x0000002b,
+    0x00000087, 0x00000029, 0x00000086, 0x0004003d, 0x00000006, 0x00000088, 0x00000087, 0x00050080,
+    0x00000006, 0x00000089, 0x00000085, 0x00000088, 0x00050041, 0x0000002b, 0x0000008c, 0x00000029,
+    0x0000008b, 0x0004003d, 0x00000006, 0x0000008d, 0x0000008c, 0x000500ae, 0x0000002f, 0x0000008e,
+    0x00000089, 0x0000008d, 0x000300f7, 0x00000090, 0x00000000, 0x000400fa, 0x0000008e, 0x0000008f,
+    0x00000090, 0x000200f8, 0x0000008f, 0x000200f9, 0x000000a2, 0x000200f8, 0x00000090, 0x000300f7,
+    0x000000ec, 0x00000000, 0x000300fb, 0x0000002e, 0x000000b2, 0x000200f8, 0x000000b2, 0x00050041,
+    0x0000002b, 0x000000b3, 0x00000029, 0x0000002a, 0x0004003d, 0x00000006, 0x000000b4, 0x000000b3,
+    0x000500aa, 0x0000002f, 0x000000b5, 0x000000b4, 0x0000002e, 0x000300f7, 0x000000b7, 0x00000000,
+    0x000400fa, 0x000000b5, 0x000000b6, 0x000000b7, 0x000200f8, 0x000000b6, 0x000200f9, 0x000000ec,
+    0x000200f8, 0x000000b7, 0x000500aa, 0x0000002f, 0x000000ba, 0x000000b4, 0x00000036, 0x000300f7,
+    0x000000bc, 0x00000000, 0x000400fa, 0x000000ba, 0x000000bb, 0x000000bc, 0x000200f8, 0x000000bb,
+    0x000200f9, 0x000000ec, 0x000200f8, 0x000000bc, 0x000500aa, 0x0000002f, 0x000000bf, 0x000000b4,
+    0x0000003e, 0x000300f7, 0x000000c1, 0x00000000, 0x000400fa, 0x000000bf, 0x000000c0, 0x000000c1,
+    0x000200f8, 0x000000c0, 0x000200f9, 0x000000ec, 0x000200f8, 0x000000c1, 0x000500aa, 0x0000002f,
+    0x000000c4, 0x000000b4, 0x00000046, 0x000300f7, 0x000000c6, 0x00000000, 0x000400fa, 0x000000c4,
+    0x000000c5, 0x000000c6, 0x000200f8, 0x000000c5, 0x000200f9, 0x000000ec, 0x000200f8, 0x000000c6,
+    0x000500aa, 0x0000002f, 0x000000c9, 0x000000b4, 0x0000004e, 0x000300f7, 0x000000d2, 0x00000000,
+    0x000400fa, 0x000000c9, 0x000000ca, 0x000000d2, 0x000200f8, 0x000000ca, 0x00050041, 0x0000002b,
+    0x000000cc, 0x00000029, 0x00000054, 0x0004003d, 0x00000006, 0x000000cd, 0x000000cc, 0x00050080,
+    0x00000006, 0x000000ce, 0x000000cd, 0x00000036, 0x00050084, 0x00000006, 0x000000cf, 0x00000053,
+    0x000000ce, 0x000500c6, 0x00000006, 0x000000d0, 0x00000089, 0x000000cf, 0x000500c2, 0x00000006,
+    0x000000f1, 0x000000d0, 0x00000011, 0x000500c6, 0x00000006, 0x000000f3, 0x000000d0, 0x000000f1,
+    0x00050084, 0x00000006, 0x000000f5, 0x000000f3, 0x00000015, 0x000500c2, 0x00000006, 0x000000f7,
+    0x000000f5, 0x00000019, 0x000500c6, 0x00000006, 0x000000f9, 0x000000f5, 0x000000f7, 0x00050084,
+    0x00000006, 0x000000fb, 0x000000f9, 0x0000001d, 0x000500c2, 0x00000006, 0x000000fd, 0x000000fb,
+    0x00000011, 0x000500c6, 0x00000006, 0x000000ff, 0x000000fb, 0x000000fd, 0x000200f9, 0x000000ec,
+    0x000200f8, 0x000000d2, 0x000500aa, 0x0000002f, 0x000000d5, 0x000000b4, 0x0000005f, 0x000300f7,
+    0x000000db, 0x00000000, 0x000400fa, 0x000000d5, 0x000000d6, 0x000000db, 0x000200f8, 0x000000d6,
+    0x00050041, 0x0000002b, 0x000000d7, 0x00000029, 0x00000054, 0x0004003d, 0x00000006, 0x000000d8,
+    0x000000d7, 0x000500c7, 0x00000006, 0x000000d9, 0x000000d8, 0x00000065, 0x000500c4, 0x00000006,
+    0x000000da, 0x00000036, 0x000000d9, 0x000200f9, 0x000000ec, 0x000200f8, 0x000000db, 0x000500aa,
+    0x0000002f, 0x000000de, 0x000000b4, 0x0000006b, 0x000300f7, 0x000000e5, 0x00000000, 0x000400fa,
+    0x000000de, 0x000000df, 0x000000e5, 0x000200f8, 0x000000df, 0x00050041, 0x0000002b, 0x000000e0,
+    0x00000029, 0x00000054, 0x0004003d, 0x00000006, 0x000000e1, 0x000000e0, 0x000500c7, 0x00000006,
+    0x000000e2, 0x000000e1, 0x00000065, 0x000500c4, 0x00000006, 0x000000e3, 0x00000036, 0x000000e2,
+    0x000400c8, 0x00000006, 0x000000e4, 0x000000e3, 0x000200f9, 0x000000ec, 0x000200f8, 0x000000e5,
+    0x000500aa, 0x0000002f, 0x000000e8, 0x000000b4, 0x00000077, 0x000300f7, 0x000000eb, 0x00000000,
+    0x000400fa, 0x000000e8, 0x000000e9, 0x000000eb, 0x000200f8, 0x000000e9, 0x000200f9, 0x000000ec,
+    0x000200f8, 0x000000eb, 0x000200f9, 0x000000ec, 0x000200f8, 0x000000ec, 0x001500f5, 0x00000006,
+    0x00000101, 0x0000002e, 0x000000b6, 0x0000003a, 0x000000bb, 0x00000042, 0x000000c0, 0x0000004a,
+    0x000000c5, 0x000000ff, 0x000000ca, 0x000000da, 0x000000d6, 0x000000e4, 0x000000df, 0x00000089,
+    0x000000e9, 0x0000002e, 0x000000eb, 0x00060041, 0x0000009a, 0x0000009b, 0x00000095, 0x0000008b,
+    0x00000089, 0x0003003e, 0x0000009b, 0x00000101, 0x000200f9, 0x000000a2, 0x000200f8, 0x000000a2,
+    0x000100fd, 0x00010038,
+};
+static const size_t g_vramFillSPIRVSize = sizeof(g_vramFillSPIRV);
 
 // Pre-heat the GPU before VRAM scan to expose thermal-dependent errors.
 // Runs continuous buffer-copy traffic on the bench device for the configured
@@ -5131,7 +5240,9 @@ struct VRAMGpuVerifyState {
     VkShaderModule           shaderModule       = VK_NULL_HANDLE;
     VkDescriptorSetLayout    descSetLayout      = VK_NULL_HANDLE;
     VkPipelineLayout         pipelineLayout     = VK_NULL_HANDLE;
-    VkPipeline               pipeline           = VK_NULL_HANDLE;
+    VkPipeline               pipeline           = VK_NULL_HANDLE;   // verify
+    VkShaderModule           fillModule         = VK_NULL_HANDLE;
+    VkPipeline               fillPipeline       = VK_NULL_HANDLE;   // fill (writes the pattern on-GPU)
     VkDescriptorPool         descPool           = VK_NULL_HANDLE;
     VkDescriptorSet          descSet            = VK_NULL_HANDLE;
     VkBufferAllocation       errorBuf           = {};   // device-local, 1 + 256*3 uints
@@ -5141,6 +5252,8 @@ struct VRAMGpuVerifyState {
 
 void DestroyGpuVerifyState(VRAMGpuVerifyState& s) {
     if (s.pipeline)        vkDestroyPipeline(g_app.benchDevice, s.pipeline, nullptr);
+    if (s.fillPipeline)    vkDestroyPipeline(g_app.benchDevice, s.fillPipeline, nullptr);
+    if (s.fillModule)      vkDestroyShaderModule(g_app.benchDevice, s.fillModule, nullptr);
     if (s.pipelineLayout)  vkDestroyPipelineLayout(g_app.benchDevice, s.pipelineLayout, nullptr);
     if (s.descSetLayout)   vkDestroyDescriptorSetLayout(g_app.benchDevice, s.descSetLayout, nullptr);
     if (s.descPool)        vkDestroyDescriptorPool(g_app.benchDevice, s.descPool, nullptr);
@@ -5213,6 +5326,24 @@ bool InitGpuVerifyState(VRAMGpuVerifyState& s) {
         return false;
     }
 
+    // Fill pipeline: same descriptor/pipeline layout, different shader.
+    VkShaderModuleCreateInfo fsmci = {};
+    fsmci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    fsmci.codeSize = g_vramFillSPIRVSize;
+    fsmci.pCode = g_vramFillSPIRV;
+    if (vkCreateShaderModule(g_app.benchDevice, &fsmci, nullptr, &s.fillModule) != VK_SUCCESS) {
+        Log("[ERROR] GPU fill shader module creation failed");
+        DestroyGpuVerifyState(s);
+        return false;
+    }
+    VkComputePipelineCreateInfo fcpci = cpci;
+    fcpci.stage.module = s.fillModule;
+    if (vkCreateComputePipelines(g_app.benchDevice, VK_NULL_HANDLE, 1, &fcpci, nullptr, &s.fillPipeline) != VK_SUCCESS) {
+        Log("[ERROR] GPU fill pipeline creation failed");
+        DestroyGpuVerifyState(s);
+        return false;
+    }
+
     // Descriptor pool + set
     VkDescriptorPoolSize dps = {};
     dps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -5261,7 +5392,6 @@ bool VerifyChunkOnGPU_Vulkan(VRAMGpuVerifyState& s,
                              std::vector<VRAMError>& errors, size_t& patternErrors)
 {
     if (!s.ready) return false;
-    if (pattern == VRAMTestPattern::Random) return false;
 
     size_t dwordCount = chainBytes / sizeof(uint32_t);
     const size_t errBufBytes = (1 + 256 * 3) * sizeof(uint32_t);
@@ -5302,9 +5432,6 @@ bool VerifyChunkOnGPU_Vulkan(VRAMGpuVerifyState& s,
             0, 1, &mb, 0, nullptr, 0, nullptr);
 
         // Dispatch verify shader
-        vkCmdBindPipeline(g_app.benchCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, s.pipeline);
-        vkCmdBindDescriptorSets(g_app.benchCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                s.pipelineLayout, 0, 1, &s.descSet, 0, nullptr);
         uint32_t pc[4] = {
             static_cast<uint32_t>(dwordCount),
             static_cast<uint32_t>(pattern),
@@ -5313,19 +5440,35 @@ bool VerifyChunkOnGPU_Vulkan(VRAMGpuVerifyState& s,
         };
         // Vulkan guarantees maxComputeWorkGroupCount[0] >= 65535 only. A 512MB
         // chunk needs ~524288 groups, so split into sub-dispatches that each
-        // stay within the guaranteed limit. All sub-dispatches accumulate into
-        // the same error buffer via atomicAdd, so no barrier between them is
-        // needed.
+        // stay within the guaranteed limit.
         const uint32_t THREADS_PER_GROUP = 256;
         const uint32_t MAX_GROUPS_PER_DISPATCH = 65535;
         const uint64_t totalGroups = (static_cast<uint64_t>(dwordCount) + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
-        for (uint64_t groupBase = 0; groupBase < totalGroups; groupBase += MAX_GROUPS_PER_DISPATCH) {
-            uint32_t groupsThis = static_cast<uint32_t>(std::min<uint64_t>(MAX_GROUPS_PER_DISPATCH, totalGroups - groupBase));
-            pc[3] = static_cast<uint32_t>(groupBase * THREADS_PER_GROUP);  // baseIndex (dword offset)
-            vkCmdPushConstants(g_app.benchCommandBuffer, s.pipelineLayout,
-                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-            vkCmdDispatch(g_app.benchCommandBuffer, groupsThis, 1, 1);
-        }
+        auto dispatchAll = [&](VkPipeline pipe) {
+            vkCmdBindPipeline(g_app.benchCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+            vkCmdBindDescriptorSets(g_app.benchCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    s.pipelineLayout, 0, 1, &s.descSet, 0, nullptr);
+            for (uint64_t groupBase = 0; groupBase < totalGroups; groupBase += MAX_GROUPS_PER_DISPATCH) {
+                uint32_t groupsThis = static_cast<uint32_t>(std::min<uint64_t>(MAX_GROUPS_PER_DISPATCH, totalGroups - groupBase));
+                pc[3] = static_cast<uint32_t>(groupBase * THREADS_PER_GROUP);  // baseIndex (dword offset)
+                vkCmdPushConstants(g_app.benchCommandBuffer, s.pipelineLayout,
+                                   VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+                vkCmdDispatch(g_app.benchCommandBuffer, groupsThis, 1, 1);
+            }
+        };
+
+        // 1. FILL: write the pattern straight into VRAM (no PCIe traffic).
+        dispatchAll(s.fillPipeline);
+        // 2. Make the fill's writes visible to the verify shader's reads.
+        VkMemoryBarrier fillBarrier = {};
+        fillBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        fillBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        fillBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(g_app.benchCommandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &fillBarrier, 0, nullptr, 0, nullptr);
+        // 3. VERIFY: compare every dword against the regenerated expected value.
+        dispatchAll(s.pipeline);
 
         // Barrier: shader writes -> transfer reads (readback copy)
         VkMemoryBarrier mb2 = {};
@@ -5442,39 +5585,20 @@ bool VerifyChunkOnGPU_Vulkan(VRAMGpuVerifyState& s,
 // Run a single pattern test using GPU-side compute verification (no full
 // chunk readback). Random pattern unsupported.
 bool RunVRAMPatternTestGpu(VRAMTestPattern pattern, size_t regionSize, size_t regionOffset,
-                           VkBufferAllocation& uploadBuffer,
+                           VkBufferAllocation& /*uploadBuffer*/,
                            VkBufferAllocation& gpuBuffer,
                            VRAMGpuVerifyState& gpuVerify,
                            std::vector<VRAMError>& errors,
                            size_t& totalErrors, int iteration = 0)
 {
+    // Resident GPU test: the fill shader writes the pattern into VRAM and the
+    // verify shader checks it, in one submission. Nothing crosses the bus
+    // except the 4 KB error record buffer.
     if (g_app.vramTestCancelRequested) return false;
-    if (pattern == VRAMTestPattern::Random) return false;
 
     regionSize = regionSize & ~3ULL;
     if (regionSize == 0) return true;
-    size_t dwordCount = regionSize / sizeof(uint32_t);
 
-    // Step 1: generate pattern in upload buffer
-    void* mapped = nullptr;
-    if (vkMapMemory(g_app.benchDevice, uploadBuffer.memory, 0, regionSize, 0, &mapped) != VK_SUCCESS || !mapped) {
-        Log("[ERROR] GPU-verify: upload map failed");
-        return false;
-    }
-    GenerateTestPattern(pattern, static_cast<uint32_t*>(mapped), dwordCount, iteration);
-    vkUnmapMemory(g_app.benchDevice, uploadBuffer.memory);
-
-    // Step 2: copy upload -> gpu
-    BeginBenchCommandBuffer();
-    VkBufferCopy copy = {};
-    copy.size = regionSize;
-    vkCmdCopyBuffer(g_app.benchCommandBuffer, uploadBuffer.buffer, gpuBuffer.buffer, 1, &copy);
-    if (EndAndSubmitBenchCommandBuffer() != FenceWaitResult::Success) {
-        Log("[ERROR] GPU-verify: write fence wait failed");
-        return false;
-    }
-
-    // Step 3: dispatch verify shader, classify errors
     size_t patternErrors = 0;
     if (!VerifyChunkOnGPU_Vulkan(gpuVerify, gpuBuffer, regionSize, pattern, iteration,
                                   regionOffset, errors, patternErrors)) {
@@ -5657,10 +5781,17 @@ void VRAMTestThreadFunc() {
             Log("[WARNING] GPU-verify init failed - falling back to CPU verification");
             useGpuVerify = false;
         } else {
-            Log("GPU-verify enabled: using compute shader to compare patterns "
-                "(skips full chunk readback; Random pattern still uses CPU)");
+            Log("GPU mode: resident fill+verify on the GPU (" + std::to_string(g_app.config.vramGpuPasses) +
+                " pass" + (g_app.config.vramGpuPasses == 1 ? "" : "es") + " per pattern, marching patterns walk 32 bits, "
+                "no PCIe traffic per pass)");
         }
     }
+    if (!useGpuVerify) {
+        Log("CPU mode: every pass is written and read back over the PCIe bus (slow; GPU mode is recommended)");
+    }
+    // GPU mode is fast enough to walk every bit; CPU mode keeps the old short walk.
+    const int marchIters = useGpuVerify ? 32 : MARCH_ITERATIONS;
+    const int gpuPasses = std::max(1, std::min(256, g_app.config.vramGpuPasses));
 
     // ========== MARATHON OUTER LOOP ==========
     int marathonPass = 0;
@@ -5696,13 +5827,25 @@ void VRAMTestThreadFunc() {
         
         size_t chunkErrors = 0;
         bool chunkFailed = false;
+        auto chunkStart = std::chrono::steady_clock::now();
 
         // Lambda: dispatch the right verify path
         auto runPattern = [&](VRAMTestPattern p, int iter, size_t& patErrors) -> bool {
-            if (useGpuVerify && p != VRAMTestPattern::Random) {
-                return RunVRAMPatternTestGpu(p, thisChunkSize, chunkOffset,
-                                             uploadBuffer, gpuBuffer, gpuVerify,
-                                             allErrors, patErrors, iter);
+            if (useGpuVerify) {
+                // Marching patterns: `iter` selects the bit and every pass repeats
+                // it. Other patterns: the pass index is the iteration, so Random
+                // gets fresh data on every pass.
+                bool marching = (p == VRAMTestPattern::MarchingOnes || p == VRAMTestPattern::MarchingZeros);
+                for (int pass = 0; pass < gpuPasses; ++pass) {
+                    if (g_app.vramTestCancelRequested) return false;
+                    int it = marching ? iter : pass;
+                    if (!RunVRAMPatternTestGpu(p, thisChunkSize, chunkOffset,
+                                               uploadBuffer, gpuBuffer, gpuVerify,
+                                               allErrors, patErrors, it)) {
+                        return false;
+                    }
+                }
+                return true;
             }
             return RunVRAMPatternTest(p, thisChunkSize, chunkOffset,
                                       uploadBuffer, gpuBuffer, readbackBuffer,
@@ -5734,7 +5877,7 @@ void VRAMTestThreadFunc() {
             SetVramPattern("Marching ones [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]");
             g_app.fenceTimeoutCount = 0;
 
-            for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
+            for (int iter = 0; iter < marchIters && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
                 size_t marchErrors = 0;
                 if (!runPattern(VRAMTestPattern::MarchingOnes, iter, marchErrors)) {
                     chunkFailed = true;
@@ -5749,7 +5892,7 @@ void VRAMTestThreadFunc() {
             SetVramPattern("Marching zeros [" + std::to_string(chunkNum + 1) + "/" + std::to_string(numChunks) + "]");
             g_app.fenceTimeoutCount = 0;
 
-            for (int iter = 0; iter < MARCH_ITERATIONS && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
+            for (int iter = 0; iter < marchIters && !g_app.vramTestCancelRequested && !chunkFailed; ++iter) {
                 size_t marchErrors = 0;
                 if (!runPattern(VRAMTestPattern::MarchingZeros, iter, marchErrors)) {
                     chunkFailed = true;
@@ -5849,7 +5992,12 @@ void VRAMTestThreadFunc() {
         
         std::string chunkResult = chunkFailed ? "INCOMPLETE" : 
                                   (chunkErrors == 0) ? "PASS" : "FAIL (" + std::to_string(chunkErrors) + " errors)";
-        Log("  Chunk " + std::to_string(chunkNum + 1) + " result: " + chunkResult);
+        {
+            double chunkSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - chunkStart).count();
+            char tbuf[48];
+            snprintf(tbuf, sizeof(tbuf), " (%.1f s)", chunkSec);
+            Log("  Chunk " + std::to_string(chunkNum + 1) + " result: " + chunkResult + tbuf);
+        }
         
         if (chunkFailed && !g_app.vramTestCancelRequested) {
             hadCriticalFailure = true;
@@ -6686,7 +6834,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v3.4 GUI");
+    ImGui::Text("GPU-PCIe-Test v3.5 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -7184,10 +7332,26 @@ void RenderGUI() {
                 markCustomIfChanged(true);
             }
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Use a compute shader to compare patterns on the GPU\n"
-                                 "instead of reading back to CPU. Much higher throughput\n"
-                                 "(no PCIe round-trip on every chunk). Random pattern still\n"
-                                 "uses CPU verify since its RNG cannot be replicated in GLSL.");
+                ImGui::SetTooltip("Resident GPU testing (memtest_vulkan-style): a compute shader\n"
+                                 "writes each pattern straight into VRAM and a second shader\n"
+                                 "verifies it, so a pass runs at VRAM speed and never crosses\n"
+                                 "the PCIe bus. Random uses a GPU hash. Marching patterns walk\n"
+                                 "all 32 bits. Off = legacy CPU readback compare (slow, bus-bound).");
+            }
+            if (g_app.config.vramGpuVerify) {
+                int passes = g_app.config.vramGpuPasses;
+                ImGui::Indent();
+                ImGui::SetNextItemWidth(200);
+                if (ImGui::SliderInt("Passes per pattern", &passes, 1, 256, "%d", ImGuiSliderFlags_Logarithmic)) {
+                    g_app.config.vramGpuPasses = passes;
+                    markCustomIfChanged(true);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Fill+verify repetitions per pattern per chunk. Each pass\n"
+                                     "rewrites the chunk (new random data every pass). More passes\n"
+                                     "catch marginal cells that only fail intermittently or hot.");
+                }
+                ImGui::Unindent();
             }
 
             ImGui::TreePop();
@@ -8289,7 +8453,7 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v3.4 GUI Edition (Vulkan)");
+        ImGui::Text("GPU-PCIe-Test v3.5 GUI Edition (Vulkan)");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
@@ -8616,7 +8780,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.4 GUI (Vulkan)",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.5 GUI (Vulkan)",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,

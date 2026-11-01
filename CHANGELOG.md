@@ -2,6 +2,24 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.5.0] - 2026-11-01
+
+### Added
+- **Resident GPU VRAM testing (memtest_vulkan-style).** A new fill compute shader
+  writes every pattern straight into VRAM and the verify shader checks it, in one
+  submission per pass. A pass no longer crosses the PCIe bus at all, so on an eGPU
+  a 512 MB chunk pass drops from ~250 ms of tunnel traffic to a few milliseconds
+  of VRAM bandwidth. GPU mode is now the default; the CPU readback path remains
+  as a fallback and is labelled as slow.
+- **Random pattern on the GPU** via a lowbias32 hash of the dword index and pass
+  number, so it no longer needs CPU-generated data and gets fresh values every pass.
+- **Passes per pattern** setting (Quick 1, Standard 4, Deep 16, Thorough and
+  Marathon 64; 1-256 in Custom). Marginal cells that fail intermittently or only
+  when hot need many write/read cycles, which the old single pass could not give.
+- **Marching ones/zeros walk all 32 bits** in GPU mode (the CPU path kept its
+  4-bit walk for speed).
+- Per-chunk timing in the log.
+
 ## [3.4.4] - 2026-09-05
 
 ### Changed

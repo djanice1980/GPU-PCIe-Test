@@ -1,0 +1,50 @@
+#version 450
+
+// GPU-side VRAM pattern FILL compute shader (memtest_vulkan-style resident
+// testing). Writes the expected value for every dword straight into VRAM so a
+// test pass never crosses the PCIe bus. Must stay in sync with vram_verify.comp.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) restrict writeonly buffer ChainBuf {
+    uint data[];
+} chainBuf;
+
+layout(set = 0, binding = 1) buffer ErrorBuf {   // unused here; same layout as verify
+    uint count;
+    uint records[];
+} errBuf;
+
+layout(push_constant) uniform Params {
+    uint dwordCount;
+    uint patternType;   // matches VRAMTestPattern enum
+    uint patternIter;   // iteration / pass index (varies marching bit and random seed)
+    uint baseIndex;     // dword offset added per sub-dispatch (workgroup-count cap)
+} pc;
+
+// 32-bit integer hash (lowbias32, Chris Wellons). Reproducible on GPU and in
+// C++ so the Random pattern needs no CPU-generated data.
+uint Hash32(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+uint GenerateExpected(uint i) {
+    if (pc.patternType == 0u) return 0u;                                    // AllZeros
+    if (pc.patternType == 1u) return 0xFFFFFFFFu;                           // AllOnes
+    if (pc.patternType == 2u) return 0xAAAAAAAAu;                           // Checkerboard
+    if (pc.patternType == 3u) return 0x55555555u;                           // InverseCheckerboard
+    if (pc.patternType == 4u) return Hash32(i ^ (0x9E3779B9u * (pc.patternIter + 1u)));  // Random
+    if (pc.patternType == 5u) return 1u << (pc.patternIter & 31u);          // MarchingOnes
+    if (pc.patternType == 6u) return ~(1u << (pc.patternIter & 31u));       // MarchingZeros
+    if (pc.patternType == 7u) return i;                                     // AddressPattern
+    return 0u;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x + pc.baseIndex;
+    if (i >= pc.dwordCount) return;
+    chainBuf.data[i] = GenerateExpected(i);
+}

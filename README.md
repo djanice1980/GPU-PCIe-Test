@@ -17,7 +17,8 @@ A tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Measures re
 
 ### VRAM Integrity Scanning
 - **Multi-chunk testing** - Tests up to 80-90% of VRAM by cycling through multiple allocations
-- **8 test patterns** - Zeros, ones, checkerboard, inverse checkerboard, address, random, marching ones, marching zeros
+- **Resident GPU testing** - Compute shaders write and verify every pattern inside VRAM (memtest_vulkan-style), so a pass runs at VRAM speed and never crosses the PCIe bus; configurable passes per pattern
+- **8 test patterns** - Zeros, ones, checkerboard, inverse checkerboard, address, random, marching ones and zeros (all 32 bits)
 - **Error clustering** - Groups nearby faults for easier diagnosis
 - **Progress tracking** - Real-time progress with cancellation support
 
@@ -140,14 +141,18 @@ See [Linux/Linux_README.md](Linux/Linux_README.md) for detailed instructions and
 Uses D3D12 copy operations between upload heaps (CPU-visible) and default heaps (GPU-local) with fence synchronization for accurate timing.
 
 ### VRAM Scanning
-1. Allocates 512MB test buffers (upload, GPU, readback)
-2. For each chunk (up to 25+ chunks for 80% coverage):
-   - Writes test pattern to upload buffer
-   - Copies to GPU buffer
-   - Copies back to readback buffer
-   - Compares against expected pattern
-   - Releases and reallocates to potentially hit different physical VRAM
-3. Reports errors by pattern type and memory region
+1. Allocates a 512MB chunk in VRAM (fresh allocation per chunk to walk physical memory)
+2. For each chunk and pattern, a compute shader **fills** the chunk with the expected
+   value per dword and a second shader **verifies** it, N passes per pattern (Random
+   gets fresh data every pass, marching patterns walk all 32 bits). Only the 4 KB error
+   record buffer ever crosses the PCIe bus. This is the same approach as memtest_vulkan;
+   for multi-hour burn-in use the Marathon preset.
+3. Optional refresh check re-reads a random fill after a delay (data-retention faults)
+4. Reports errors clustered by region with bit-flip histogram and stuck-at / single-bit /
+   multi-bit / address-bus classification
+
+The legacy CPU path (write over the bus, read back, compare on the CPU) remains as a
+fallback when the GPU has no compute queue; it is bus-bound and much slower.
 
 ### Interface Detection
 Queries PCIe link status registers via DXGI and applies heuristics for:
