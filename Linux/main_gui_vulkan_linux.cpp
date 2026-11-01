@@ -1523,10 +1523,27 @@ void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo&
         // DDR6 dual-channel realistic: ~164 GB/s (DDR6-12800 base)
         // DDR5 dual-channel realistic: ~70 GB/s
         // DDR4 dual-channel realistic: ~40 GB/s
-        // No SMBIOS data: speed, width and channel count are all unknown, so
-        // there is no baseline. Report n/a rather than a percentage of a guess.
-        expectedBandwidth = 0.0;
-        bandwidthSource = "unknown memory configuration (Help > Read memory details)";
+        // No SMBIOS data (speed, width and channel count unknown): compare
+        // against the memory standard whose theoretical bandwidth is nearest to
+        // the measured read+write traffic, and say so. Same idea as the
+        // discrete path's nearest-interface match; never a fixed guess.
+        double traffic = 2.0 * maxBandwidth;
+        const InterfaceSpeed* nearest = nullptr;
+        double bestDiff = 1e9;
+        for (int i = 0; i < NUM_MEMORY_STANDARDS; ++i) {
+            double diff = std::abs(traffic - MEMORY_STANDARDS[i].theoretical);
+            if (diff < bestDiff) { bestDiff = diff; nearest = &MEMORY_STANDARDS[i]; }
+        }
+        if (nearest) {
+            expectedBandwidth = nearest->theoretical;
+            char nb[160];
+            snprintf(nb, sizeof(nb), "%s (%.0f GB/s theoretical) - nearest standard, memory not detected",
+                     nearest->name, nearest->theoretical);
+            bandwidthSource = nb;
+        } else {
+            expectedBandwidth = 0.0;
+            bandwidthSource = "unknown memory configuration (Help > Read memory details)";
+        }
     }
     
     g_app.closestUploadStandard = bandwidthSource;

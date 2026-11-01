@@ -19,8 +19,10 @@ All notable changes to GPU-PCIe-Test will be documented in this file.
 - **No more percentages of a guessed standard.** Without SMBIOS data (an
   unprivileged Linux run) the integrated-GPU comparison showed "157% of DDR5
   (estimated)" against a hard-coded figure. With no baseline every display
-  now says "n/a - unknown memory configuration" and points at Help > Read
-  memory details.
+  now compares against the memory standard whose theoretical bandwidth is
+  nearest to the measured read+write traffic, labelled as a nearest match with
+  memory not detected (the same idea as the discrete path's nearest-interface
+  match), and points at Help > Read memory details for the real figure.
 - **Comparison table columns** are sized from the font instead of fixed
   pixels (the Bandwidth column truncated to "225.30 GE" at larger UI scales)
   and are user-resizable.
