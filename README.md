@@ -19,7 +19,10 @@ A tool to benchmark GPU/PCIe bandwidth, latency, and VRAM integrity. Measures re
 - **Multi-chunk testing** - Tests up to 80-90% of VRAM by cycling through multiple allocations
 - **Resident GPU testing** - Compute shaders write and verify every pattern inside VRAM (memtest_vulkan-style), so a pass runs at VRAM speed and never crosses the PCIe bus; configurable passes per pattern
 - **8 test patterns** - Zeros, ones, checkerboard, inverse checkerboard, address, random, marching ones and zeros (all 32 bits)
-- **Error clustering** - Groups nearby faults for easier diagnosis
+- **Live telemetry** - Passes, GB written and verified, GB/s and elapsed time per chunk and running, in the log and the status line
+- **Error clustering and bit-level tables** - Faults grouped by address range with expected/actual values and classification; bit-index, bits-flipped and ones-in-value histograms in the log
+- **Marathon 5-minute checkpoint** - A fixed-length PASS/FAIL checkpoint comparable to memtest_vulkan's standard test, then endless testing
+- **Copy or save the log** - Buttons at the top of the log panel and under File
 - **Progress tracking** - Real-time progress with cancellation support
 
 ### Hardware Detection

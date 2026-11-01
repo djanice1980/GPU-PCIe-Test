@@ -2,6 +2,25 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.6.0] - 2026-11-01
+
+### Added
+- **Scan telemetry.** Every chunk line now reports passes, GB written, GB
+  verified, elapsed time and GB/s; the status line under the progress bar shows
+  the running totals, current throughput and elapsed time; the final summary
+  adds total work, average fill+verify throughput and the error count as a
+  fraction of dwords checked.
+- **Bit-level error tables in the log.** On a failed scan the log lists every
+  error region with pattern, classification, first expected/actual values and
+  the flipped bit, followed by histograms of bit index flipped, bits flipped per
+  bad dword and ones in the bad value, plus error-kind and refresh counts.
+- **Marathon 5-minute checkpoint**: a fixed PASS/FAIL line at five minutes,
+  comparable to memtest_vulkan's standard test, then the endless part continues.
+- **Copy / Save log** buttons at the top of the log panel, a Save button next
+  to the existing bottom Copy button, and both under the File menu. Save uses
+  the same native dialog as CSV export. Log retention raised from 500 to 4000
+  lines so a long scan's header survives.
+
 ## [3.5.1] - 2026-11-01
 
 ### Fixed

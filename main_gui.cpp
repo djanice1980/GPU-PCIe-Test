@@ -1,5 +1,5 @@
 // ============================================================================
-// GPU-PCIe-Test v3.5 - GUI Edition
+// GPU-PCIe-Test v3.6 - GUI Edition
 // Dear ImGui + D3D12 Frontend
 // ============================================================================
 // Graphical frontend for the GPU/PCIe benchmark tool.
@@ -127,6 +127,7 @@
 #include <iomanip>
 #include <cmath>
 #include <map>
+#include <tuple>
 #include <set>
 #include <random>
 #include <array>
@@ -186,7 +187,7 @@ namespace Constants {
     constexpr double TB5_MAX_BANDWIDTH = 7.5;         // Thunderbolt 5 / USB4 80Gbps typical max (64 Gbps PCIe tunnel)
 
     // Log and UI limits
-    constexpr int MAX_LOG_LINES = 500;
+    constexpr int MAX_LOG_LINES = 4000;   // a Marathon scan logs a line per chunk; keep the header reachable
 
     // VRAM scanning chunk sizes
     constexpr size_t VRAM_CHUNK_PREFERRED = 512ull * 1024 * 1024;  // 512 MB per chunk
@@ -350,6 +351,11 @@ struct VRAMTestResult {
 
     // Aggregate bit-level error stats (across ALL chunks and patterns):
     std::array<size_t, 32> bitFlipHistogram = {};  // bitFlipHistogram[b] = times bit b flipped
+    std::array<size_t, 33> flipCountHistogram = {};    // bits flipped per bad dword (0..32)
+    std::array<size_t, 33> onesInValueHistogram = {};  // popcount of the value read back (0..32)
+    uint64_t totalBytesWritten = 0;
+    uint64_t totalBytesVerified = 0;
+    uint64_t totalPasses = 0;
     std::array<size_t, 6>  errorKindCounts  = {};  // Indexed by VRAMErrorKind enum order
     size_t refreshPassErrors = 0;                  // Errors detected during re-read phase only
 };
@@ -658,6 +664,11 @@ struct AppContext {
     std::thread vramTestThread;
     VRAMTestResult vramTestResult;
     std::atomic<float> vramTestProgress{ 0.0f };
+    std::atomic<uint64_t> vramBytesWritten{ 0 };   // live telemetry for the status line
+    std::atomic<uint64_t> vramBytesVerified{ 0 };
+    std::atomic<uint64_t> vramPasses{ 0 };
+    std::atomic<float>    vramThroughputGBs{ 0.0f };
+    std::atomic<float>    vramElapsedSec{ 0.0f };
     std::string vramTestCurrentPattern;
     bool showVRAMTestWindow = false;
     // (Coverage is now driven by g_app.config.vramCoveragePercent - see BenchmarkConfig)
@@ -3924,6 +3935,8 @@ static void RecordDwordError(uint32_t expected, uint32_t actual, size_t byteOffs
         for (int b = 0; b < 32; ++b) {
             if (flipMask & (1u << b)) aggResult->bitFlipHistogram[b]++;
         }
+        aggResult->flipCountHistogram[std::min<uint32_t>(flipCount, 32u)]++;
+        aggResult->onesInValueHistogram[std::min<uint32_t>(PopCount32(actual), 32u)]++;
         size_t kindIdx = static_cast<size_t>(kind);
         if (kindIdx < aggResult->errorKindCounts.size()) {
             aggResult->errorKindCounts[kindIdx]++;
@@ -4723,6 +4736,8 @@ bool VerifyChunkOnGPU(VRAMGpuVerifyState& gpuState,
         for (int b = 0; b < 32; ++b) {
             if (flipMask & (1u << b)) g_app.vramTestResult.bitFlipHistogram[b]++;
         }
+        g_app.vramTestResult.flipCountHistogram[std::min<uint32_t>(flipCount, 32u)]++;
+        g_app.vramTestResult.onesInValueHistogram[std::min<uint32_t>(PopCount32(actVal), 32u)]++;
         size_t kindIdx = static_cast<size_t>(kind);
         if (kindIdx < g_app.vramTestResult.errorKindCounts.size()) {
             g_app.vramTestResult.errorKindCounts[kindIdx]++;
@@ -4780,8 +4795,10 @@ void VRAMTestThreadFunc() {
     Log("For chip-level diagnosis, use manufacturer tools.");
     Log("");
     
-    g_app.vramTestResult = {};  // Reset results
+    g_app.vramTestResult = {};
     g_app.vramTestProgress = 0.0f;
+    g_app.vramBytesWritten = 0; g_app.vramBytesVerified = 0; g_app.vramPasses = 0;
+    g_app.vramThroughputGBs = 0.0f; g_app.vramElapsedSec = 0.0f;
     
     // Reset fence timeout counter for fresh start
     g_app.fenceTimeoutCount = 0;
@@ -4975,6 +4992,7 @@ void VRAMTestThreadFunc() {
     // In Marathon mode, the whole chunk loop repeats indefinitely. Each
     // iteration is a "pass". The user cancels when they've heard enough.
     int marathonPass = 0;
+    bool standardCheckpointLogged = false;
     do {
         marathonPass++;
         if (g_app.config.vramMarathonMode) {
@@ -5012,6 +5030,8 @@ void VRAMTestThreadFunc() {
         size_t chunkErrors = 0;
         bool chunkFailed = false;
         auto chunkStart = std::chrono::steady_clock::now();
+        uint64_t chunkWritten = 0, chunkVerified = 0;  // bytes moved through VRAM this chunk
+        int chunkPasses = 0;
         
         // Helper lambda: pick the right verify path (GPU if enabled and pattern
         // != Random, otherwise CPU). Returns false on actual failure (not
@@ -5030,12 +5050,15 @@ void VRAMTestThreadFunc() {
                                                allErrors, patErrors, it)) {
                         return false;
                     }
+                    chunkWritten += thisChunkSize; chunkVerified += thisChunkSize; chunkPasses++;
                 }
                 return true;
             }
-            return RunVRAMPatternTest(p, thisChunkSize, chunkOffset,
-                                      uploadBuffer, gpuBuffer, readbackBuffer,
-                                      allErrors, patErrors, iter);
+            bool ok = RunVRAMPatternTest(p, thisChunkSize, chunkOffset,
+                                         uploadBuffer, gpuBuffer, readbackBuffer,
+                                         allErrors, patErrors, iter);
+            if (ok) { chunkWritten += thisChunkSize; chunkVerified += thisChunkSize; chunkPasses++; }
+            return ok;
         };
 
         // Run basic patterns on this chunk
@@ -5126,6 +5149,7 @@ void VRAMTestThreadFunc() {
                 ID3D12CommandList* writeList[] = { g_app.benchList.Get() };
                 g_app.benchQueue->ExecuteCommandLists(1, writeList);
                 if (WaitForBenchFenceEx() == FenceWaitResult::Success) {
+                    chunkWritten += regionSize;
                     // Step 2: re-read N times with brief delays
                     for (int rr = 0; rr < rereadIters && !g_app.vramTestCancelRequested && !chunkFailed; ++rr) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(250));
@@ -5156,6 +5180,7 @@ void VRAMTestThreadFunc() {
                                        &g_app.vramTestResult, true);
                         readbackBuffer->Unmap(0, nullptr);
                         chunkErrors += refreshErrors;
+                        chunkVerified += regionSize;
                     }
                 } else {
                     Log("[WARNING] Refresh check initial write fence wait failed");
@@ -5179,10 +5204,38 @@ void VRAMTestThreadFunc() {
         std::string chunkResult = chunkFailed ? "INCOMPLETE" : 
                                   (chunkErrors == 0) ? "PASS" : "FAIL (" + std::to_string(chunkErrors) + " errors)";
         {
-            double chunkSec = std::chrono::duration<double>(std::chrono::steady_clock::now() - chunkStart).count();
-            char tbuf[48];
-            snprintf(tbuf, sizeof(tbuf), " (%.1f s)", chunkSec);
+            auto now = std::chrono::steady_clock::now();
+            double chunkSec = std::chrono::duration<double>(now - chunkStart).count();
+            double gbW = chunkWritten / 1e9, gbV = chunkVerified / 1e9;
+            double rate = chunkSec > 0 ? (gbW + gbV) / chunkSec : 0.0;
+            char tbuf[192];
+            snprintf(tbuf, sizeof(tbuf), " - %d passes, %.1f GB written, %.1f GB verified in %.1f s (%.0f GB/s)",
+                     chunkPasses, gbW, gbV, chunkSec, rate);
             Log("  Chunk " + std::to_string(chunkNum + 1) + " result: " + chunkResult + tbuf);
+
+            // Running totals (also shown live under the progress bar)
+            g_app.vramTestResult.totalBytesWritten  += chunkWritten;
+            g_app.vramTestResult.totalBytesVerified += chunkVerified;
+            g_app.vramTestResult.totalPasses        += chunkPasses;
+            g_app.vramBytesWritten  = g_app.vramTestResult.totalBytesWritten;
+            g_app.vramBytesVerified = g_app.vramTestResult.totalBytesVerified;
+            g_app.vramPasses        = g_app.vramTestResult.totalPasses;
+            g_app.vramThroughputGBs = static_cast<float>(rate);
+            double elapsedTotal = std::chrono::duration<double>(now - startTime).count();
+            g_app.vramElapsedSec = static_cast<float>(elapsedTotal);
+
+            // Marathon: a fixed 5-minute checkpoint, comparable to memtest_vulkan's
+            // standard test, before the endless part.
+            if (g_app.config.vramMarathonMode && !standardCheckpointLogged && elapsedTotal >= 300.0) {
+                standardCheckpointLogged = true;
+                char cbuf[256];
+                snprintf(cbuf, sizeof(cbuf), "=== 5-minute standard checkpoint: %s - %llu passes, %.1f GB written, %.1f GB verified, %zu errors ===",
+                         (totalErrors == 0 && !hadCriticalFailure) ? "PASS" : "FAIL",
+                         (unsigned long long)g_app.vramTestResult.totalPasses,
+                         g_app.vramTestResult.totalBytesWritten / 1e9, g_app.vramTestResult.totalBytesVerified / 1e9, totalErrors);
+                Log(cbuf);
+                Log("    (Marathon continues until cancelled; testing beyond ~2 hours rarely adds information)");
+            }
         }
         
         if (chunkFailed && !g_app.vramTestCancelRequested) {
@@ -5234,6 +5287,18 @@ void VRAMTestThreadFunc() {
     char durationBuf[64];
     snprintf(durationBuf, sizeof(durationBuf), "Duration: %.1f seconds", duration);
     Log(durationBuf);
+    {
+        const auto& r = g_app.vramTestResult;
+        double gbW = r.totalBytesWritten / 1e9, gbV = r.totalBytesVerified / 1e9;
+        char wbuf[256];
+        snprintf(wbuf, sizeof(wbuf), "Work: %llu passes, %.1f GB written, %.1f GB verified, %.0f GB/s average fill+verify",
+                 (unsigned long long)r.totalPasses, gbW, gbV, duration > 0 ? (gbW + gbV) / duration : 0.0);
+        Log(wbuf);
+        unsigned long long dwords = r.totalBytesVerified / 4;
+        snprintf(wbuf, sizeof(wbuf), "Errors: %zu of %llu dwords checked (%.8f%%)",
+                 totalErrors, dwords, dwords ? 100.0 * (double)totalErrors / (double)dwords : 0.0);
+        Log(wbuf);
+    }
     
     if (totalErrors == 0 && g_app.vramTestResult.incomplete) {
         Log("Result: INCOMPLETE - scan aborted after " + FormatSize(totalBytesTested) + " (see errors above). This is NOT a pass.");
@@ -5247,16 +5312,62 @@ void VRAMTestThreadFunc() {
         
         // Log error clusters
         Log("");
-        Log("Error Regions:");
-        for (const auto& err : g_app.vramTestResult.errors) {
-            if (err.errorCount > 0) {
-                Log("  " + FormatErrorAddress(err.offsetStart) + " - " + 
-                    FormatErrorAddress(err.offsetEnd) + " (" + 
-                    std::to_string(err.errorCount) + " errors, pattern: " + 
-                    GetPatternName(err.pattern) + ")");
+        {
+            // A bad cell is hit on every pass and by every pattern, so the raw
+            // list repeats. Merge by address range + pattern + kind and count
+            // how many passes hit it; memtest-style aggregation.
+            struct MergedRegion { VRAMError first; size_t errors = 0; size_t hits = 0; };
+            std::map<std::tuple<size_t, size_t, int, int>, MergedRegion> merged;
+            for (const auto& err : g_app.vramTestResult.errors) {
+                if (err.errorCount == 0) continue;
+                auto key = std::make_tuple(err.offsetStart, err.offsetEnd, static_cast<int>(err.pattern), static_cast<int>(err.kind));
+                auto& m = merged[key];
+                if (m.hits == 0) m.first = err;
+                m.errors += err.errorCount;
+                m.hits++;
+            }
+            Log("Error Regions (" + std::to_string(merged.size()) + " distinct, " +
+                std::to_string(g_app.vramTestResult.errors.size()) + " reports):");
+            const size_t MAX_PRINTED = 200;
+            size_t printed = 0;
+            for (const auto& kv : merged) {
+                if (++printed > MAX_PRINTED) {
+                    Log("  ... and " + std::to_string(merged.size() - MAX_PRINTED) + " more distinct regions");
+                    break;
+                }
+                const VRAMError& err = kv.second.first;
+                char ebuf[240];
+                snprintf(ebuf, sizeof(ebuf), " (%zu errors in %zu pass%s, %s, %s, first: expected 0x%08X actual 0x%08X, %u bit%s flipped%s)",
+                         kv.second.errors, kv.second.hits, kv.second.hits == 1 ? "" : "es",
+                         GetPatternName(err.pattern).c_str(), GetErrorKindName(err.kind),
+                         err.expected, err.actual, err.bitFlipCount, err.bitFlipCount == 1 ? "" : "s",
+                         err.bitIndex >= 0 ? (" at bit " + std::to_string(err.bitIndex)).c_str() : "");
+                Log("  " + FormatErrorAddress(err.offsetStart) + " - " + FormatErrorAddress(err.offsetEnd) + ebuf);
             }
         }
         
+        Log("");
+        {
+            const auto& res = g_app.vramTestResult;
+            auto logHistogram = [](const char* title, const size_t* bins, int count) {
+                std::string line = title;
+                bool any = false;
+                for (int i = 0; i < count; ++i) {
+                    if (bins[i]) { line += " " + std::to_string(i) + ":" + std::to_string(bins[i]); any = true; }
+                }
+                Log(any ? line : std::string(title) + " (none)");
+            };
+            Log("Bit-level statistics (index:count, zero entries omitted):");
+            logHistogram("  Bit index flipped         ", res.bitFlipHistogram.data(), 32);
+            logHistogram("  Bits flipped per bad dword", res.flipCountHistogram.data(), 33);
+            logHistogram("  Ones in bad value         ", res.onesInValueHistogram.data(), 33);
+            std::string kinds = "  Error kinds:";
+            for (size_t k = 0; k < res.errorKindCounts.size(); ++k) {
+                if (res.errorKindCounts[k]) kinds += " " + std::string(GetErrorKindName(static_cast<VRAMErrorKind>(k))) + ":" + std::to_string(res.errorKindCounts[k]);
+            }
+            Log(kinds);
+            if (res.refreshPassErrors) Log("  Refresh (retention) errors: " + std::to_string(res.refreshPassErrors));
+        }
         Log("");
         Log("NOTE: Error addresses are logical offsets in the test buffer,");
         Log("not physical VRAM addresses. For chip-level diagnosis, use");
@@ -5846,9 +5957,9 @@ std::string DefaultCsvFileName() {
 // "" if cancelled. Starts in the Documents folder. (Previously the file was
 // written silently to the process's working directory, which for a launch
 // from the Start menu is somewhere the user never looks.)
-std::string ChooseCsvSavePath() {
+std::string ChooseSavePath(const std::string& defaultName, bool csv) {
     wchar_t path[MAX_PATH] = {};
-    std::wstring wdef = Utf8ToWide(DefaultCsvFileName());
+    std::wstring wdef = Utf8ToWide(defaultName);
     wcsncpy_s(path, MAX_PATH, wdef.c_str(), _TRUNCATE);
 
     wchar_t docs[MAX_PATH] = {};
@@ -5857,16 +5968,19 @@ std::string ChooseCsvSavePath() {
     OPENFILENAMEW ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_app.hwnd;
-    ofn.lpstrFilter = L"CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0";
+    ofn.lpstrFilter = csv ? L"CSV files (*.csv)\0*.csv\0All files (*.*)\0*.*\0"
+                          : L"Log files (*.log;*.txt)\0*.log;*.txt\0All files (*.*)\0*.*\0";
     ofn.lpstrFile = path;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrInitialDir = haveDocs ? docs : nullptr;
-    ofn.lpstrDefExt = L"csv";
-    ofn.lpstrTitle = L"Export benchmark results";
+    ofn.lpstrDefExt = csv ? L"csv" : L"log";
+    ofn.lpstrTitle = csv ? L"Export benchmark results" : L"Save log";
     ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     if (!GetSaveFileNameW(&ofn)) return "";
     return WideToUtf8(path);
 }
+
+std::string ChooseCsvSavePath() { return ChooseSavePath(DefaultCsvFileName(), true); }
 
 void ExportCSV(const std::string& filename) {
     std::ofstream file(filename);
@@ -5925,6 +6039,29 @@ void ExportBenchmarkCsvInteractive() {
     ExportCSV(path);
 }
 
+// Whole log as one string (for the clipboard and for saving).
+std::string GetLogText() {
+    std::lock_guard<std::mutex> lock(g_app.logMutex);
+    std::string all;
+    for (const auto& line : g_app.logLines) all += line + "\n";
+    return all;
+}
+
+std::string DefaultLogFileName() {
+    std::string n = DefaultCsvFileName();
+    return n.substr(0, n.size() - 4) + ".log";
+}
+
+void SaveLogInteractive() {
+    std::string path = ChooseSavePath(DefaultLogFileName(), false);
+    if (path.empty()) { Log("Save log cancelled"); return; }
+    std::ofstream f(path);
+    if (!f) { Log("[ERROR] Failed to open " + path); return; }
+    f << GetLogText();
+    f.close();
+    Log("Log saved to " + path);
+}
+
 // ============================================================================
 //                             GUI RENDERING
 // ============================================================================
@@ -5962,6 +6099,9 @@ void RenderGUI() {
     // ========== Top Menu Bar (moved About here) ==========
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
+            if (ImGui::MenuItem("Copy Log to Clipboard")) ImGui::SetClipboardText(GetLogText().c_str());
+            if (ImGui::MenuItem("Save Log...")) SaveLogInteractive();
+            ImGui::Separator();
             if (ImGui::MenuItem("Export CSV", nullptr, false, g_app.state == AppState::Completed)) {
                 ExportBenchmarkCsvInteractive();
             }
@@ -6012,7 +6152,7 @@ void RenderGUI() {
     ImGui::SetNextWindowSize(ImVec2(configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Configuration", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
 
-    ImGui::Text("GPU-PCIe-Test v3.5 GUI");
+    ImGui::Text("GPU-PCIe-Test v3.6 GUI");
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -6604,8 +6744,15 @@ void RenderGUI() {
         // Show VRAM test progress
         ImGui::Spacing();
         ImGui::ProgressBar(g_app.vramTestProgress, ImVec2(-1, 20));
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern: %s", 
-                          GetVramPattern().c_str());
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern: %s", GetVramPattern().c_str());
+        {
+            double w = g_app.vramBytesWritten.load() / 1e9, v = g_app.vramBytesVerified.load() / 1e9;
+            float el = g_app.vramElapsedSec.load();
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f),
+                "Passes: %llu | Written: %.1f GB | Verified: %.1f GB | %.0f GB/s | %02d:%02d elapsed",
+                (unsigned long long)g_app.vramPasses.load(), w, v, g_app.vramThroughputGBs.load(),
+                (int)el / 60, (int)el % 60);
+        }
     }
     
     // Show VRAM test results button if test completed
@@ -6631,6 +6778,21 @@ void RenderGUI() {
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + configWidth, viewport->WorkPos.y));
     ImGui::SetNextWindowSize(ImVec2(viewport->WorkSize.x - configWidth, viewport->WorkSize.y - progressHeight));
     ImGui::Begin("Output Log", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+
+    // Header row: the log is what goes into bug reports, so copy/save sit at
+    // the top where they are seen (also under File).
+    if (ImGui::SmallButton("Copy log")) ImGui::SetClipboardText(GetLogText().c_str());
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the whole log to the clipboard");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Save log...")) SaveLogInteractive();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear")) ClearLog();
+    ImGui::SameLine();
+    {
+        size_t nLines;
+        { std::lock_guard<std::mutex> lock(g_app.logMutex); nLines = g_app.logLines.size(); }
+        ImGui::TextDisabled("%zu lines", nLines);
+    }
 
     // Scrollable log area
     ImGui::BeginChild("LogScroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
@@ -6670,13 +6832,12 @@ void RenderGUI() {
     ImGui::EndChild();
 
     ImGui::Separator();
-    if (ImGui::Button("Copy Log to Clipboard", ImVec2(-1, 0))) {
-        std::lock_guard<std::mutex> lock(g_app.logMutex);
-        std::string allLog;
-        for (const auto& line : g_app.logLines) {
-            allLog += line + "\n";
-        }
-        ImGui::SetClipboardText(allLog.c_str());
+    if (ImGui::Button("Copy Log to Clipboard", ImVec2(ImGui::GetContentRegionAvail().x * 0.5f, 0))) {
+        ImGui::SetClipboardText(GetLogText().c_str());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Save Log...", ImVec2(-1, 0))) {
+        SaveLogInteractive();
     }
 
     ImGui::End();
@@ -7654,7 +7815,7 @@ void RenderGUI() {
     ImVec2 center = ImGui::GetMainViewport()->GetCenter();
     ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("About GPU-PCIe-Test", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::Text("GPU-PCIe-Test v3.5 GUI Edition");
+        ImGui::Text("GPU-PCIe-Test v3.6 GUI Edition");
         ImGui::Separator();
         ImGui::Spacing();
         ImGui::Text("A tool to benchmark GPU/PCIe bandwidth and latency.");
@@ -7890,7 +8051,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     // Create window
     g_app.hwnd = CreateWindowExW(
-        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.5 GUI",
+        0, L"GPUPCIeTestGUI", L"GPU-PCIe-Test v3.6 GUI",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         windowWidth, windowHeight,
