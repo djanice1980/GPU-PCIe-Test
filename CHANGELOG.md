@@ -2,6 +2,18 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.6.4] - 2026-11-01
+
+### Added
+- **View > UI Scale.** Shrink or enlarge the whole interface relative to the
+  display scale (60% to 150%), applied immediately and remembered across runs
+  (`~/.config/gpu-pcie-test/ui.ini` on Linux, `%APPDATA%\GPU-PCIe-Test\ui.ini`
+  on Windows). The menu shows the display scale and the effective scale.
+
+### Changed
+- Base font size reduced from 16 px to 14 px at 100%, closer to the pre-3.6.3
+  look; at 1.75x display scale the UI felt oversized.
+
 ## [3.6.3] - 2026-11-01
 
 ### Fixed

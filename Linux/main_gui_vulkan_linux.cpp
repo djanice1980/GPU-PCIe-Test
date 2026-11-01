@@ -702,6 +702,10 @@ static AppContext g_app;
 // style is scaled with it, and every fixed pixel size in the GUI is multiplied
 // by it so buttons and sliders keep their proportions.
 static float g_uiScale = 1.0f;
+static float g_uiDpiScale = 1.0f;        // what the display reports
+static float g_uiUserFactor = 1.0f;      // View > UI Scale, multiplies the DPI scale
+static float g_uiPendingFactor = -1.0f;  // set by the menu, applied between frames
+static const float kUiFactors[] = { 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 1.15f, 1.3f, 1.5f };
 
 // Defined further down; LoadUiFont runs before them in file order.
 void Log(const std::string& msg);
@@ -709,7 +713,7 @@ void Log(const std::string& msg);
 // Load a real system font at the scaled size when one exists; fall back to
 // ImGui's built-in font rasterized at the scaled size.
 static void LoadUiFont(ImGuiIO& io, float scale) {
-    const float px = 16.0f * scale;
+    const float px = 14.0f * scale;   // 14 px at 100%: close to the old 13 px look
     const char* candidates[] = {
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -731,6 +735,46 @@ static void LoadUiFont(ImGuiIO& io, float scale) {
     cfg.SizePixels = 13.0f * scale;
     io.Fonts->AddFontDefault(&cfg);
     Log("[INFO] UI font: built-in at " + std::to_string(static_cast<int>(cfg.SizePixels)) + " px (no system TTF found)");
+}
+
+// The one persisted preference: the UI scale factor, in
+// $XDG_CONFIG_HOME/gpu-pcie-test/ui.ini (default ~/.config/...).
+static std::string UiSettingsPath() {
+    const char* xdg = getenv("XDG_CONFIG_HOME");
+    std::string dir = (xdg && *xdg) ? std::string(xdg) : (getenv("HOME") ? std::string(getenv("HOME")) + "/.config" : std::string("."));
+    dir += "/gpu-pcie-test";
+    mkdir(dir.c_str(), 0755);
+    return dir + "/ui.ini";
+}
+
+static void LoadUiSettings() {
+    std::ifstream f(UiSettingsPath());
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind("ui_scale_factor=", 0) == 0) {
+            float v = static_cast<float>(atof(line.c_str() + 16));
+            if (v >= 0.5f && v <= 2.0f) g_uiUserFactor = v;
+        }
+    }
+}
+
+static void SaveUiSettings() {
+    std::ofstream f(UiSettingsPath());
+    if (f) f << "ui_scale_factor=" << g_uiUserFactor << "\n";
+}
+
+// Base style + colours, then scaled. Shared by startup and live rescaling
+// (ScaleAllSizes is cumulative, so the style is rebuilt from scratch).
+static void ApplyUiStyle(float scale) {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = ImGuiStyle();
+    ImGui::StyleColorsDark();
+    style.WindowRounding = 4.0f;
+    style.FrameRounding = 2.0f;
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.15f, 0.15f, 0.18f, 1.0f);
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.1f, 0.1f, 0.12f, 1.0f);
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.2f, 0.2f, 0.25f, 1.0f);
+    style.ScaleAllSizes(scale);
 }
 
 // Helper to add log messages
@@ -2435,7 +2479,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 3);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 4);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2913,7 +2957,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 3);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 4);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -7306,6 +7350,24 @@ void RenderGUI() {
             if (ImGui::MenuItem("Compare to Standards", nullptr, false, g_app.state == AppState::Completed)) {
                 g_app.showCompareWindow = true;
             }
+            ImGui::Separator();
+            {
+                char hdr[64];
+                snprintf(hdr, sizeof(hdr), "UI Scale (display %.0f%%, effective %.0f%%)", g_uiDpiScale * 100.0f, g_uiScale * 100.0f);
+                if (ImGui::BeginMenu(hdr)) {
+                    for (float f : kUiFactors) {
+                        char item[48];
+                        snprintf(item, sizeof(item), "%.0f%%%s", f * 100.0f, f == 1.0f ? "  (match display)" : "");
+                        bool selected = std::abs(g_uiUserFactor - f) < 0.001f;
+                        if (ImGui::MenuItem(item, nullptr, selected) && !selected) g_uiPendingFactor = f;
+                    }
+                    ImGui::EndMenu();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Shrinks or enlarges the whole interface relative to the display scale.\n"
+                                      "Applied immediately and remembered.");
+                }
+            }
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Help")) {
@@ -9408,23 +9470,16 @@ int main(int argc, char* argv[]) {
     float dpiScale = std::max(xscale, yscale);
     // Rasterize the font at the DPI-scaled size and scale the style with it;
     // FontGlobalScale stays 1.0 (stretching the bitmap font looked crushed).
-    g_uiScale = std::max(1.0f, Constants::BASE_FONT_SCALE * dpiScale);
+    g_uiDpiScale = std::max(1.0f, Constants::BASE_FONT_SCALE * dpiScale);
+    LoadUiSettings();   // View > UI Scale factor, if the user changed it before
+    g_uiScale = g_uiDpiScale * g_uiUserFactor;
     LoadUiFont(io, g_uiScale);
     io.FontGlobalScale = 1.0f;
 
     io.DisplaySize = ImVec2((float)g_app.windowWidth, (float)g_app.windowHeight);
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
 
-    ImGui::StyleColorsDark();
-
-    // Custom style
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 4.0f;
-    style.FrameRounding = 2.0f;
-    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.15f, 0.15f, 0.18f, 1.0f);
-    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.1f, 0.1f, 0.12f, 1.0f);
-    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.2f, 0.2f, 0.25f, 1.0f);
-    style.ScaleAllSizes(g_uiScale);
+    ApplyUiStyle(g_uiScale);
 
     // Initialize Vulkan ImGui backend
     ImGui_ImplVulkan_InitInfo initInfo = {};
@@ -9455,6 +9510,22 @@ int main(int argc, char* argv[]) {
 
         if (g_app.windowWidth <= 0 || g_app.windowHeight <= 0) {
             continue;
+        }
+
+        // Live UI rescale requested from View > UI Scale: rebuild the font atlas
+        // and the style between frames (nothing may reference the old atlas).
+        if (g_uiPendingFactor > 0.0f) {
+            g_uiUserFactor = g_uiPendingFactor;
+            g_uiPendingFactor = -1.0f;
+            g_uiScale = g_uiDpiScale * g_uiUserFactor;
+            WaitForGPU();
+            ImGui_ImplVulkan_DestroyFontsTexture();
+            ImGui::GetIO().Fonts->Clear();
+            LoadUiFont(ImGui::GetIO(), g_uiScale);
+            ImGui::GetIO().Fonts->Build();
+            ImGui_ImplVulkan_CreateFontsTexture();
+            ApplyUiStyle(g_uiScale);
+            SaveUiSettings();
         }
 
         // Start ImGui frame
