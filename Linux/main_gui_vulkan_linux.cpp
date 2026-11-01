@@ -294,6 +294,7 @@ struct SystemMemoryInfo {
     uint32_t busWidthBits = 0;         // Memory bus width from SMBIOS data widths (0 = unknown)
     bool   channelsUnverified = false; // Soldered LPDDR: channel count is only an SMBIOS-based guess
     bool   channelsInferred = false;   // Channel count raised to fit the measured iGPU bandwidth
+    bool   channelsLowerBound = false; // Firmware strings name no channels: value is a floor ("or more")
     bool   needsElevation = false;     // Linux: SMBIOS (dmidecode) needs root; per-device details missing
 };
 
@@ -795,6 +796,54 @@ std::string GetDDRTypeFromSMBIOS(uint16_t memoryType) {
     }
 }
 
+// Pull a memory-channel identifier out of an SMBIOS locator / bank string.
+// Firmware strings vary: "DIMM_A1", "DIMM A2", "ChannelA-DIMM0", "P0 CHANNEL B",
+// "Node0_Channel1_Dimm0", "CH-A", "BANK 0". Returns "" when the string carries
+// no channel information - bank *numbers* are slot numbers, not channels, and
+// counting them is how a quad-channel LGA 2011-3 board got reported as dual
+// (GitHub issue #15). SMBIOS does not encode the channel count anywhere else.
+static std::string ParseChannelId(const std::string& s) {
+    std::string u = s;
+    std::transform(u.begin(), u.end(), u.begin(),
+                   [](char c) { return static_cast<char>(::toupper(static_cast<unsigned char>(c))); });
+    auto isSep = [](char c) { return c == ' ' || c == '_' || c == '-' || c == '/' || c == '.' || c == ':'; };
+    auto isAlnum = [](char c) { return (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
+    auto isAlpha = [](char c) { return c >= 'A' && c <= 'Z'; };
+    auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+
+    std::string node;  // dual-socket boards: "Node1_Channel0" is a different channel from "Node0_Channel0"
+    size_t np = u.find("NODE");
+    if (np != std::string::npos) {
+        size_t i = np + 4;
+        while (i < u.size() && isSep(u[i])) ++i;
+        if (i < u.size() && isDigit(u[i])) node = std::string("N") + u[i];
+    }
+    // "CHANNEL A", "ChannelA", "CHANNEL_1"
+    size_t cp = u.find("CHANNEL");
+    if (cp != std::string::npos) {
+        size_t i = cp + 7;
+        while (i < u.size() && isSep(u[i])) ++i;
+        if (i < u.size() && isAlnum(u[i])) return node + "CH" + u[i];
+    }
+    // "CH-A", "CH_B", "CHA" as a token of its own (not the start of another word)
+    for (size_t p = u.find("CH"); p != std::string::npos; p = u.find("CH", p + 1)) {
+        if (p > 0 && isAlnum(u[p - 1])) continue;
+        size_t i = p + 2;
+        while (i < u.size() && isSep(u[i])) ++i;
+        if (i < u.size() && isAlnum(u[i]) && (i + 1 >= u.size() || !isAlpha(u[i + 1]))) return node + "CH" + u[i];
+    }
+    // "DIMM_A1", "DIMM A2", "DIMMB1": a channel letter followed by a slot digit
+    size_t dp = u.find("DIMM");
+    if (dp != std::string::npos) {
+        size_t i = dp + 4;
+        while (i < u.size() && isSep(u[i])) ++i;
+        if (i + 1 < u.size() && u[i] >= 'A' && u[i] <= 'H' && isDigit(u[i + 1])) return node + "CH" + u[i];
+    }
+    // Bare slot names "A1", "B2"
+    if (u.size() == 2 && u[0] >= 'A' && u[0] <= 'H' && isDigit(u[1])) return node + "CH" + u[0];
+    return "";
+}
+
 // Soldered memory (LPDDR on laptops / APUs; SMBIOS form factor "Row Of Chips")
 // has no DIMM-per-channel relationship: firmware may describe a 256-bit bus as
 // one device or as eight 32-bit devices. Device counting and locator letters
@@ -883,6 +932,7 @@ SystemMemoryInfo DetectSystemMemoryFrom(const std::string& dmidecodeOutputIn) {
     uint64_t dmidecodeCapacity = 0;
     std::set<std::string> uniqueLocators;  // For channel counting
     std::set<char> bankChannelLetters;     // From "Bank Locator: ... CHANNEL X"
+    std::set<std::string> locatorChannelIds, bankChannelIds;  // ParseChannelId() on Locator / Bank Locator
 
     // Split output into lines and parse Memory Device sections
     std::istringstream dmiStream(dmidecodeOutput);
@@ -997,6 +1047,8 @@ SystemMemoryInfo DetectSystemMemoryFrom(const std::string& dmidecodeOutputIn) {
         if (field == "Locator" && slotHasModule) {
             if (value != "Unknown" && !value.empty()) {
                 currentLocator = value;
+                std::string id = ParseChannelId(value);
+                if (!id.empty()) locatorChannelIds.insert(id);
             }
         }
 
@@ -1004,6 +1056,10 @@ SystemMemoryInfo DetectSystemMemoryFrom(const std::string& dmidecodeOutputIn) {
         // "BANK 0 CHANNEL B") - soldered LPDDR boards typically repeat the same
         // Locator ("DIMM 0") for every device, so this is the only channel hint.
         if (field == "Bank Locator" && slotHasModule) {
+            {
+                std::string id = ParseChannelId(value);
+                if (!id.empty()) bankChannelIds.insert(id);
+            }
             std::string upper = value;
             std::transform(upper.begin(), upper.end(), upper.begin(),
                            [](char c) { return static_cast<char>(::toupper(static_cast<unsigned char>(c))); });
@@ -1074,15 +1130,17 @@ SystemMemoryInfo DetectSystemMemoryFrom(const std::string& dmidecodeOutputIn) {
     }
 
     for (char c : bankChannelLetters) channelLetters.insert(c);
+    // Largest consistent count wins: letters from the legacy patterns, or the
+    // ids ParseChannelId() found in Locator or Bank Locator (kept separate so
+    // one channel named two ways is not double-counted).
+    size_t channelIdCount = std::max(channelLetters.size(), std::max(locatorChannelIds.size(), bankChannelIds.size()));
 
-    if (channelLetters.size() >= 4u) {
-        info.channels = 4;  // Quad channel
-    } else if (channelLetters.size() >= 2u) {
-        info.channels = static_cast<uint32_t>(channelLetters.size());
-    } else if (stickCount >= 4) {
-        info.channels = 4;  // Quad channel (heuristic)
+    if (channelIdCount >= 2u) {
+        info.channels = static_cast<uint32_t>(std::min<size_t>(channelIdCount, 8u));
     } else if (stickCount >= 2) {
-        info.channels = 2;  // Dual channel (typical)
+        // No channel letters anywhere: 2 is a floor, reported as "or more".
+        info.channels = 2;
+        info.channelsLowerBound = true;
     } else if (stickCount == 1) {
         info.channels = 1;  // Single channel
     } else {
@@ -1162,6 +1220,7 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
         else if (mem.channels == 4) oss << "quad";
         else oss << mem.channels;
         oss << "-channel";
+        if (mem.channelsLowerBound) oss << " or more (firmware does not name channels)";
         if (mem.busWidthBits > 0) oss << " (" << mem.busWidthBits << "-bit)";
         if (mem.channelsInferred) oss << " (inferred from measured bandwidth)";
         else if (mem.channelsUnverified) oss << " (SMBIOS estimate)";
@@ -2302,7 +2361,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 0);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 1);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2780,7 +2839,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 0);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 1);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -6908,7 +6967,21 @@ static std::string ShellQuote(const std::string& s) {
 // the full path. (Previously the file was written silently to the process's
 // working directory, which for a launcher/AppImage start is not obvious.)
 std::string ChooseSavePath(const std::string& defaultName, bool csv) {
-    std::string dir = TrimString(ExecCommand("xdg-user-dir DOCUMENTS 2>/dev/null"));
+    // Default folder: the executable's own folder when it is writable (a
+    // portable extracted build keeps results next to it); an AppImage mount
+    // and /usr are read-only, so those fall back to Documents, then $HOME.
+    std::string dir;
+    if (!getenv("APPIMAGE")) {
+        char exe[4096] = {};
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n > 0) {
+            std::string d(exe, static_cast<size_t>(n));
+            size_t slash = d.rfind('/');
+            if (slash != std::string::npos) d.resize(slash);
+            if (d.rfind("/usr/", 0) != 0 && access(d.c_str(), W_OK) == 0) dir = d;
+        }
+    }
+    if (dir.empty()) dir = TrimString(ExecCommand("xdg-user-dir DOCUMENTS 2>/dev/null"));
     if (dir.empty() || access(dir.c_str(), W_OK) != 0) {
         const char* home = getenv("HOME");
         dir = home ? home : ".";
@@ -7080,6 +7153,24 @@ void RenderMemoryElevationPrompt() {
         }
         ImGui::EndPopup();
     }
+}
+
+// Hover tooltip for the grouped horizontal bar charts: the exact values of the
+// bar under the cursor, so nobody has to pixel-hunt the bar end (issue #15).
+static void ShowGroupedBarTooltip(const std::vector<double>& mins, const std::vector<double>& avgs,
+                                  const std::vector<double>& maxs, const std::vector<const char*>& labels,
+                                  int numTests, const char* unit, const char* maxName) {
+    if (numTests <= 0 || !ImPlot::IsPlotHovered()) return;
+    ImPlotPoint mp = ImPlot::GetPlotMousePos();
+    int i = static_cast<int>(std::lround(mp.y));
+    if (i < 0 || i >= numTests || i >= static_cast<int>(labels.size())) return;
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(labels[i]);
+    ImGui::Separator();
+    ImGui::Text("Min: %.3f %s", mins[i], unit);
+    ImGui::Text("Avg: %.3f %s", avgs[i], unit);
+    ImGui::Text("%s: %.3f %s", maxName, maxs[i], unit);
+    ImGui::EndTooltip();
 }
 
 void RenderGUI() {
@@ -7795,7 +7886,11 @@ void RenderGUI() {
     // Header row: the log is what goes into bug reports, so copy/save sit at
     // the top where they are seen (also under File).
     if (ImGui::SmallButton("Copy log")) ImGui::SetClipboardText(GetLogText().c_str());
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the whole log to the clipboard");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the whole log to the clipboard (Ctrl+C while this panel is focused)");
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput &&
+        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C)) {
+        ImGui::SetClipboardText(GetLogText().c_str());
+    }
     ImGui::SameLine();
     if (ImGui::SmallButton("Save log...")) SaveLogInteractive();
     ImGui::SameLine();
@@ -8240,6 +8335,8 @@ void RenderGUI() {
                 
                 ImPlot::SetNextFillStyle(ImVec4(1.0f, 0.4f, 0.2f, 0.8f));  // Orange for Max
                 ImPlot::PlotBars("Max", maxs.data(), maxPos.data(), numTests, barWidth * 0.9, ImPlotBarsFlags_Horizontal);
+
+                ShowGroupedBarTooltip(mins, avgs, maxs, bwLabels, numTests, "GB/s", g_app.config.averageRuns ? "Max" : "Best");
                 
                 ImPlot::EndPlot();
             }
@@ -8313,6 +8410,8 @@ void RenderGUI() {
                 
                 ImPlot::SetNextFillStyle(ImVec4(1.0f, 0.4f, 0.2f, 0.8f));
                 ImPlot::PlotBars("Max", maxs.data(), maxPos.data(), numTests, barWidth * 0.9, ImPlotBarsFlags_Horizontal);
+
+                ShowGroupedBarTooltip(mins, avgs, maxs, latLabels, numTests, "us", g_app.config.averageRuns ? "Max" : "Best");
                 
                 ImPlot::EndPlot();
             }
@@ -8480,6 +8579,19 @@ void RenderGUI() {
                 ImPlot::PlotBars("Your GPU->CPU", downloadBW.data(), downloadPos.data(),
                                   static_cast<int>(downloadBW.size()), barHeight, ImPlotBarsFlags_Horizontal);
             }
+            if (ImPlot::IsPlotHovered()) {
+                ImPlotPoint mp = ImPlot::GetPlotMousePos();
+                int hi = static_cast<int>(std::lround(mp.y));
+                if (hi >= 0 && hi < numEntries) {
+                    static const char* kinds[] = { "interface standard", "your CPU->GPU", "your GPU->CPU", "memory standard" };
+                    ImGui::BeginTooltip();
+                    ImGui::TextUnformatted(labels[hi]);
+                    ImGui::Text("%.2f GB/s (%s)", bandwidths[hi],
+                                (entries[hi].type >= 0 && entries[hi].type < 4) ? kinds[entries[hi].type] : "");
+                    ImGui::EndTooltip();
+                }
+            }
+
 
             ImPlot::EndPlot();
         }

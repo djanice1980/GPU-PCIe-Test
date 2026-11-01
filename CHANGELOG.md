@@ -2,6 +2,28 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.6.1] - 2026-11-01
+
+### Fixed
+- **Quad-channel RAM reported as dual-channel on Windows** (GitHub #15, LGA
+  2011-3). Channels were guessed from distinct WMI `BankLabel` strings, with
+  "two or more sticks = dual" as the fallback. Channel identifiers are now
+  parsed from both `DeviceLocator` and `BankLabel` (`DIMM_A1`,
+  `ChannelA-DIMM0`, `P0 CHANNEL B`, `Node0_Channel1`, `CH-A`, ...), bank
+  *numbers* are no longer mistaken for channels, and when the firmware strings
+  name no channel at all the result is reported as "dual-channel or more
+  (firmware does not name channels)" instead of asserted. SMBIOS does not
+  encode the channel count; tools like CPU-Z read the memory controller, which
+  an unprivileged app cannot.
+
+### Added
+- **Portable default save folder**: CSV and log save dialogs start in the
+  executable's own folder when it is writable (USB stick, extracted zip), and
+  in Documents otherwise (Program Files, the read-only AppImage mount, /usr).
+- **Ctrl+C copies the log** while the log panel is focused.
+- **Hover tooltips on the charts**: the bandwidth, latency and comparison bar
+  charts show the exact values of the bar under the cursor.
+
 ## [3.6.0] - 2026-11-01
 
 ### Added
