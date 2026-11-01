@@ -1327,6 +1327,20 @@ std::string FormatVendorDeviceId(uint32_t vendorId, uint32_t deviceId) {
     return ss.str();
 }
 
+// "86% of LPDDR5 @ 8000 MT/s 256-bit (256 GB/s theoretical)" - or an honest
+// "n/a" when there is no baseline (no SMBIOS data, nothing to compare to).
+// A percentage of a guessed standard is never printed: an unprivileged run
+// used to show "157% of DDR5 (estimated)", which meant nothing.
+std::string PctOfStd(double pct, const std::string& standard) {
+    if (pct <= 0.0 || standard.empty() || standard == "Unknown") {
+        return (standard.empty() || standard == "Unknown") ? std::string("n/a - no comparison baseline")
+                                                            : "n/a - " + standard;
+    }
+    char b[256];
+    snprintf(b, sizeof(b), "%.0f%% of %s", pct, standard.c_str());
+    return b;
+}
+
 // Check if global benchmark timeout has been exceeded
 bool IsGlobalTimeoutExceeded() {
     auto elapsed = std::chrono::steady_clock::now() - g_app.benchmarkStartTime;
@@ -1460,8 +1474,13 @@ void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo&
     std::string bandwidthSource;
     
     if (g_app.systemMemory.detected && g_app.systemMemory.theoreticalBandwidth > 0) {
-        // Use detected RAM bandwidth with ~80% efficiency factor
-        expectedBandwidth = g_app.systemMemory.theoreticalBandwidth * 0.80;
+        // Compare against the theoretical bus bandwidth. On an integrated GPU a
+        // copy reads the source and writes the destination in the SAME memory,
+        // so the bus carries twice the copy rate; the percentages below use that
+        // read+write traffic. (Comparing the raw copy rate against an 80% of
+        // theoretical figure read "54% of LPDDR5" on a Strix Halo that was in
+        // fact moving 86% of its 256 GB/s.)
+        expectedBandwidth = g_app.systemMemory.theoreticalBandwidth;
 
         // An iGPU cannot pull system RAM faster than the bus delivers it, so a
         // measurement above the estimate proves the channel count is too low
@@ -1473,51 +1492,48 @@ void DetectIntegratedGPUInterface(double upload, double download, const GPUInfo&
                 g_app.systemMemory.configuredSpeedMT : g_app.systemMemory.speedMT;
             double perChannelGBs = memSpeed * 8.0 / 1000.0;   // one 64-bit channel
             uint32_t oldChannels = g_app.systemMemory.channels > 0 ? g_app.systemMemory.channels : 1;
-            if (perChannelGBs > 0 && maxBandwidth > expectedBandwidth) {
+            if (perChannelGBs > 0 && maxBandwidth * 2.0 > expectedBandwidth * 1.05) {   // traffic (2x copy) beyond the bus
                 uint32_t ch = oldChannels;
-                while (ch < 16 && maxBandwidth > perChannelGBs * ch * 0.80) ch *= 2;
+                while (ch < 16 && maxBandwidth * 2.0 > perChannelGBs * ch * 1.05) ch *= 2;
                 if (ch != oldChannels) {
                     char msg[320];
                     snprintf(msg, sizeof(msg),
-                        "[INFO] Measured %.1f GB/s exceeds the %.1f GB/s achievable for %u-channel RAM - "
+                        "[INFO] Measured %.1f GB/s copy = %.1f GB/s read+write traffic, more than the %.1f GB/s a %u-channel bus can carry - "
                         "SMBIOS under-reports the memory bus (typical for soldered LPDDR); "
                         "assuming %u channels (%u-bit, %.1f GB/s theoretical)",
-                        maxBandwidth, expectedBandwidth, oldChannels, ch, ch * 64u, perChannelGBs * ch);
+                        maxBandwidth, maxBandwidth * 2.0, expectedBandwidth, oldChannels, ch, ch * 64u, perChannelGBs * ch);
                     Log(msg);
                     g_app.systemMemory.channels = ch;
                     g_app.systemMemory.busWidthBits = ch * 64u;
                     g_app.systemMemory.theoreticalBandwidth = perChannelGBs * ch;
                     g_app.systemMemory.channelsInferred = true;
-                    expectedBandwidth = g_app.systemMemory.theoreticalBandwidth * 0.80;
+                    expectedBandwidth = g_app.systemMemory.theoreticalBandwidth;
                 }
             }
         }
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%s @ %u MT/s (%.0f GB/s)", 
+        char buf[128];
+        uint32_t busBits = g_app.systemMemory.busWidthBits > 0 ? g_app.systemMemory.busWidthBits : g_app.systemMemory.channels * 64u;
+        snprintf(buf, sizeof(buf), "%s @ %u MT/s %u-bit (%.0f GB/s theoretical)",
                 g_app.systemMemory.type.c_str(),
-                g_app.systemMemory.configuredSpeedMT > 0 ? 
-                    g_app.systemMemory.configuredSpeedMT : g_app.systemMemory.speedMT,
-                expectedBandwidth);
+                g_app.systemMemory.configuredSpeedMT > 0 ? g_app.systemMemory.configuredSpeedMT : g_app.systemMemory.speedMT,
+                busBits, expectedBandwidth);
         bandwidthSource = buf;
     } else {
         // Fall back to estimates based on detected/heuristic memory type
         // DDR6 dual-channel realistic: ~164 GB/s (DDR6-12800 base)
         // DDR5 dual-channel realistic: ~70 GB/s
         // DDR4 dual-channel realistic: ~40 GB/s
-        if (memoryType.find("DDR6") != std::string::npos) {
-            expectedBandwidth = 164.0;
-        } else if (memoryType.find("DDR5") != std::string::npos) {
-            expectedBandwidth = 70.0;
-        } else {
-            expectedBandwidth = 40.0;
-        }
-        bandwidthSource = memoryType + " (estimated)";
+        // No SMBIOS data: speed, width and channel count are all unknown, so
+        // there is no baseline. Report n/a rather than a percentage of a guess.
+        expectedBandwidth = 0.0;
+        bandwidthSource = "unknown memory configuration (Help > Read memory details)";
     }
     
     g_app.closestUploadStandard = bandwidthSource;
-    g_app.uploadPercentage = (upload / expectedBandwidth) * 100.0;
+    // Read + write: a copy moves every byte through the shared memory twice.
+    g_app.uploadPercentage = expectedBandwidth > 0 ? (2.0 * upload / expectedBandwidth) * 100.0 : 0.0;
     g_app.closestDownloadStandard = bandwidthSource;
-    g_app.downloadPercentage = (download / expectedBandwidth) * 100.0;
+    g_app.downloadPercentage = expectedBandwidth > 0 ? (2.0 * download / expectedBandwidth) * 100.0 : 0.0;
 }
 
 void DetectInterface(double upload, double download, int gpuIndex) {
@@ -2361,7 +2377,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 1);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 2);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2839,7 +2855,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 1);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 2);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -6747,12 +6763,12 @@ void BenchmarkThreadFunc() {
             }
 
             // Log with percentages vs DDR bandwidth
-            char uploadBuf[128], downloadBuf[128];
+            char uploadBuf[256], downloadBuf[256];
             const char* modeStr = g_app.config.averageRuns ? "Avg" : "Best";
-            snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU (%s): %.2f GB/s (%.0f%% of %s)",
-                modeStr, reportUpload, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
-            snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU (%s): %.2f GB/s (%.0f%% of %s)",
-                modeStr, reportDownload, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+            snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU (%s): %.2f GB/s copy = %.1f GB/s read+write (%s)",
+                modeStr, reportUpload, reportUpload * 2.0, PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard).c_str());
+            snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU (%s): %.2f GB/s copy = %.1f GB/s read+write (%s)",
+                modeStr, reportDownload, reportDownload * 2.0, PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard).c_str());
             Log(uploadBuf);
             Log(downloadBuf);
             
@@ -6767,6 +6783,8 @@ void BenchmarkThreadFunc() {
                 << "- Memory controller configuration (channels, ranks)\n"
                 << "- Fabric/interconnect bandwidth\n"
                 << "- Contention with CPU memory access\n\n"
+                << "A copy reads its source and writes its destination in the same memory, so the "
+                << "bus carries twice the copy rate; the percentages above count that read+write traffic.\n\n"
                 << "The asymmetry between upload (" << std::fixed << std::setprecision(1) << reportUpload 
                 << " GB/s) and download (" << reportDownload << " GB/s) is normal and reflects "
                 << "differences in how the GPU reads vs writes to different memory heap types.";
@@ -6792,12 +6810,12 @@ void BenchmarkThreadFunc() {
             }
 
             // Log with percentages - indicate if using best or average
-            char uploadBuf[128], downloadBuf[128];
+            char uploadBuf[256], downloadBuf[256];
             const char* modeStr = g_app.config.averageRuns ? "Avg" : "Best";
-            snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU (%s): %.2f GB/s (%.0f%% of %s)",
-                modeStr, reportUpload, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
-            snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU (%s): %.2f GB/s (%.0f%% of %s)",
-                modeStr, reportDownload, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+            snprintf(uploadBuf, sizeof(uploadBuf), "CPU->GPU (%s): %.2f GB/s (%s)",
+                modeStr, reportUpload, PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard).c_str());
+            snprintf(downloadBuf, sizeof(downloadBuf), "GPU->CPU (%s): %.2f GB/s (%s)",
+                modeStr, reportDownload, PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard).c_str());
             Log(uploadBuf);
             Log(downloadBuf);
             
@@ -7031,8 +7049,8 @@ void ExportCSV(const std::string& filename) {
 
     // Add interface detection info
     file << "\nSpeed Comparable To," << g_app.detectedInterface << "\n";
-    file << "CPU->GPU," << g_app.uploadBW << " GB/s," << g_app.uploadPercentage << "% of " << g_app.closestUploadStandard << "\n";
-    file << "GPU->CPU," << g_app.downloadBW << " GB/s," << g_app.downloadPercentage << "% of " << g_app.closestDownloadStandard << "\n";
+    file << "CPU->GPU," << g_app.uploadBW << " GB/s," << PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard) << "\n";
+    file << "GPU->CPU," << g_app.downloadBW << " GB/s," << PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard) << "\n";
     
     // Add system memory info
     if (g_app.systemMemory.detected) {
@@ -7970,12 +7988,12 @@ void RenderGUI() {
     }
     else if (g_app.state == AppState::Completed) {
         // Show summary with percentages
-        char resultBuf[256];
+        char resultBuf[512];
         snprintf(resultBuf, sizeof(resultBuf),
-            "Complete! | %s | CPU->GPU: %.2f GB/s (%.0f%% of %s) | GPU->CPU: %.2f GB/s (%.0f%% of %s)",
+            "Complete! | %s | CPU->GPU: %.2f GB/s (%s) | GPU->CPU: %.2f GB/s (%s)",
             g_app.detectedInterface.c_str(),
-            g_app.uploadBW, g_app.uploadPercentage, g_app.closestUploadStandard.c_str(),
-            g_app.downloadBW, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+            g_app.uploadBW, PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard).c_str(),
+            g_app.downloadBW, PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard).c_str());
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "%s", resultBuf);
         
         // Show eGPU detection if applicable
@@ -7992,9 +8010,9 @@ void RenderGUI() {
         ImGui::ProgressBar(1.0f, ImVec2(-1, 28), "Benchmark Complete!");
 
         // Progress bars showing percentages
-        char uploadBar[64], downloadBar[64];
-        snprintf(uploadBar, sizeof(uploadBar), "CPU->GPU: %.0f%% of %s", g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
-        snprintf(downloadBar, sizeof(downloadBar), "GPU->CPU: %.0f%% of %s", g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+        char uploadBar[192], downloadBar[192];
+        snprintf(uploadBar, sizeof(uploadBar), "CPU->GPU: %s", PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard).c_str());
+        snprintf(downloadBar, sizeof(downloadBar), "GPU->CPU: %s", PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard).c_str());
 
         // Normalize percentages (cap at 150% for display)
         float uploadPct = std::min(static_cast<float>(g_app.uploadPercentage) / 100.0f, 1.5f) / 1.5f;
@@ -8043,15 +8061,15 @@ void RenderGUI() {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%.2f GB/s", g_app.uploadBW);
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(%.0f%% of %s)", 
-            g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(%s)", 
+            PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard).c_str());
         
         ImGui::Text("GPU -> CPU: ");
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%.2f GB/s", g_app.downloadBW);
         ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(%.0f%% of %s)", 
-            g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "(%s)", 
+            PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard).c_str());
         
         ImGui::Text("Inferred Interface: ");
         ImGui::SameLine();
@@ -8242,17 +8260,19 @@ void RenderGUI() {
 
         ImGui::Spacing();
 
-        char uploadStr[128], downloadStr[128];
-        snprintf(uploadStr, sizeof(uploadStr), "CPU->GPU: %.2f GB/s (%.0f%% of %s)",
-            g_app.uploadBW, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
-        snprintf(downloadStr, sizeof(downloadStr), "GPU->CPU: %.2f GB/s (%.0f%% of %s)",
-            g_app.downloadBW, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+        char uploadStr[224], downloadStr[224];
+        snprintf(uploadStr, sizeof(uploadStr), "CPU->GPU: %.2f GB/s (%s)",
+            g_app.uploadBW, PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard).c_str());
+        snprintf(downloadStr, sizeof(downloadStr), "GPU->CPU: %.2f GB/s (%s)",
+            g_app.downloadBW, PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard).c_str());
 
         // Color based on percentage
-        ImVec4 uploadColor = g_app.uploadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
+        ImVec4 uploadColor = g_app.uploadPercentage <= 0 ? ImVec4(0.6f, 0.6f, 0.6f, 1.0f) :
+            g_app.uploadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
             g_app.uploadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
             ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-        ImVec4 downloadColor = g_app.downloadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
+        ImVec4 downloadColor = g_app.downloadPercentage <= 0 ? ImVec4(0.6f, 0.6f, 0.6f, 1.0f) :
+            g_app.downloadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
             g_app.downloadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
             ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
 
@@ -8482,16 +8502,27 @@ void RenderGUI() {
         }
         
         // Add user results
+        // Integrated GPU: show the system's own RAM as the ceiling, and plot the
+        // measured copies as read+write traffic (2x), which is what the bus saw.
+        static std::string ownRamName;
+        if (isIntegrated && g_app.systemMemory.detected && g_app.systemMemory.theoreticalBandwidth > 0) {
+            uint32_t bits = g_app.systemMemory.busWidthBits > 0 ? g_app.systemMemory.busWidthBits : g_app.systemMemory.channels * 64u;
+            ownRamName = "YOUR RAM " + g_app.systemMemory.type + "-" +
+                std::to_string(g_app.systemMemory.configuredSpeedMT > 0 ? g_app.systemMemory.configuredSpeedMT : g_app.systemMemory.speedMT) +
+                " " + std::to_string(bits) + "-bit";
+            entries.push_back({ ownRamName.c_str(), g_app.systemMemory.theoreticalBandwidth, 3, "Your system RAM, theoretical" });
+        }
+        const double trafficScale = isIntegrated ? 2.0 : 1.0;
         entries.push_back({
-            "YOUR CPU->GPU",
-            g_app.uploadBW,
+            isIntegrated ? "YOUR CPU->GPU (read+write)" : "YOUR CPU->GPU",
+            g_app.uploadBW * trafficScale,
             1,
             "Your measured upload bandwidth"
         });
         
         entries.push_back({
-            "YOUR GPU->CPU",
-            g_app.downloadBW,
+            isIntegrated ? "YOUR GPU->CPU (read+write)" : "YOUR GPU->CPU",
+            g_app.downloadBW * trafficScale,
             2,
             "Your measured download bandwidth"
         });
@@ -8613,11 +8644,15 @@ void RenderGUI() {
         ImGui::Text("Detailed Ranking (fastest to slowest):");
         ImGui::Spacing();
         
-        if (ImGui::BeginTable("RankingTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, 
+        // Column widths follow the font (a fixed 100 px squeezed "225.30 GB/s" to
+        // "225.30 GE" at larger UI scales); columns are user-resizable.
+        const float rankW = ImGui::CalcTextSize("#99").x + ImGui::GetStyle().CellPadding.x * 4.0f;
+        const float bwW   = ImGui::CalcTextSize("9999.99 GB/s").x + ImGui::GetStyle().CellPadding.x * 4.0f;
+        if (ImGui::BeginTable("RankingTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
                               ImVec2(0, 200))) {
-            ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthFixed, 50);
+            ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthFixed, rankW);
             ImGui::TableSetupColumn("Interface", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Bandwidth", ImGuiTableColumnFlags_WidthFixed, 100);
+            ImGui::TableSetupColumn("Bandwidth", ImGuiTableColumnFlags_WidthFixed, bwW);
             ImGui::TableSetupScrollFreeze(0, 1);
             ImGui::TableHeadersRow();
             
@@ -8667,23 +8702,38 @@ void RenderGUI() {
         ImGui::Separator();
         ImGui::Spacing();
         
-        char uploadSummary[128], downloadSummary[128];
-        snprintf(uploadSummary, sizeof(uploadSummary), 
-                 "CPU->GPU: %.2f GB/s = %.0f%% of %s",
-                 g_app.uploadBW, g_app.uploadPercentage, g_app.closestUploadStandard.c_str());
-        snprintf(downloadSummary, sizeof(downloadSummary),
-                 "GPU->CPU: %.2f GB/s = %.0f%% of %s", 
-                 g_app.downloadBW, g_app.downloadPercentage, g_app.closestDownloadStandard.c_str());
+        char uploadSummary[224], downloadSummary[224];
+        if (isIntegrated) {
+            snprintf(uploadSummary, sizeof(uploadSummary),
+                     "CPU->GPU: %.2f GB/s copy = %.1f GB/s read+write = %s",
+                     g_app.uploadBW, g_app.uploadBW * 2.0, PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard).c_str());
+            snprintf(downloadSummary, sizeof(downloadSummary),
+                     "GPU->CPU: %.2f GB/s copy = %.1f GB/s read+write = %s",
+                     g_app.downloadBW, g_app.downloadBW * 2.0, PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard).c_str());
+        } else {
+            snprintf(uploadSummary, sizeof(uploadSummary),
+                     "CPU->GPU: %.2f GB/s = %s",
+                     g_app.uploadBW, PctOfStd(g_app.uploadPercentage, g_app.closestUploadStandard).c_str());
+            snprintf(downloadSummary, sizeof(downloadSummary),
+                     "GPU->CPU: %.2f GB/s = %s",
+                     g_app.downloadBW, PctOfStd(g_app.downloadPercentage, g_app.closestDownloadStandard).c_str());
+        }
         
-        ImVec4 uploadColor = g_app.uploadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
+        ImVec4 uploadColor = g_app.uploadPercentage <= 0 ? ImVec4(0.6f, 0.6f, 0.6f, 1.0f) :
+            g_app.uploadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
             g_app.uploadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
             ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-        ImVec4 downloadColor = g_app.downloadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
+        ImVec4 downloadColor = g_app.downloadPercentage <= 0 ? ImVec4(0.6f, 0.6f, 0.6f, 1.0f) :
+            g_app.downloadPercentage >= 90 ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f) :
             g_app.downloadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
             ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
         
         ImGui::TextColored(uploadColor, "%s", uploadSummary);
         ImGui::TextColored(downloadColor, "%s", downloadSummary);
+        if (isIntegrated) {
+            ImGui::TextDisabled("Integrated GPU: a copy reads and writes the same RAM, so the bus carries twice the copy rate.");
+            ImGui::TextDisabled("Your bars and percentages count that read+write traffic; the standards are theoretical dual-channel figures.");
+        }
         
         if (!g_app.detectedInterface.empty() && g_app.detectedInterface != "Unknown") {
             ImGui::Spacing();

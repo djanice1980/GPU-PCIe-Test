@@ -2,6 +2,29 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.6.2] - 2026-11-01
+
+### Fixed
+- **Integrated GPUs were graded against the wrong yardstick.** A copy on an
+  integrated GPU reads its source and writes its destination in the same
+  system RAM, so the bus carries twice the copy rate. The comparison divided
+  the raw copy rate by 80% of the theoretical bus bandwidth, which turned a
+  Strix Halo moving 221 GB/s of traffic over its 256 GB/s bus into "54% of
+  LPDDR5" in red. Integrated-GPU percentages, log lines and the comparison
+  chart now count read+write traffic against the theoretical bus bandwidth
+  (86% in that case), the label names the bus width, and the chart gains a
+  "YOUR RAM" bar so the ceiling is visible. The bandwidth-based channel
+  inference uses the same traffic figure. Discrete GPUs are unchanged: a
+  PCIe copy crosses the link once.
+- **No more percentages of a guessed standard.** Without SMBIOS data (an
+  unprivileged Linux run) the integrated-GPU comparison showed "157% of DDR5
+  (estimated)" against a hard-coded figure. With no baseline every display
+  now says "n/a - unknown memory configuration" and points at Help > Read
+  memory details.
+- **Comparison table columns** are sized from the font instead of fixed
+  pixels (the Bandwidth column truncated to "225.30 GE" at larger UI scales)
+  and are user-resizable.
+
 ## [3.6.1] - 2026-11-01
 
 ### Fixed
