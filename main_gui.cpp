@@ -5595,6 +5595,21 @@ void RefreshPCIeLinkUnderLoad() {
     }
 }
 
+// Short GPU tag for result names, so charts that accumulate runs from
+// different GPUs stay readable: "NVIDIA GeForce RTX 5070 Ti" -> "RTX 5070 Ti",
+// "AMD Radeon 8060S Graphics (RADV STRIX_HALO)" -> "Radeon 8060S Graphics".
+std::string ShortGpuName(const std::string& name) {
+    std::string s = name;
+    const char* prefixes[] = { "NVIDIA GeForce ", "NVIDIA ", "AMD Radeon(TM) ", "AMD ", "Intel(R) ", "Intel " };
+    for (const char* p : prefixes) {
+        if (s.rfind(p, 0) == 0) { s = s.substr(strlen(p)); break; }
+    }
+    size_t paren = s.find(" (");
+    if (paren != std::string::npos) s = s.substr(0, paren);
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    return s.empty() ? name : s;
+}
+
 void BenchmarkThreadFunc() {
     g_app.benchmarkThreadRunning = true;
     g_app.benchmarkStartTime = std::chrono::steady_clock::now();
@@ -6110,7 +6125,9 @@ void BenchmarkThreadFunc() {
             newResults = allResults;
         }
         
-        // Append new results to existing results (accumulate across benchmark runs)
+        // Results accumulate across runs and GPUs: tag each with the GPU so the
+        // charts and tables say which card a bar belongs to.
+        for (auto& r : newResults) r.testName += " [" + ShortGpuName(gpu.name) + "]";
         g_app.results.insert(g_app.results.end(), newResults.begin(), newResults.end());
         
         // Only now (results inserted under the lock) let the UI open the
@@ -7417,6 +7434,8 @@ void RenderGUI() {
     if (g_app.showGraphsWindow && !g_app.results.empty()) {
         ImGui::SetNextWindowSize(ImVec2(900 * g_uiScale, 700 * g_uiScale), ImGuiCond_FirstUseEver);
         ImGui::Begin("Graphs", &g_app.showGraphsWindow);
+        ImGui::TextDisabled("Results accumulate across runs and GPUs (tagged [GPU]); Clear Charts starts fresh. "
+                            "Hover a bar for exact values; Ctrl+wheel zooms, wheel scrolls.");
 
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
 
@@ -7456,9 +7475,9 @@ void RenderGUI() {
             // Plot height based on number of tests
             float plotHeight = std::max(200.0f, numTests * 50.0f + 80.0f) * g_uiScale;
             
-            if (ImPlot::BeginPlot("##Bandwidth", ImVec2(-1, plotHeight))) {
+            if (ImPlot::BeginPlot("##Bandwidth", ImVec2(-1, plotHeight), ImPlotFlags_NoBoxSelect | ImPlotFlags_NoMenus)) {
                 // Invert Y axis so oldest (index 0) appears at TOP
-                ImPlot::SetupAxes("GB/s", "", 0, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
+                ImPlot::SetupAxes("GB/s", "", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
                 
                 // Calculate positions for grouped bars
                 double barWidth = 0.25;
@@ -7535,9 +7554,9 @@ void RenderGUI() {
             
             float plotHeight = std::max(200.0f, numTests * 50.0f + 80.0f) * g_uiScale;
             
-            if (ImPlot::BeginPlot("##Latency", ImVec2(-1, plotHeight))) {
+            if (ImPlot::BeginPlot("##Latency", ImVec2(-1, plotHeight), ImPlotFlags_NoBoxSelect | ImPlotFlags_NoMenus)) {
                 // Invert Y axis so oldest (index 0) appears at TOP
-                ImPlot::SetupAxes("Microseconds (us)", "", 0, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
+                ImPlot::SetupAxes("Microseconds (us)", "", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
                 
                 double barWidth = 0.25;
                 
@@ -7709,7 +7728,7 @@ void RenderGUI() {
         maxBW = maxBW * 1.1;  // 10% padding
 
         // Draw the horizontal bar chart
-        if (ImPlot::BeginPlot("##InterfaceComparison", ImVec2(-1, plotHeight))) {
+        if (ImPlot::BeginPlot("##InterfaceComparison", ImVec2(-1, plotHeight), ImPlotFlags_NoBoxSelect | ImPlotFlags_NoMenus)) {
             ImPlot::SetupAxes("Bandwidth (GB/s)", "", 0, ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_Invert);
             ImPlot::SetupAxisLimits(ImAxis_X1, 0, maxBW, ImPlotCond_Always);
             ImPlot::SetupAxisTicks(ImAxis_Y1, positions.data(), numEntries, labels.data());
@@ -8405,6 +8424,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImPlot::CreateContext();
+    // The mouse wheel scrolls the window; plot zoom needs Ctrl (and the axes
+    // auto-fit every frame anyway, so a zoomed-out chart cannot get stuck).
+    ImPlot::GetInputMap().ZoomMod = ImGuiMod_Ctrl;
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;

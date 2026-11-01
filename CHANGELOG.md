@@ -2,6 +2,18 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.6.5] - 2026-11-01
+
+### Fixed
+- **Mouse wheel over a chart zoomed it instead of scrolling the window**, and a
+  zoomed-out bandwidth axis (-100 to 350 GB/s) could not be recovered because
+  the X axis only fitted once. The wheel now scrolls; zoom needs Ctrl; both
+  axes fit the data every frame; box-select and the context menu are off.
+- **Results from different GPUs were indistinguishable on the charts.** Runs
+  accumulate across GPUs, so eGPU bars (3.9 GB/s) sat unexplained under iGPU
+  bars (110 GB/s). Every result is now tagged with its GPU, e.g.
+  "CPU->GPU 256 MB [RTX 5070 Ti]", and the Graphs window says how to clear.
+
 ## [3.6.4] - 2026-11-01
 
 ### Added
