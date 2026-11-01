@@ -19,7 +19,7 @@ makedepends=('cmake' 'vulkan-headers')
 optdepends=('dmidecode: detailed system RAM info (run as root)'
             'vulkan-validation-layers: for -DENABLE_VULKAN_VALIDATION=ON builds')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')  # pinned after tagging
+sha256sums=('6e19dfb2f20a987cf3dccf3d7fad79bf5c26a0dc40ed804fbd263827d0df79d0')
 
 build() {
     cmake -S "GPU-PCIe-Test-$pkgver/Linux" -B build \
