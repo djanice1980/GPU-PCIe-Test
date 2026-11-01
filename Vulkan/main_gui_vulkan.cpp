@@ -375,6 +375,7 @@ struct VRAMError {
 
 struct VRAMTestResult {
     bool completed = false;
+    bool incomplete = false;   // aborted by a GPU/driver failure: never a PASS
     bool cancelled = false;
     size_t totalBytesTested = 0;
     size_t totalErrors = 0;
@@ -2164,7 +2165,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 5, 0);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 5, 1);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2640,7 +2641,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 5, 0);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 5, 1);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2823,7 +2824,7 @@ bool InitVulkan() {
 //                      VULKAN BENCHMARK DEVICE
 // ============================================================================
 
-bool InitBenchmarkDevice(int gpuIndex) {
+bool InitBenchmarkDevice(int gpuIndex, bool requireCompute = false) {
     if (gpuIndex < 0 || gpuIndex >= static_cast<int>(g_app.gpuList.size())) {
         Log("[ERROR] Invalid GPU index: " + std::to_string(gpuIndex));
         return false;
@@ -2883,8 +2884,33 @@ bool InitBenchmarkDevice(int gpuIndex) {
         }
     }
 
+    // The VRAM scan dispatches compute shaders (resident fill + verify). A
+    // transfer-only family cannot execute them: on NVIDIA, family 1 (transfer
+    // only) answered the first dispatch with VK_ERROR_DEVICE_LOST (Xid 32).
+    // Prefer a compute family without graphics, then any compute family.
+    uint32_t computeFamily = UINT32_MAX;
+    if (requireCompute) {
+        for (uint32_t i = 0; i < queueFamilyCount && computeFamily == UINT32_MAX; i++) {
+            bool hasCompute  = (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+            bool hasGraphics = (queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
+            if (hasCompute && !hasGraphics && queueFamilies[i].timestampValidBits > 0) computeFamily = i;
+        }
+        for (uint32_t i = 0; i < queueFamilyCount && computeFamily == UINT32_MAX; i++) {
+            if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) computeFamily = i;
+        }
+        if (computeFamily == UINT32_MAX) {
+            Log("[ERROR] No compute-capable queue family on the benchmark device - VRAM scan cannot run");
+            return false;
+        }
+        g_app.benchQueueFamily = computeFamily;
+        Log("[INFO] Using compute queue family " + std::to_string(computeFamily) + " (" +
+            std::to_string(queueFamilies[computeFamily].queueCount) + " queues) - VRAM scan runs compute shaders");
+    }
+
     // Step 2: Select primary bench queue family
-    if (dedicatedTransferFamily != UINT32_MAX) {
+    if (requireCompute) {
+        // chosen above
+    } else if (dedicatedTransferFamily != UINT32_MAX) {
         g_app.benchQueueFamily = dedicatedTransferFamily;
         Log("[INFO] Using dedicated transfer queue family " + std::to_string(dedicatedTransferFamily) + 
             " (" + std::to_string(queueFamilies[dedicatedTransferFamily].queueCount) + " queues) - direct DMA engine access");
@@ -3146,7 +3172,8 @@ FenceWaitResult WaitForBenchFenceEx() {
         VkResult result = vkWaitForFences(g_app.benchDevice, 1, &g_app.benchFence, VK_TRUE, timeout);
         if (result == VK_SUCCESS) break;
         if (result != VK_TIMEOUT) {
-            Log("[ERROR] vkWaitForFences failed: " + std::to_string((int)result));
+            Log("[ERROR] vkWaitForFences failed: " + std::to_string((int)result) +
+                (result == VK_ERROR_DEVICE_LOST ? " (VK_ERROR_DEVICE_LOST - the GPU reset or was lost; on an eGPU check the kernel log for NVRM/Xid)" : ""));
             g_app.benchmarkAborted = true;
             return FenceWaitResult::Error;
         }
@@ -5628,7 +5655,8 @@ void VRAMTestThreadFunc() {
     g_app.benchmarkAborted = false;
     
     CleanupBenchmarkDevice();
-    if (!InitBenchmarkDevice(g_app.config.selectedGPU)) {
+    // The scan's fill/verify shaders need a compute-capable queue (see InitBenchmarkDevice).
+    if (!InitBenchmarkDevice(g_app.config.selectedGPU, true)) {
         Log("[ERROR] Failed to initialize benchmark device for VRAM test");
         g_app.vramTestResult.completed = false;
         g_app.vramTestRunning = false;
@@ -6030,6 +6058,7 @@ void VRAMTestThreadFunc() {
     double duration = std::chrono::duration<double>(endTime - startTime).count();
     
     g_app.vramTestResult.completed = !g_app.vramTestCancelRequested;
+    g_app.vramTestResult.incomplete = !g_app.vramTestCancelRequested && (hadCriticalFailure || totalBytesTested == 0);
     g_app.vramTestResult.cancelled = g_app.vramTestCancelRequested;
     g_app.vramTestResult.totalBytesTested = totalBytesTested;
     g_app.vramTestResult.totalErrors = totalErrors;
@@ -6045,7 +6074,10 @@ void VRAMTestThreadFunc() {
     snprintf(durationBuf, sizeof(durationBuf), "Duration: %.1f seconds", duration);
     Log(durationBuf);
     
-    if (totalErrors == 0) {
+    if (totalErrors == 0 && g_app.vramTestResult.incomplete) {
+        Log("Result: INCOMPLETE - scan aborted after " + FormatSize(totalBytesTested) + " (see errors above). This is NOT a pass.");
+        g_app.vramTestResult.summary = "INCOMPLETE - aborted after " + FormatSize(totalBytesTested) + " (not a pass)";
+    } else if (totalErrors == 0) {
         Log("Result: PASS - No errors detected");
         g_app.vramTestResult.summary = "PASS - No errors in " + FormatSize(totalBytesTested) + " (" + percentBuf + " coverage)";
     } else {
@@ -7432,7 +7464,9 @@ void RenderGUI() {
         }
         
         // Quick status indicator
-        if (g_app.vramTestResult.totalErrors == 0) {
+        if (g_app.vramTestResult.incomplete && g_app.vramTestResult.totalErrors == 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Last scan: INCOMPLETE (aborted)");
+        } else if (g_app.vramTestResult.totalErrors == 0) {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Last scan: PASS");
         } else {
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Last scan: %zu errors!", 
@@ -8242,6 +8276,8 @@ void RenderGUI() {
             // Header with status
             if (result.cancelled) {
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "VRAM Scan: CANCELLED");
+            } else if (result.incomplete && result.totalErrors == 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "VRAM Scan: INCOMPLETE (aborted - not a pass)");
             } else if (result.totalErrors == 0) {
                 ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "VRAM Scan: PASS");
             } else {

@@ -339,6 +339,7 @@ struct VRAMError {
 // VRAM test results
 struct VRAMTestResult {
     bool completed = false;
+    bool incomplete = false;   // aborted by a GPU/driver failure: never a PASS
     bool cancelled = false;
     size_t totalBytesTested = 0;
     size_t totalErrors = 0;
@@ -5218,6 +5219,7 @@ void VRAMTestThreadFunc() {
     
     // Generate summary
     g_app.vramTestResult.completed = !g_app.vramTestCancelRequested;
+    g_app.vramTestResult.incomplete = !g_app.vramTestCancelRequested && (hadCriticalFailure || totalBytesTested == 0);
     g_app.vramTestResult.cancelled = g_app.vramTestCancelRequested;
     g_app.vramTestResult.totalBytesTested = totalBytesTested;
     g_app.vramTestResult.totalErrors = totalErrors;
@@ -5233,7 +5235,10 @@ void VRAMTestThreadFunc() {
     snprintf(durationBuf, sizeof(durationBuf), "Duration: %.1f seconds", duration);
     Log(durationBuf);
     
-    if (totalErrors == 0) {
+    if (totalErrors == 0 && g_app.vramTestResult.incomplete) {
+        Log("Result: INCOMPLETE - scan aborted after " + FormatSize(totalBytesTested) + " (see errors above). This is NOT a pass.");
+        g_app.vramTestResult.summary = "INCOMPLETE - aborted after " + FormatSize(totalBytesTested) + " (not a pass)";
+    } else if (totalErrors == 0) {
         Log("Result: PASS - No errors detected");
         g_app.vramTestResult.summary = "PASS - No errors in " + FormatSize(totalBytesTested) + " (" + percentBuf + " coverage)";
     } else {
@@ -6610,7 +6615,9 @@ void RenderGUI() {
         }
         
         // Quick status indicator
-        if (g_app.vramTestResult.totalErrors == 0) {
+        if (g_app.vramTestResult.incomplete && g_app.vramTestResult.totalErrors == 0) {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "Last scan: INCOMPLETE (aborted)");
+        } else if (g_app.vramTestResult.totalErrors == 0) {
             ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "Last scan: PASS");
         } else {
             ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "Last scan: %zu errors!", 
@@ -7431,6 +7438,8 @@ void RenderGUI() {
             // Header with status
             if (result.cancelled) {
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "VRAM Scan: CANCELLED");
+            } else if (result.incomplete && result.totalErrors == 0) {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "VRAM Scan: INCOMPLETE (aborted - not a pass)");
             } else if (result.totalErrors == 0) {
                 ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "VRAM Scan: PASS");
             } else {

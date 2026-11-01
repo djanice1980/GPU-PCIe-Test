@@ -2,6 +2,23 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.5.1] - 2026-11-01
+
+### Fixed
+- **VRAM scan died with VK_ERROR_DEVICE_LOST on NVIDIA (Vulkan variants).** The
+  benchmark device sits on the dedicated transfer-only queue family (right for
+  bandwidth tests), but the scan's fill/verify compute dispatches are invalid
+  there; the driver reset the context (Xid 32) on the first chunk. The scan now
+  re-creates the benchmark device on a compute-capable family (compute-only
+  preferred). The pre-3.5 GPU-verify option (Deep/Thorough presets) had the
+  same flaw.
+- **An aborted scan reported PASS.** A chunk that failed on a driver error left
+  0 bytes tested yet the summary, the results window and the "Last scan" line
+  all said PASS. Aborted scans now report INCOMPLETE everywhere and say so is
+  not a pass.
+- `vkWaitForFences` device-loss errors are named in the log with a hint to check
+  the kernel log on eGPU hosts.
+
 ## [3.5.0] - 2026-11-01
 
 ### Added
