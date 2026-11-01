@@ -2,6 +2,30 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.6.3] - 2026-11-01
+
+### Fixed
+- **Integrated-GPU comparison was on two different bases.** The memory
+  standard bars and table rows used the 80%-of-theoretical "realistic" figure
+  while the YOUR RAM bar, the traffic bars and the percentage text were
+  theoretical, so the text could say "108% of DDR6-12800 DC (205 GB/s)" beside
+  a bar showing 163.8. Everything in that window is now theoretical.
+- **Bus width is now in the standard names** ("DDR6-12800 DC 128-bit") and
+  256-bit LPDDR5X-8000 / 8533 rows were added, so a 256-bit APU has
+  like-for-like neighbours and it is clear that it outruns dual-channel DDR6
+  by width, not by speed.
+- **UI scaling on high-DPI displays.** The 13 px bitmap font was being stretched
+  by a global scale factor (crushed text) while buttons, sliders and windows
+  kept their 96-dpi pixel sizes (clipped labels such as "Continue with"). The
+  font is now a system TTF rasterized at the scaled size (DejaVu/Noto/Liberation
+  on Linux, Segoe UI/Tahoma on Windows, ImGui's font at the scaled size as a
+  fallback), the style paddings scale with it, and every fixed size in the GUI
+  follows the scale. The GPU selector no longer prints the vendor twice.
+- Legend on the integrated-GPU chart names the purple memory-standard bars and
+  quotes the read+write figure the bars actually show; the ranking table sizes
+  itself to its rows instead of hiding #1 behind a 200 px scroll area; the
+  summary lines wrap instead of running off the window.
+
 ## [3.6.2] - 2026-11-01
 
 ### Fixed

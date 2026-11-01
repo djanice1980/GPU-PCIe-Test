@@ -475,16 +475,21 @@ static const int NUM_INTERFACE_SPEEDS = sizeof(INTERFACE_SPEEDS) / sizeof(INTERF
 // Realistic = ~80% of theoretical (memory controller overhead, contention)
 // Theoretical = speed_MT/s * 8 bytes * 2 channels / 1000
 static const InterfaceSpeed MEMORY_STANDARDS[] = {
-    {"DDR4-2400 DC",    30.7,   38.4,  "Dual-channel DDR4-2400"},
-    {"DDR4-3200 DC",    41.0,   51.2,  "Dual-channel DDR4-3200"},
-    {"DDR5-4800 DC",    61.4,   76.8,  "Dual-channel DDR5-4800"},
-    {"DDR5-5600 DC",    71.7,   89.6,  "Dual-channel DDR5-5600"},
-    {"DDR5-6400 DC",    81.9,   102.4, "Dual-channel DDR5-6400"},
-    {"DDR5-8800 DC",    112.6,  140.8, "Dual-channel DDR5-8800"},
-    {"LPDDR5X-7500",    96.0,   120.0, "Dual-channel LPDDR5X-7500"},
-    {"LPDDR5X-8533",    109.2,  136.5, "Dual-channel LPDDR5X-8533"},
-    {"DDR6-12800 DC",   163.8,  204.8, "Dual-channel DDR6-12800 (projected)"},
-    {"DDR6-17600 DC",   225.3,  281.6, "Dual-channel DDR6-17600 (projected)"},
+    // Bus width is in the name because it is the whole story: a 256-bit
+    // LPDDR5-8000 bus (256 GB/s) outruns dual-channel DDR6-12800 (204.8 GB/s)
+    // by being twice as wide, not by being faster per channel.
+    {"DDR4-2400 DC 128-bit",      30.7,   38.4,  "Dual-channel DDR4-2400"},
+    {"DDR4-3200 DC 128-bit",      41.0,   51.2,  "Dual-channel DDR4-3200"},
+    {"DDR5-4800 DC 128-bit",      61.4,   76.8,  "Dual-channel DDR5-4800"},
+    {"DDR5-5600 DC 128-bit",      71.7,   89.6,  "Dual-channel DDR5-5600"},
+    {"DDR5-6400 DC 128-bit",      81.9,   102.4, "Dual-channel DDR5-6400"},
+    {"DDR5-8800 DC 128-bit",      112.6,  140.8, "Dual-channel DDR5-8800"},
+    {"LPDDR5X-7500 128-bit",      96.0,   120.0, "128-bit LPDDR5X-7500 (thin-and-light laptops)"},
+    {"LPDDR5X-8533 128-bit",      109.2,  136.5, "128-bit LPDDR5X-8533 (thin-and-light laptops)"},
+    {"LPDDR5X-8000 256-bit",      204.8,  256.0, "256-bit LPDDR5X-8000 (Strix Halo class APUs)"},
+    {"LPDDR5X-8533 256-bit",      218.4,  273.1, "256-bit LPDDR5X-8533 (Apple M-series Pro class)"},
+    {"DDR6-12800 DC 128-bit",     163.8,  204.8, "Dual-channel DDR6-12800 (projected)"},
+    {"DDR6-17600 DC 128-bit",     225.3,  281.6, "Dual-channel DDR6-17600 (projected)"},
 };
 static const int NUM_MEMORY_STANDARDS = sizeof(MEMORY_STANDARDS) / sizeof(MEMORY_STANDARDS[0]);
 
@@ -691,6 +696,42 @@ struct AppContext {
 };
 
 static AppContext g_app;
+
+// UI scale (1.0 = 96 dpi). The font is rasterized at this scale rather than
+// stretched with FontGlobalScale (which blurred the 13 px bitmap font), the
+// style is scaled with it, and every fixed pixel size in the GUI is multiplied
+// by it so buttons and sliders keep their proportions.
+static float g_uiScale = 1.0f;
+
+// Defined further down; LoadUiFont runs before them in file order.
+void Log(const std::string& msg);
+
+// Load a real system font at the scaled size when one exists; fall back to
+// ImGui's built-in font rasterized at the scaled size.
+static void LoadUiFont(ImGuiIO& io, float scale) {
+    const float px = 16.0f * scale;
+    const char* candidates[] = {
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    };
+    for (const char* path : candidates) {
+        if (access(path, R_OK) == 0 && io.Fonts->AddFontFromFileTTF(path, px) != nullptr) {
+            Log(std::string("[INFO] UI font: ") + path + " at " + std::to_string(static_cast<int>(px)) + " px (scale " +
+                std::to_string(scale).substr(0, 4) + ")");
+            return;
+        }
+    }
+    ImFontConfig cfg;
+    cfg.SizePixels = 13.0f * scale;
+    io.Fonts->AddFontDefault(&cfg);
+    Log("[INFO] UI font: built-in at " + std::to_string(static_cast<int>(cfg.SizePixels)) + " px (no system TTF found)");
+}
 
 // Helper to add log messages
 void Log(const std::string& msg) {
@@ -2394,7 +2435,7 @@ void EnumerateGPUs() {
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "GPU-PCIe-Test";
-        appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 2);
+        appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 3);
         appInfo.pEngineName = "No Engine";
         appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
         appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -2872,7 +2913,7 @@ bool InitVulkan() {
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     appInfo.pApplicationName = "GPU-PCIe-Test";
-    appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 2);
+    appInfo.applicationVersion = VK_MAKE_VERSION(3, 6, 3);
     appInfo.pEngineName = "No Engine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = VK_API_VERSION_1_1;
@@ -7176,13 +7217,13 @@ void RenderMemoryElevationPrompt() {
                            "the tool with sudo, or use Help > Read memory details later.");
         ImGui::PopTextWrapPos();
         ImGui::Spacing();
-        if (ImGui::Button("Read with admin rights (pkexec)", ImVec2(270, 0))) {
+        if (ImGui::Button("Read with admin rights (pkexec)")) {
             g_app.memoryPromptDismissed = true;
             ImGui::CloseCurrentPopup();
             ElevatedMemoryRead();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Continue without", ImVec2(160, 0))) {
+        if (ImGui::Button("Continue without")) {
             g_app.memoryPromptDismissed = true;
             ImGui::CloseCurrentPopup();
         }
@@ -7522,7 +7563,7 @@ void RenderGUI() {
     bool hasResults = !g_app.results.empty();  // Changed: check if results exist, not state
 
     if (!canStart) ImGui::BeginDisabled();
-    if (ImGui::Button("Start Benchmark", ImVec2(-1, 40))) {
+    if (ImGui::Button("Start Benchmark", ImVec2(-1, 40 * g_uiScale))) {
         // Apply quick mode overrides (don't permanently change config)
         int actualRuns = g_app.config.quickMode ? 1 : g_app.config.numRuns;
         int actualBatches = g_app.config.quickMode ? 16 : g_app.config.bandwidthBatches;
@@ -7567,7 +7608,7 @@ void RenderGUI() {
     if (!canStart) ImGui::EndDisabled();
 
     if (!canStop) ImGui::BeginDisabled();
-    if (ImGui::Button("Cancel", ImVec2(-1, 30))) {
+    if (ImGui::Button("Cancel", ImVec2(-1, 30 * g_uiScale))) {
         g_app.cancelRequested = true;
         Log("Cancellation requested...");
     }
@@ -7579,29 +7620,29 @@ void RenderGUI() {
 
     // Results buttons - available when we have results
     if (!hasResults) ImGui::BeginDisabled();
-    if (ImGui::Button("View Summary", ImVec2(-1, 30))) {
+    if (ImGui::Button("View Summary", ImVec2(-1, 30 * g_uiScale))) {
         g_app.showSummaryWindow = true;
     }
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("View detailed analysis comparing measured vs actual PCIe link");
     }
-    if (ImGui::Button("View Results", ImVec2(-1, 30))) {
+    if (ImGui::Button("View Results", ImVec2(-1, 30 * g_uiScale))) {
         g_app.showResultsWindow = true;
     }
-    if (ImGui::Button("View Graphs", ImVec2(-1, 30))) {
+    if (ImGui::Button("View Graphs", ImVec2(-1, 30 * g_uiScale))) {
         g_app.showGraphsWindow = true;
     }
-    if (ImGui::Button("Compare to Standards", ImVec2(-1, 30))) {
+    if (ImGui::Button("Compare to Standards", ImVec2(-1, 30 * g_uiScale))) {
         g_app.showCompareWindow = true;
     }
-    if (ImGui::Button("Export to CSV", ImVec2(-1, 30))) {
+    if (ImGui::Button("Export to CSV", ImVec2(-1, 30 * g_uiScale))) {
         ExportBenchmarkCsvInteractive();
     }
     
     ImGui::Spacing();
     
     // Clear Charts button
-    if (ImGui::Button("Clear Charts", ImVec2(-1, 30))) {
+    if (ImGui::Button("Clear Charts", ImVec2(-1, 30 * g_uiScale))) {
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
         g_app.results.clear();
         g_app.uploadBW = 0;
@@ -7630,7 +7671,7 @@ void RenderGUI() {
     
     // Reset Settings button (always available when not running)
     if (canStop) ImGui::BeginDisabled();
-    if (ImGui::Button("Reset Settings", ImVec2(-1, 30))) {
+    if (ImGui::Button("Reset Settings", ImVec2(-1, 30 * g_uiScale))) {
         g_app.config.bandwidthSize = Constants::DEFAULT_BANDWIDTH_SIZE;
         g_app.config.latencySize = Constants::DEFAULT_LATENCY_SIZE;
         g_app.config.bandwidthBatches = Constants::DEFAULT_BANDWIDTH_BATCHES;
@@ -7679,7 +7720,7 @@ void RenderGUI() {
         if (presetIdx < 0 || presetIdx > 5) presetIdx = 1;
         ImGui::Text("Scan preset:");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(140);
+        ImGui::SetNextItemWidth(140 * g_uiScale);
         if (ImGui::Combo("##VRAMPreset", &presetIdx, PRESET_NAMES, IM_ARRAYSIZE(PRESET_NAMES))) {
             ApplyVRAMScanPreset(static_cast<VRAMScanPreset>(presetIdx), g_app.config);
         }
@@ -7733,7 +7774,7 @@ void RenderGUI() {
             if (g_app.config.vramRereadEnabled) {
                 int iters = g_app.config.vramRereadIterations;
                 ImGui::Indent();
-                ImGui::SetNextItemWidth(200);
+                ImGui::SetNextItemWidth(200 * g_uiScale);
                 if (ImGui::SliderInt("Iterations", &iters, 1, 20)) {
                     g_app.config.vramRereadIterations = iters;
                     markCustomIfChanged(true);
@@ -7759,7 +7800,7 @@ void RenderGUI() {
                     if (g_app.config.vramNonSequentialBlockSize == BLOCK_VALUES[i]) { blockIdx = i; break; }
                 }
                 ImGui::Indent();
-                ImGui::SetNextItemWidth(120);
+                ImGui::SetNextItemWidth(120 * g_uiScale);
                 if (ImGui::Combo("Block size##VRAMNSBlock", &blockIdx, BLOCK_LABELS, IM_ARRAYSIZE(BLOCK_LABELS))) {
                     g_app.config.vramNonSequentialBlockSize = BLOCK_VALUES[blockIdx];
                     markCustomIfChanged(true);
@@ -7780,7 +7821,7 @@ void RenderGUI() {
             if (g_app.config.vramPreheatEnabled) {
                 int psec = g_app.config.vramPreheatSeconds;
                 ImGui::Indent();
-                ImGui::SetNextItemWidth(200);
+                ImGui::SetNextItemWidth(200 * g_uiScale);
                 if (ImGui::SliderInt("Pre-heat seconds", &psec, 10, 120)) {
                     g_app.config.vramPreheatSeconds = psec;
                     markCustomIfChanged(true);
@@ -7803,7 +7844,7 @@ void RenderGUI() {
             if (g_app.config.vramGpuVerify) {
                 int passes = g_app.config.vramGpuPasses;
                 ImGui::Indent();
-                ImGui::SetNextItemWidth(200);
+                ImGui::SetNextItemWidth(200 * g_uiScale);
                 if (ImGui::SliderInt("Passes per pattern", &passes, 1, 256, "%d", ImGuiSliderFlags_Logarithmic)) {
                     g_app.config.vramGpuPasses = passes;
                     markCustomIfChanged(true);
@@ -7827,7 +7868,7 @@ void RenderGUI() {
         }
         ImGui::Text("Coverage:");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(180);
+        ImGui::SetNextItemWidth(180 * g_uiScale);
         if (ImGui::Combo("##VRAMCoverage", &covIdx, COVERAGE_LABELS, IM_ARRAYSIZE(COVERAGE_LABELS))) {
             g_app.config.vramCoveragePercent = COVERAGE_VALUES[covIdx];
             markCustomIfChanged(true);
@@ -7843,7 +7884,7 @@ void RenderGUI() {
     }
     
     if (vramScanDisabled) ImGui::BeginDisabled();
-    if (ImGui::Button("VRAM Scan", ImVec2(-1, 35))) {
+    if (ImGui::Button("VRAM Scan", ImVec2(-1, 35 * g_uiScale))) {
         if (!g_app.vramTestRunning && !g_app.benchmarkThreadRunning) {
             // Clear any previous results immediately
             g_app.vramTestResult = {};
@@ -7875,14 +7916,14 @@ void RenderGUI() {
     
     // Cancel button for VRAM test
     if (g_app.vramTestRunning) {
-        if (ImGui::Button("Cancel VRAM Scan", ImVec2(-1, 30))) {
+        if (ImGui::Button("Cancel VRAM Scan", ImVec2(-1, 30 * g_uiScale))) {
             g_app.vramTestCancelRequested = true;
             Log("[INFO] VRAM scan cancellation requested...");
         }
         
         // Show VRAM test progress
         ImGui::Spacing();
-        ImGui::ProgressBar(g_app.vramTestProgress, ImVec2(-1, 20));
+        ImGui::ProgressBar(g_app.vramTestProgress, ImVec2(-1, 20 * g_uiScale));
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Pattern: %s", GetVramPattern().c_str());
         {
             double w = g_app.vramBytesWritten.load() / 1e9, v = g_app.vramBytesVerified.load() / 1e9;
@@ -7896,7 +7937,7 @@ void RenderGUI() {
     
     // Show VRAM test results button if test completed
     if (g_app.vramTestResult.completed || g_app.vramTestResult.cancelled) {
-        if (ImGui::Button("View VRAM Results", ImVec2(-1, 30))) {
+        if (ImGui::Button("View VRAM Results", ImVec2(-1, 30 * g_uiScale))) {
             g_app.showVRAMTestWindow = true;
         }
         
@@ -7997,10 +8038,10 @@ void RenderGUI() {
         char overlayBuf[64];
         snprintf(overlayBuf, sizeof(overlayBuf), "Overall: %d / %d tests (%.0f%%)",
             (int)g_app.completedTests, (int)g_app.totalTests, g_app.overallProgress * 100.0f);
-        ImGui::ProgressBar(g_app.overallProgress, ImVec2(-1, 24), overlayBuf);
+        ImGui::ProgressBar(g_app.overallProgress, ImVec2(-1, 24 * g_uiScale), overlayBuf);
 
         // Per-test progress
-        ImGui::ProgressBar(g_app.progress, ImVec2(-1, 24), "Test progress");
+        ImGui::ProgressBar(g_app.progress, ImVec2(-1, 24 * g_uiScale), "Test progress");
 
     }
     else if (g_app.state == AppState::Completed) {
@@ -8024,7 +8065,7 @@ void RenderGUI() {
         ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.3f, 0.1f, 1.0f));  // Dark green background
 
         // Full green "Complete" progress bar
-        ImGui::ProgressBar(1.0f, ImVec2(-1, 28), "Benchmark Complete!");
+        ImGui::ProgressBar(1.0f, ImVec2(-1, 28 * g_uiScale), "Benchmark Complete!");
 
         // Progress bars showing percentages
         char uploadBar[192], downloadBar[192];
@@ -8038,20 +8079,20 @@ void RenderGUI() {
         float halfWidth = (viewport->WorkSize.x / 2) - 10;
         ImGui::ProgressBar(uploadPct, ImVec2(halfWidth, 28), uploadBar);
         ImGui::SameLine();
-        ImGui::ProgressBar(downloadPct, ImVec2(-1, 28), downloadBar);
+        ImGui::ProgressBar(downloadPct, ImVec2(-1, 28 * g_uiScale), downloadBar);
 
         ImGui::PopStyleColor(2);  // Pop both colors
     }
     else {
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Ready - Click 'Start Benchmark' to begin");
-        ImGui::ProgressBar(0.0f, ImVec2(-1, 24), "Idle");
+        ImGui::ProgressBar(0.0f, ImVec2(-1, 24 * g_uiScale), "Idle");
     }
 
     ImGui::End();
 
     // ========== Summary Window (Auto-popup after benchmark) ==========
     if (g_app.showSummaryWindow && !g_app.results.empty()) {
-        ImGui::SetNextWindowSize(ImVec2(700, 550), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(700 * g_uiScale, 550 * g_uiScale), ImGuiCond_FirstUseEver);
         ImVec2 center = ImGui::GetMainViewport()->GetCenter();
         ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
         
@@ -8223,7 +8264,7 @@ void RenderGUI() {
 
     // ========== Results Window (Popup, only when requested) ==========
     if (g_app.showResultsWindow && !g_app.results.empty()) {
-        ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(700 * g_uiScale, 500 * g_uiScale), ImGuiCond_FirstUseEver);
         ImGui::Begin("Results", &g_app.showResultsWindow);
 
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
@@ -8301,7 +8342,7 @@ void RenderGUI() {
 
     // ========== Graphs Window (Popup, only when requested) ==========
     if (g_app.showGraphsWindow && !g_app.results.empty()) {
-        ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(900 * g_uiScale, 700 * g_uiScale), ImGuiCond_FirstUseEver);
         ImGui::Begin("Graphs", &g_app.showGraphsWindow);
 
         std::lock_guard<std::mutex> lock(g_app.resultsMutex);
@@ -8340,7 +8381,7 @@ void RenderGUI() {
             for (const auto& s : bwLabelStorage) bwLabels.push_back(s.c_str());
             
             // Plot height based on number of tests
-            float plotHeight = std::max(200.0f, numTests * 50.0f + 80.0f);
+            float plotHeight = std::max(200.0f, numTests * 50.0f + 80.0f) * g_uiScale;
             
             if (ImPlot::BeginPlot("##Bandwidth", ImVec2(-1, plotHeight))) {
                 // Invert Y axis so oldest (index 0) appears at TOP
@@ -8419,7 +8460,7 @@ void RenderGUI() {
             }
             for (const auto& s : latLabelStorage) latLabels.push_back(s.c_str());
             
-            float plotHeight = std::max(200.0f, numTests * 50.0f + 80.0f);
+            float plotHeight = std::max(200.0f, numTests * 50.0f + 80.0f) * g_uiScale;
             
             if (ImPlot::BeginPlot("##Latency", ImVec2(-1, plotHeight))) {
                 // Invert Y axis so oldest (index 0) appears at TOP
@@ -8469,7 +8510,7 @@ void RenderGUI() {
 
     // ========== Compare to Standards Window ==========
     if (g_app.showCompareWindow && !g_app.results.empty()) {
-        ImGui::SetNextWindowSize(ImVec2(900, 700), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(900 * g_uiScale, 700 * g_uiScale), ImGuiCond_FirstUseEver);
         ImGui::Begin("Compare to Interface Standards", &g_app.showCompareWindow);
 
         const char* modeLabel = g_app.config.averageRuns ? "Average" : "Best Run";
@@ -8499,9 +8540,11 @@ void RenderGUI() {
         if (isIntegrated) {
             // Integrated GPU: show memory bandwidth standards
             for (int i = 0; i < NUM_MEMORY_STANDARDS; ++i) {
+                // Theoretical, so the standards sit on the same basis as the
+                // YOUR RAM bar and the read+write traffic bars.
                 entries.push_back({
                     MEMORY_STANDARDS[i].name,
-                    MEMORY_STANDARDS[i].bandwidth,
+                    MEMORY_STANDARDS[i].theoretical,
                     3,
                     MEMORY_STANDARDS[i].description
                 });
@@ -8583,7 +8626,7 @@ void RenderGUI() {
         for (const auto& s : labelStorage) labels.push_back(s.c_str());
         
         // Calculate plot height based on number of entries
-        float plotHeight = std::max(350.0f, numEntries * 22.0f + 60.0f);
+        float plotHeight = std::max(350.0f, numEntries * 22.0f + 60.0f) * g_uiScale;
 
         // Determine X-axis range based on data
         double maxBW = 70.0;
@@ -8647,11 +8690,19 @@ void RenderGUI() {
         // Legend
         ImGui::Spacing();
         const char* modeLbl = g_app.config.averageRuns ? "Avg" : "Best";
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Gray = Interface Standards");
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "  Green = Your CPU->GPU %s (%.2f GB/s)", modeLbl, g_app.uploadBW);
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(0.2f, 0.7f, 0.9f, 1.0f), "  Cyan = Your GPU->CPU %s (%.2f GB/s)", modeLbl, g_app.downloadBW);
+        if (isIntegrated) {
+            ImGui::TextColored(ImVec4(0.6f, 0.4f, 0.8f, 1.0f), "Purple = Memory Standards (theoretical)");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "  Green = Your CPU->GPU %s (%.2f GB/s copy = %.1f GB/s read+write)", modeLbl, g_app.uploadBW, g_app.uploadBW * 2.0);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.7f, 0.9f, 1.0f), "  Cyan = Your GPU->CPU %s (%.2f GB/s copy = %.1f GB/s read+write)", modeLbl, g_app.downloadBW, g_app.downloadBW * 2.0);
+        } else {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Gray = Interface Standards");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.2f, 1.0f), "  Green = Your CPU->GPU %s (%.2f GB/s)", modeLbl, g_app.uploadBW);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.2f, 0.7f, 0.9f, 1.0f), "  Cyan = Your GPU->CPU %s (%.2f GB/s)", modeLbl, g_app.downloadBW);
+        }
         
         ImGui::Spacing();
         ImGui::Separator();
@@ -8665,8 +8716,10 @@ void RenderGUI() {
         // "225.30 GE" at larger UI scales); columns are user-resizable.
         const float rankW = ImGui::CalcTextSize("#99").x + ImGui::GetStyle().CellPadding.x * 4.0f;
         const float bwW   = ImGui::CalcTextSize("9999.99 GB/s").x + ImGui::GetStyle().CellPadding.x * 4.0f;
+        const float rowH = ImGui::GetTextLineHeight() + ImGui::GetStyle().CellPadding.y * 2.0f;
+        const float tableH = std::min(rowH * static_cast<float>(numEntries + 1) + 8.0f, 560.0f);
         if (ImGui::BeginTable("RankingTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
-                              ImVec2(0, 200))) {
+                              ImVec2(0, tableH))) {
             ImGui::TableSetupColumn("Rank", ImGuiTableColumnFlags_WidthFixed, rankW);
             ImGui::TableSetupColumn("Interface", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupColumn("Bandwidth", ImGuiTableColumnFlags_WidthFixed, bwW);
@@ -8745,12 +8798,16 @@ void RenderGUI() {
             g_app.downloadPercentage >= 70 ? ImVec4(1.0f, 1.0f, 0.4f, 1.0f) :
             ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
         
+        ImGui::PushTextWrapPos(0.0f);
         ImGui::TextColored(uploadColor, "%s", uploadSummary);
         ImGui::TextColored(downloadColor, "%s", downloadSummary);
         if (isIntegrated) {
-            ImGui::TextDisabled("Integrated GPU: a copy reads and writes the same RAM, so the bus carries twice the copy rate.");
-            ImGui::TextDisabled("Your bars and percentages count that read+write traffic; the standards are theoretical dual-channel figures.");
+            ImGui::TextDisabled("Integrated GPU: a copy reads and writes the same RAM, so the bus carries twice the copy rate. "
+                                "Your bars and percentages count that read+write traffic.");
+            ImGui::TextDisabled("All figures are theoretical bus bandwidth. Bus width matters as much as speed: a 256-bit bus has twice the "
+                                "lanes of a dual-channel (128-bit) one, which is why 256-bit LPDDR5 can outrun dual-channel DDR6.");
         }
+        ImGui::PopTextWrapPos();
         
         if (!g_app.detectedInterface.empty() && g_app.detectedInterface != "Unknown") {
             ImGui::Spacing();
@@ -8764,7 +8821,7 @@ void RenderGUI() {
 
     // ========== VRAM Test Results Window ==========
     if (g_app.showVRAMTestWindow) {
-        ImGui::SetNextWindowSize(ImVec2(600, 500), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(600 * g_uiScale, 500 * g_uiScale), ImGuiCond_FirstUseEver);
         ImVec2 center = ImGui::GetMainViewport()->GetCenter();
         ImGui::SetNextWindowPos(center, ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
         
@@ -8885,7 +8942,7 @@ void RenderGUI() {
                             }
                             ImGui::PlotHistogram("##VRAMBitHist", floats, 32, 0,
                                                  nullptr, 0.0f, (float)maxFlips,
-                                                 ImVec2(0, 80));
+                                                 ImVec2(0, 80 * g_uiScale));
                         }
                     }
                 }
@@ -8894,7 +8951,7 @@ void RenderGUI() {
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Error Regions:");
                 ImGui::Spacing();
 
-                ImGui::BeginChild("ErrorList", ImVec2(0, 150), true, ImGuiWindowFlags_HorizontalScrollbar);
+                ImGui::BeginChild("ErrorList", ImVec2(0, 150 * g_uiScale), true, ImGuiWindowFlags_HorizontalScrollbar);
                 for (const auto& err : result.errors) {
                     char errBuf[320];
                     if (err.bitFlipCount > 0) {
@@ -9323,7 +9380,7 @@ int main(int argc, char* argv[]) {
     for (const auto& gpu : g_app.gpuList) {
         std::string label;
         if (gpu.isValid) {
-            label = gpu.vendor + " " + gpu.name +
+            label = (gpu.name.rfind(gpu.vendor, 0) == 0 ? gpu.name : gpu.vendor + " " + gpu.name) +
                 " (" + FormatMemory(gpu.dedicatedVRAM) +
                 (gpu.isIntegrated ? " iGPU" : "") + ")";
         } else {
@@ -9349,7 +9406,11 @@ int main(int argc, char* argv[]) {
     float xscale = 1.0f, yscale = 1.0f;
     glfwGetWindowContentScale(g_app.window, &xscale, &yscale);
     float dpiScale = std::max(xscale, yscale);
-    io.FontGlobalScale = Constants::BASE_FONT_SCALE * dpiScale;
+    // Rasterize the font at the DPI-scaled size and scale the style with it;
+    // FontGlobalScale stays 1.0 (stretching the bitmap font looked crushed).
+    g_uiScale = std::max(1.0f, Constants::BASE_FONT_SCALE * dpiScale);
+    LoadUiFont(io, g_uiScale);
+    io.FontGlobalScale = 1.0f;
 
     io.DisplaySize = ImVec2((float)g_app.windowWidth, (float)g_app.windowHeight);
     io.DisplayFramebufferScale = ImVec2(1.0f, 1.0f);
@@ -9363,6 +9424,7 @@ int main(int argc, char* argv[]) {
     style.Colors[ImGuiCol_WindowBg] = ImVec4(0.15f, 0.15f, 0.18f, 1.0f);
     style.Colors[ImGuiCol_TitleBg] = ImVec4(0.1f, 0.1f, 0.12f, 1.0f);
     style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.2f, 0.2f, 0.25f, 1.0f);
+    style.ScaleAllSizes(g_uiScale);
 
     // Initialize Vulkan ImGui backend
     ImGui_ImplVulkan_InitInfo initInfo = {};
