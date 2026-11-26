@@ -279,6 +279,7 @@ struct SystemMemoryInfo {
     double ratedLatencyNs = 0;         // Estimated chip latency from speed tier (ns)
     int    estimatedCL = 0;            // Estimated CAS latency
     bool   latencyEstimated = false;   // True if we found a matching speed tier
+    bool     eccDetected = false;      // SMBIOS total width exceeds data width (72/64), or 72-bit-multiple widths
     uint32_t busWidthBits = 0;         // Memory bus width from SMBIOS data widths (0 = unknown)
     bool   channelsUnverified = false; // Soldered LPDDR: channel count is only an SMBIOS-based guess
     bool   channelsInferred = false;   // Channel count raised to fit the measured iGPU bandwidth
@@ -412,7 +413,9 @@ struct BenchmarkResult {
     double            avgValue = 0;
     double            maxValue = 0;
     std::string       unit;
-    std::vector<double> samples;  // For graphing
+    std::vector<double> samples;  // For graphing (may be trimmed; see CompactResults)
+    double            runningSum = 0;     // exact statistics across every sample ever folded in
+    uint64_t          runningCount = 0;
 };
 
 // VRAM scan preset modes. Selecting a preset snaps all individual VRAM scan
@@ -438,6 +441,7 @@ struct BenchmarkConfig {
     bool   runLatency = true;
     bool   runMemoryLatency = true;  // GPU memory latency via compute shader pointer-chase
     bool   quickMode = false;
+    bool   runUntilStopped = false;  // repeat the test set until Cancel (#16)
     bool   averageRuns = true;  // When false, record each run individually
     bool   debugLogging = false;  // Verbose diagnostic logging for memory latency test etc.
     int    selectedGPU = 0;
@@ -621,6 +625,7 @@ struct AppContext {
     
     // Benchmark timing for global timeout
     std::chrono::steady_clock::time_point benchmarkStartTime;
+    std::atomic<bool>  benchmarkUnlimited{ false };   // run-until-stopped in progress
 
     // UI State (removed g_ prefix - cleaner inside struct)
     bool showResultsWindow = false;
@@ -1016,6 +1021,7 @@ SystemMemoryInfo DetectSystemMemory() {
     uint16_t detectedMemoryType = 0;  // SMBIOS memory type for DDR generation detection
     int stickCount = 0;
     uint32_t dataWidthSum = 0;  // sum of per-device SMBIOS data widths (bits), populated devices only
+    bool eccAny = false;
     std::set<std::string> bankChannelIds;     // channel ids parsed from BankLabel
     std::set<std::string> locatorChannelIds;  // channel ids parsed from DeviceLocator
     
@@ -1066,11 +1072,19 @@ SystemMemoryInfo DetectSystemMemory() {
         VariantClear(&vtProp);
 
         // Get data width in bits (SMBIOS "Data Width"; summed for soldered memory)
+        uint32_t thisDataWidth = 0, thisTotalWidth = 0;
         hr = pclsObj->Get(L"DataWidth", 0, &vtProp, 0, 0);
-        if (SUCCEEDED(hr) && vtProp.vt == VT_I4 && vtProp.lVal > 0 && vtProp.lVal <= 1024) {
-            dataWidthSum += static_cast<uint32_t>(vtProp.lVal);
-        }
+        if (SUCCEEDED(hr) && vtProp.vt == VT_I4 && vtProp.lVal > 0 && vtProp.lVal <= 1024) thisDataWidth = static_cast<uint32_t>(vtProp.lVal);
         VariantClear(&vtProp);
+        hr = pclsObj->Get(L"TotalWidth", 0, &vtProp, 0, 0);
+        if (SUCCEEDED(hr) && vtProp.vt == VT_I4 && vtProp.lVal > 0 && vtProp.lVal <= 1024) thisTotalWidth = static_cast<uint32_t>(vtProp.lVal);
+        VariantClear(&vtProp);
+        // ECC: the total width carries check bits beyond the data width (72 vs
+        // 64). Some firmware reports 72 in both fields, so a width that is a
+        // multiple of 72 but not of 64 also counts.
+        auto is72 = [](uint32_t w) { return w > 0 && (w % 72u) == 0 && (w % 64u) != 0; };
+        if ((thisTotalWidth > thisDataWidth && thisDataWidth > 0) || is72(thisDataWidth) || is72(thisTotalWidth)) eccAny = true;
+        if (thisDataWidth > 0) dataWidthSum += is72(thisDataWidth) ? thisDataWidth / 72u * 64u : thisDataWidth;
         
         // Channel identification: either BankLabel or DeviceLocator may carry
         // it, depending on the firmware. Kept as two sets and the larger wins,
@@ -1107,6 +1121,7 @@ SystemMemoryInfo DetectSystemMemory() {
     info.configuredSpeedMT = maxConfiguredSpeed;
     
     info.totalSticks = static_cast<uint32_t>(stickCount);
+    info.eccDetected = eccAny;
     info.totalCapacityGB = totalCapacity / (1024 * 1024 * 1024);
     info.type = detectedType;
     info.formFactor = detectedFormFactor;
@@ -1161,6 +1176,7 @@ std::string FormatSystemMemoryInfo(const SystemMemoryInfo& mem) {
     oss << "System Memory: ";
     oss << mem.totalCapacityGB << "GB";
     if (!mem.type.empty()) oss << " " << mem.type;
+    if (mem.eccDetected) oss << " ECC";
     
     if (mem.configuredSpeedMT > 0) {
         oss << " @ " << mem.configuredSpeedMT << " MT/s";
@@ -1324,6 +1340,7 @@ std::string PctOfStd(double pct, const std::string& standard) {
 
 // Check if global benchmark timeout has been exceeded
 bool IsGlobalTimeoutExceeded() {
+    if (g_app.benchmarkUnlimited) return false;   // run-until-stopped: only Cancel ends it
     auto elapsed = std::chrono::steady_clock::now() - g_app.benchmarkStartTime;
     return std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > 
            Constants::GLOBAL_BENCHMARK_TIMEOUT_MS;
@@ -3915,6 +3932,8 @@ std::vector<BenchmarkResult> AggregateResults(const std::vector<BenchmarkResult>
     // Map from base test name to aggregated samples
     std::map<std::string, std::vector<double>> aggregatedSamples;
     std::map<std::string, std::string> unitMap;
+    std::map<std::string, double> runningSum, runningMin, runningMax;
+    std::map<std::string, uint64_t> runningCount;
     
     for (const auto& r : rawResults) {
         // Extract base name (remove " Run X" suffix if present)
@@ -3927,6 +3946,20 @@ std::vector<BenchmarkResult> AggregateResults(const std::vector<BenchmarkResult>
         // Append all samples
         for (double s : r.samples) {
             aggregatedSamples[baseName].push_back(s);
+        }
+        // Exact running statistics survive sample trimming (see CompactResults).
+        if (r.runningCount > 0) {
+            runningSum[baseName]   += r.runningSum;
+            runningCount[baseName] += r.runningCount;
+            runningMin[baseName] = std::min(runningMin.count(baseName) ? runningMin[baseName] : r.minValue, r.minValue);
+            runningMax[baseName] = std::max(runningMax.count(baseName) ? runningMax[baseName] : r.maxValue, r.maxValue);
+        } else {
+            for (double s : r.samples) {
+                runningSum[baseName] += s;
+                runningCount[baseName]++;
+                runningMin[baseName] = std::min(runningMin.count(baseName) ? runningMin[baseName] : s, s);
+                runningMax[baseName] = std::max(runningMax.count(baseName) ? runningMax[baseName] : s, s);
+            }
         }
         unitMap[baseName] = r.unit;
     }
@@ -3941,15 +3974,35 @@ std::vector<BenchmarkResult> AggregateResults(const std::vector<BenchmarkResult>
         r.unit = unitMap[name];
         
         std::sort(samples.begin(), samples.end());
-        r.minValue = samples.front();
-        r.maxValue = samples.back();
-        r.avgValue = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
+        r.runningSum = runningSum[name];
+        r.runningCount = runningCount[name];
+        r.minValue = runningMin[name];
+        r.maxValue = runningMax[name];
+        r.avgValue = r.runningCount ? r.runningSum / static_cast<double>(r.runningCount)
+                                    : std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
         r.samples = std::move(samples);
         
         aggregated.push_back(r);
     }
     
     return aggregated;
+}
+
+// Run-until-stopped benchmarks would otherwise accumulate samples without
+// bound (a latency test alone adds 2000 per run). Fold everything into one
+// result per test and trim its sample list to a uniform subset; min, max and
+// average stay exact through the running statistics.
+std::vector<BenchmarkResult> CompactResults(const std::vector<BenchmarkResult>& raw, size_t maxSamples) {
+    std::vector<BenchmarkResult> out = AggregateResults(raw);
+    for (auto& r : out) {
+        if (r.samples.size() <= maxSamples) continue;
+        std::vector<double> kept;
+        kept.reserve(maxSamples);
+        const double step = static_cast<double>(r.samples.size()) / static_cast<double>(maxSamples);
+        for (size_t i = 0; i < maxSamples; ++i) kept.push_back(r.samples[static_cast<size_t>(i * step)]);
+        r.samples = std::move(kept);
+    }
+    return out;
 }
 
 // ============================================================================
@@ -5673,7 +5726,7 @@ void BenchmarkThreadFunc() {
     }
     Log("Batches: " + std::to_string(g_app.config.bandwidthBatches));
     Log("Copies/Batch: " + std::to_string(g_app.config.copiesPerBatch));
-    Log("Runs: " + std::to_string(g_app.config.numRuns));
+    Log(g_app.config.runUntilStopped && !g_app.config.quickMode ? std::string("Runs: until stopped") : "Runs: " + std::to_string(g_app.config.numRuns));
     Log("Average Runs: " + std::string(g_app.config.averageRuns ? "Yes" : "No (individual)"));
     Log("=========================");
 
@@ -5699,10 +5752,19 @@ void BenchmarkThreadFunc() {
     std::vector<BenchmarkResult> allResults;
 
     // Calculate total tests
+    // Run until stopped (#16): no run cap, no global timeout, results kept as
+    // exact running statistics, Cancel finishes with what was measured.
+    const bool unlimited = g_app.config.runUntilStopped && !g_app.config.quickMode;
+    g_app.benchmarkUnlimited = unlimited;
+    if (unlimited) {
+        Log("Run until stopped: press Cancel to finish and keep the results. Runs are averaged.");
+        g_app.config.averageRuns = true;
+    }
+
     int testsPerRun = 2;  // Upload + Download
     if (g_app.config.runBidirectional) testsPerRun++;
-    if (g_app.config.runLatency) testsPerRun += 3;  // Upload latency, Download latency, Command latency
-    g_app.totalTests = testsPerRun * g_app.config.numRuns;
+    if (g_app.config.runLatency) testsPerRun += 3;
+    g_app.totalTests = unlimited ? testsPerRun : testsPerRun * g_app.config.numRuns;
     if (g_app.config.runMemoryLatency) g_app.totalTests++;  // Memory latency runs once (hardware constant)
 
     double avgUpload = 0, avgDownload = 0;
@@ -5714,9 +5776,15 @@ void BenchmarkThreadFunc() {
         return useAverage ? "" : " Run " + std::to_string(run);
     };
 
-    for (int run = 1; run <= g_app.config.numRuns && !ShouldAbortBenchmark(); run++) {
+    for (int run = 1; (unlimited || run <= g_app.config.numRuns) && !ShouldAbortBenchmark(); run++) {
+        if (unlimited) {
+            // Per-run progress bar, and keep memory flat.
+            g_app.completedTests = (run == 1 && g_app.config.runMemoryLatency) ? 0 : 0;
+            if (run > 1 && (run % 10) == 0) allResults = CompactResults(allResults, 4096);
+        }
         g_app.currentRun = run;
-        Log("--- Run " + std::to_string(run) + " / " + std::to_string(g_app.config.numRuns) + " ---");
+        Log(unlimited ? "--- Run " + std::to_string(run) + " (until stopped) ---"
+                      : "--- Run " + std::to_string(run) + " / " + std::to_string(g_app.config.numRuns) + " ---");
         
         bool runHadCriticalFailure = false;
         std::string runSuffix = getRunSuffix(run, g_app.config.averageRuns);
@@ -5895,6 +5963,12 @@ void BenchmarkThreadFunc() {
 
     CleanupBenchmarkDevice();
 
+    g_app.benchmarkUnlimited = false;
+    if (g_app.cancelRequested && unlimited && uploadCount > 0 && downloadCount > 0) {
+        // Stopping an endless run is the normal way to finish it.
+        Log("Stopped by user after " + std::to_string(uploadCount) + " run" + (uploadCount == 1 ? "" : "s") + " - results kept");
+        g_app.cancelRequested = false;
+    }
     if (g_app.cancelRequested) {
         Log("Benchmark cancelled by user");
         g_app.state = AppState::Idle;
@@ -6119,8 +6193,8 @@ void BenchmarkThreadFunc() {
         
         // If averaging is enabled and we have multiple runs, aggregate the results
         std::vector<BenchmarkResult> newResults;
-        if (g_app.config.averageRuns && g_app.config.numRuns > 1) {
-            newResults = AggregateResults(allResults);
+        if (g_app.config.averageRuns && (g_app.config.numRuns > 1 || unlimited)) {
+            newResults = unlimited ? CompactResults(allResults, 4096) : AggregateResults(allResults);
         } else {
             newResults = allResults;
         }
@@ -6226,6 +6300,7 @@ void ExportCSV(const std::string& filename) {
     if (g_app.systemMemory.detected) {
         file << "\nSystem Memory\n";
         file << "Type," << g_app.systemMemory.type << "\n";
+        file << "ECC," << (g_app.systemMemory.eccDetected ? "yes" : "no") << "\n";
         file << "Rated Speed," << g_app.systemMemory.speedMT << " MT/s\n";
         file << "Actual Speed," << g_app.systemMemory.configuredSpeedMT << " MT/s\n";
         file << "Channels," << g_app.systemMemory.channels << "\n";
@@ -6495,8 +6570,10 @@ void RenderGUI() {
             const char* channelStr = (g_app.systemMemory.channels == 1) ? "single" :
                                      (g_app.systemMemory.channels == 2) ? "dual" :
                                      (g_app.systemMemory.channels == 4) ? "quad" : "multi";
-            snprintf(ramBuf, sizeof(ramBuf), "  %s-channel (~%.0f GB/s)",
-                    channelStr, g_app.systemMemory.theoreticalBandwidth * 0.8);  // ~80% efficiency
+            snprintf(ramBuf, sizeof(ramBuf), "  %s-channel%s (~%.0f GB/s)%s",
+                    channelStr, g_app.systemMemory.channelsLowerBound ? " or more" : "",
+                    g_app.systemMemory.theoreticalBandwidth * 0.8,   // ~80% efficiency
+                    g_app.systemMemory.eccDetected ? ", ECC" : "");
             ImGui::Text("%s", ramBuf);
 
             // Estimated chip latency (from speed tier lookup, not hardware)
@@ -6554,7 +6631,15 @@ void RenderGUI() {
 
     ImGui::Text("Number of Runs");
     ImGui::SetNextItemWidth(-1);
-    ImGui::SliderInt("##Runs", &g_app.config.numRuns, 1, 10);
+    if (g_app.config.runUntilStopped) ImGui::BeginDisabled();
+    ImGui::SliderInt("##Runs", &g_app.config.numRuns, 1, 50);
+    if (g_app.config.runUntilStopped) ImGui::EndDisabled();
+    ImGui::Checkbox("Run until stopped", &g_app.config.runUntilStopped);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Repeat the whole test set until you press Cancel; the results so far are kept\n"
+                          "and averaged. The 5-minute safety timeout is off in this mode (a hung GPU is\n"
+                          "still caught by the per-operation fence timeouts).");
+    }
 
     ImGui::Spacing();
     ImGui::Checkbox("Run Bidirectional Test", &g_app.config.runBidirectional);
@@ -7108,9 +7193,14 @@ void RenderGUI() {
         ImGui::Text("Current: %s", GetCurrentTest().c_str());
 
         // Overall progress bar
-        char overlayBuf[64];
-        snprintf(overlayBuf, sizeof(overlayBuf), "Overall: %d / %d tests (%.0f%%)",
-            (int)g_app.completedTests, (int)g_app.totalTests, g_app.overallProgress * 100.0f);
+        char overlayBuf[96];
+        if (g_app.benchmarkUnlimited) {
+            snprintf(overlayBuf, sizeof(overlayBuf), "Run %d (until stopped) - %d / %d tests this run",
+                (int)g_app.currentRun, (int)g_app.completedTests % std::max(1, (int)g_app.totalTests), (int)g_app.totalTests);
+        } else {
+            snprintf(overlayBuf, sizeof(overlayBuf), "Overall: %d / %d tests (%.0f%%)",
+                (int)g_app.completedTests, (int)g_app.totalTests, g_app.overallProgress * 100.0f);
+        }
         ImGui::ProgressBar(g_app.overallProgress, ImVec2(-1, 24 * g_uiScale), overlayBuf);
 
         // Per-test progress

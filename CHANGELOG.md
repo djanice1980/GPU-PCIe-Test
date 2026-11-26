@@ -2,6 +2,21 @@
 
 All notable changes to GPU-PCIe-Test will be documented in this file.
 
+## [3.6.6] - 2026-11-26
+
+### Added
+- **Run until stopped** (GitHub #16). A checkbox next to Number of Runs repeats
+  the whole test set until Cancel, which now finishes the benchmark and keeps
+  the averaged results instead of discarding them. The 5-minute global timeout
+  is off in this mode (the per-operation fence timeouts still catch a hung
+  GPU). Results are folded into exact running statistics every 10 runs so
+  memory stays flat over hours. The run slider now goes to 50.
+- **ECC memory detection.** Shown as "DDR4 ECC" in the System RAM panel, the
+  log and the CSV. Detected from SMBIOS widths: a total width above the data
+  width (72 vs 64), or a width that is a multiple of 72 (some firmware reports
+  72 in both fields, as on the LGA 2011-3 board in #15). ECC check bits are no
+  longer counted toward the data-bus width.
+
 ## [3.6.5] - 2026-11-01
 
 ### Fixed
